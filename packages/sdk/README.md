@@ -66,7 +66,7 @@ const sb = await Sandbox.start({
   ports: ["8080:80"],
   mounts: { "./src": "/workspace" },
   secrets: {
-    API_KEY: { from: "OPENAI_API_KEY", hosts: ["api.openai.com"] },
+    API_KEY: { value: "sk-your-openai-key", hosts: ["api.openai.com"] },
   },
   network: { allow: ["api.openai.com", "registry.npmjs.org"] },
 });
@@ -203,7 +203,7 @@ Secrets keep API keys on the host. The guest receives a random placeholder token
 const sb = await Sandbox.start({
   allowNet: true,
   secrets: {
-    API_KEY: { from: "OPENAI_API_KEY", hosts: ["api.openai.com"] },
+    API_KEY: { value: "sk-your-openai-key", hosts: ["api.openai.com"] },
   },
 });
 // Inside the VM, $API_KEY is a placeholder token.

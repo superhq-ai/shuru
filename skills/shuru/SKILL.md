@@ -166,7 +166,7 @@ Place `shuru.json` in the project root to avoid repeating flags:
   "command": ["/bin/sh", "-c", "cd /workspace && sh"],
   "secrets": {
     "API_KEY": {
-      "from": "OPENAI_API_KEY",
+      "value": "sk-your-openai-key",
       "hosts": ["api.openai.com"]
     }
   },

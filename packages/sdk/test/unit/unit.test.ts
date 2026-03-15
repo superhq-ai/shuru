@@ -88,7 +88,7 @@ describe("buildArgs", () => {
 		const args = buildArgs("shuru", {
 			allowNet: true,
 			secrets: {
-				API_KEY: { from: "OPENAI_API_KEY", hosts: ["api.openai.com"] },
+				API_KEY: { value: "sk-test", hosts: ["api.openai.com"] },
 			},
 		});
 		expect(args).toEqual([
@@ -97,14 +97,14 @@ describe("buildArgs", () => {
 			"--stdio",
 			"--allow-net",
 			"--secret",
-			"API_KEY=OPENAI_API_KEY@api.openai.com",
+			"API_KEY=sk-test@api.openai.com",
 		]);
 	});
 
 	test("secrets with multiple hosts", () => {
 		const args = buildArgs("shuru", {
 			secrets: {
-				TOKEN: { from: "MY_TOKEN", hosts: ["a.com", "b.com"] },
+				TOKEN: { value: "tok@test", hosts: ["a.com", "b.com"] },
 			},
 		});
 		expect(args).toEqual([
@@ -112,7 +112,7 @@ describe("buildArgs", () => {
 			"run",
 			"--stdio",
 			"--secret",
-			"TOKEN=MY_TOKEN@a.com,b.com",
+			"TOKEN=tok@test@a.com,b.com",
 		]);
 	});
 

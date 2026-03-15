@@ -4,7 +4,7 @@ import TabbedSection from "./TabbedSection.astro";
 
 const configs: Record<string, string> = {
   "secret-injection": JSON.stringify({
-    secrets: { API_KEY: { from: "OPENAI_API_KEY", hosts: ["api.openai.com"] } },
+    secrets: { API_KEY: { value: "sk-your-openai-key", hosts: ["api.openai.com"] } },
     network: { allow: ["api.openai.com"] },
   }, null, 2),
   "domain-allowlist": JSON.stringify({
@@ -12,14 +12,14 @@ const configs: Record<string, string> = {
   }, null, 2),
   "multi-provider": JSON.stringify({
     secrets: {
-      OPENAI_KEY: { from: "OPENAI_API_KEY", hosts: ["api.openai.com"] },
-      ANTHROPIC_KEY: { from: "ANTHROPIC_API_KEY", hosts: ["api.anthropic.com"] },
+      OPENAI_KEY: { value: "sk-your-openai-key", hosts: ["api.openai.com"] },
+      ANTHROPIC_KEY: { value: "sk-ant-your-key", hosts: ["api.anthropic.com"] },
     },
     network: { allow: ["api.openai.com", "api.anthropic.com"] },
   }, null, 2),
   "full-config": JSON.stringify({
     cpus: 4, memory: 4096, mounts: ["./src:/workspace"],
-    secrets: { API_KEY: { from: "OPENAI_API_KEY", hosts: ["api.openai.com"] } },
+    secrets: { API_KEY: { value: "sk-your-openai-key", hosts: ["api.openai.com"] } },
     network: { allow: ["api.openai.com"] },
   }, null, 2),
 };
@@ -71,7 +71,7 @@ const tabs = [
           <p class="text-text">{"{"}</p>
           <p class="text-text pl-4">"secrets": {"{"}</p>
           <p class="text-text pl-8">"API_KEY": {"{"}</p>
-          <p class="text-amber bg-amber/5 -mx-2 px-2 pl-12">"from": "OPENAI_API_KEY",</p>
+          <p class="text-amber bg-amber/5 -mx-2 px-2 pl-12">"value": "sk-your-openai-key",</p>
           <p class="text-amber bg-amber/5 -mx-2 px-2 pl-12">"hosts": ["api.openai.com"]</p>
           <p class="text-text pl-8">{"}"}</p>
           <p class="text-text pl-4">{"}"},</p>
@@ -101,11 +101,11 @@ const tabs = [
           <p class="text-text">{"{"}</p>
           <p class="text-text pl-4">"secrets": {"{"}</p>
           <p class="text-text pl-8">"OPENAI_KEY": {"{"}</p>
-          <p class="text-amber bg-amber/5 -mx-2 px-2 pl-12">"from": "OPENAI_API_KEY",</p>
+          <p class="text-amber bg-amber/5 -mx-2 px-2 pl-12">"value": "sk-your-openai-key",</p>
           <p class="text-amber bg-amber/5 -mx-2 px-2 pl-12">"hosts": ["api.openai.com"]</p>
           <p class="text-text pl-8">{"}"},</p>
           <p class="text-text pl-8">"ANTHROPIC_KEY": {"{"}</p>
-          <p class="text-amber bg-amber/5 -mx-2 px-2 pl-12">"from": "ANTHROPIC_API_KEY",</p>
+          <p class="text-amber bg-amber/5 -mx-2 px-2 pl-12">"value": "sk-ant-your-key",</p>
           <p class="text-amber bg-amber/5 -mx-2 px-2 pl-12">"hosts": ["api.anthropic.com"]</p>
           <p class="text-text pl-8">{"}"}</p>
           <p class="text-text pl-4">{"}"},</p>
@@ -124,7 +124,7 @@ const tabs = [
           <p class="text-amber bg-amber/5 -mx-2 px-2 pl-4">"mounts": ["./src:/workspace"],</p>
           <p class="text-text pl-4">"secrets": {"{"}</p>
           <p class="text-text pl-8">"API_KEY": {"{"}</p>
-          <p class="text-text pl-12">"from": "OPENAI_API_KEY",</p>
+          <p class="text-text pl-12">"value": "sk-your-openai-key",</p>
           <p class="text-text pl-12">"hosts": ["api.openai.com"]</p>
           <p class="text-text pl-8">{"}"}</p>
           <p class="text-text pl-4">{"}"},</p>

@@ -14,8 +14,8 @@ pub struct ProxyConfig {
 /// A secret that the proxy injects into HTTP requests.
 #[derive(Debug, Clone)]
 pub struct SecretConfig {
-    /// Host environment variable to read the real value from.
-    pub from: String,
+    /// Literal secret value held on the host.
+    pub value: String,
     /// Domain patterns where this secret may be sent (e.g., "api.openai.com").
     /// The proxy only substitutes the placeholder on requests to these hosts.
     pub hosts: Vec<String>,
@@ -56,9 +56,7 @@ impl ProxyConfig {
                 .any(|pattern| domain_matches(pattern, domain))
             {
                 if let Some(placeholder) = placeholders.get(name) {
-                    if let Ok(real_value) = std::env::var(&secret.from) {
-                        result.push((placeholder.clone(), real_value));
-                    }
+                    result.push((placeholder.clone(), secret.value.clone()));
                 }
             }
         }
@@ -71,7 +69,9 @@ impl ProxyConfig {
 /// "example.com" matches exactly "example.com".
 fn domain_matches(pattern: &str, domain: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        domain.ends_with(suffix) && domain.len() > suffix.len() && domain.as_bytes()[domain.len() - suffix.len() - 1] == b'.'
+        domain.ends_with(suffix)
+            && domain.len() > suffix.len()
+            && domain.as_bytes()[domain.len() - suffix.len() - 1] == b'.'
     } else {
         pattern == domain
     }
@@ -89,5 +89,27 @@ mod tests {
         assert!(domain_matches("*.example.com", "deep.api.example.com"));
         assert!(!domain_matches("*.example.com", "example.com"));
         assert!(!domain_matches("*.example.com", "notexample.com"));
+    }
+
+    #[test]
+    fn test_secrets_for_domain_uses_literal_values() {
+        let mut config = ProxyConfig::default();
+        config.secrets.insert(
+            "API_KEY".into(),
+            SecretConfig {
+                value: "sk-test".into(),
+                hosts: vec!["api.openai.com".into()],
+            },
+        );
+
+        let placeholders = HashMap::from([("API_KEY".into(), "shuru_tok_123".into())]);
+
+        assert_eq!(
+            config.secrets_for_domain("api.openai.com", &placeholders),
+            vec![("shuru_tok_123".into(), "sk-test".into())]
+        );
+        assert!(config
+            .secrets_for_domain("api.anthropic.com", &placeholders)
+            .is_empty());
     }
 }

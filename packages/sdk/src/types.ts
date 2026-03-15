@@ -1,6 +1,6 @@
 export interface SecretConfig {
-	/** Host environment variable containing the real value. */
-	from: string;
+	/** Literal secret value held on the host. */
+	value: string;
 	/** Domains where this secret may be sent (e.g. "api.openai.com"). */
 	hosts: string[];
 }

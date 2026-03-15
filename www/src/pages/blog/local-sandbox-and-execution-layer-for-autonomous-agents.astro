@@ -73,7 +73,7 @@ await sb.stop()`;
 const configCode = `{
   "secrets": {
     "API_KEY": {
-      "from": "OPENAI_API_KEY",
+      "value": "sk-your-openai-key",
       "hosts": ["api.openai.com"]
     }
   },
@@ -121,7 +121,7 @@ const opts = {
   allowNet: true,
   secrets: {
     ANTHROPIC_API_KEY: {
-      from: "ANTHROPIC_API_KEY",
+      value: "sk-ant-your-key",
       hosts: ["api.anthropic.com"],
     },
   },

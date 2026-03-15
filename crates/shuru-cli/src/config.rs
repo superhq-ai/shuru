@@ -17,11 +17,12 @@ pub(crate) struct ShuruConfig {
 }
 
 /// A secret to inject via the proxy.
-/// Example: `{ "from": "OPENAI_API_KEY", "hosts": ["api.openai.com"] }`
+/// Example: `{ "value": "sk-your-openai-key", "hosts": ["api.openai.com"] }`
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SecretEntry {
-    /// Host environment variable containing the real value.
-    pub from: String,
+    /// Literal secret value held on the host.
+    pub value: String,
     /// Domains where this secret may be sent.
     pub hosts: Vec<String>,
 }
@@ -43,7 +44,7 @@ impl ShuruConfig {
                 proxy.secrets.insert(
                     name.clone(),
                     shuru_proxy::config::SecretConfig {
-                        from: entry.from.clone(),
+                        value: entry.value.clone(),
                         hosts: entry.hosts.clone(),
                     },
                 );
@@ -79,5 +80,47 @@ pub(crate) fn load_config(config_flag: Option<&str>) -> Result<ShuruConfig> {
             Ok(ShuruConfig::default())
         }
         Err(e) => bail!("Failed to read {}: {}", path.display(), e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_literal_secret_entries() {
+        let cfg: ShuruConfig = serde_json::from_str(
+            r#"{
+                "secrets": {
+                    "API_KEY": {
+                        "value": "sk-test",
+                        "hosts": ["api.openai.com"]
+                    }
+                }
+            }"#,
+        )
+        .expect("config should parse");
+
+        let proxy = cfg.to_proxy_config();
+        let secret = proxy.secrets.get("API_KEY").expect("secret should exist");
+        assert_eq!(secret.value, "sk-test");
+        assert_eq!(secret.hosts, vec!["api.openai.com"]);
+    }
+
+    #[test]
+    fn rejects_legacy_from_secret_entries() {
+        let err = serde_json::from_str::<ShuruConfig>(
+            r#"{
+                "secrets": {
+                    "API_KEY": {
+                        "from": "OPENAI_API_KEY",
+                        "hosts": ["api.openai.com"]
+                    }
+                }
+            }"#,
+        )
+        .expect_err("legacy secret schema should fail");
+
+        assert!(err.to_string().contains("unknown field `from`"));
     }
 }

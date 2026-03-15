@@ -5,11 +5,7 @@ use std::io::IsTerminal;
 use anyhow::{bail, Context, Result};
 
 extern "C" {
-    fn clonefile(
-        src: *const libc::c_char,
-        dst: *const libc::c_char,
-        flags: u32,
-    ) -> libc::c_int;
+    fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32) -> libc::c_int;
 }
 
 pub(crate) fn clone_file(src: &str, dst: &str) -> Result<()> {
@@ -43,11 +39,7 @@ pub(crate) struct PreparedVm {
     pub mounts: Vec<MountConfig>,
 }
 
-pub(crate) fn prepare_vm(
-    vm: &VmArgs,
-    cfg: &ShuruConfig,
-    from: Option<&str>,
-) -> Result<PreparedVm> {
+pub(crate) fn prepare_vm(vm: &VmArgs, cfg: &ShuruConfig, from: Option<&str>) -> Result<PreparedVm> {
     let cpus = vm.cpus.or(cfg.cpus).unwrap_or(2);
     let memory = vm.memory.or(cfg.memory).unwrap_or(2048);
     let disk_size = vm.disk_size.or(cfg.disk_size).unwrap_or(4096);
@@ -57,14 +49,17 @@ pub(crate) fn prepare_vm(
     let proxy_config = if allow_net {
         let mut proxy = cfg.to_proxy_config();
 
-        // Merge --secret flags: NAME=ENV_VAR@host1,host2
+        // Merge --secret flags: NAME=VALUE@host1,host2
         for s in &vm.secret {
-            let (name, from, hosts) = parse_secret_flag(s)
-                .with_context(|| format!("invalid --secret: '{}' (expected NAME=ENV@host1,host2)", s))?;
-            proxy.secrets.insert(
-                name,
-                shuru_proxy::config::SecretConfig { from, hosts },
-            );
+            let (name, value, hosts) = parse_secret_flag(s).with_context(|| {
+                format!(
+                    "invalid --secret: '{}' (expected NAME=VALUE@host1,host2)",
+                    s
+                )
+            })?;
+            proxy
+                .secrets
+                .insert(name, shuru_proxy::config::SecretConfig { value, hosts });
         }
 
         // Merge --allow-domain flags
@@ -86,8 +81,8 @@ pub(crate) fn prepare_vm(
     }
     let mut forwards = Vec::new();
     for s in &port_strs {
-        let mapping = parse_port_mapping(s)
-            .with_context(|| format!("invalid port mapping: '{}'", s))?;
+        let mapping =
+            parse_port_mapping(s).with_context(|| format!("invalid port mapping: '{}'", s))?;
         forwards.push(mapping);
     }
 
@@ -100,8 +95,7 @@ pub(crate) fn prepare_vm(
     }
     let mut mounts = Vec::new();
     for s in &mount_strs {
-        let mc = parse_mount_spec(s)
-            .with_context(|| format!("invalid mount spec: '{}'", s))?;
+        let mc = parse_mount_spec(s).with_context(|| format!("invalid mount spec: '{}'", s))?;
         mounts.push(mc);
     }
 
@@ -168,9 +162,7 @@ pub(crate) fn prepare_vm(
     clone_file(&source, &work_rootfs)?;
 
     // Extend to requested disk size
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&work_rootfs)?;
+    let f = std::fs::OpenOptions::new().write(true).open(&work_rootfs)?;
     let target = disk_size * 1024 * 1024;
     let current = f.metadata()?.len();
     if target < current {
@@ -303,7 +295,12 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<i
     let exit_code = if std::io::stdin().is_terminal() {
         sandbox.shell(command, &env)?
     } else {
-        sandbox.exec_with_env(command, &env, &mut std::io::stdout(), &mut std::io::stderr())?
+        sandbox.exec_with_env(
+            command,
+            &env,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )?
     };
 
     drop(proxy_handle);
@@ -324,7 +321,10 @@ fn parse_mount_spec(s: &str) -> Result<MountConfig> {
 
     let guest_path = parts[1].to_string();
     if !guest_path.starts_with('/') {
-        bail!("guest path must be absolute (start with /): '{}'", guest_path);
+        bail!(
+            "guest path must be absolute (start with /): '{}'",
+            guest_path
+        );
     }
 
     Ok(MountConfig {
@@ -333,19 +333,24 @@ fn parse_mount_spec(s: &str) -> Result<MountConfig> {
     })
 }
 
-/// Parse `NAME=ENV_VAR@host1,host2` into (name, from, hosts).
+/// Parse `NAME=VALUE@host1,host2` into (name, value, hosts).
 fn parse_secret_flag(s: &str) -> Result<(String, String, Vec<String>)> {
     let (name, rest) = s
         .split_once('=')
         .ok_or_else(|| anyhow::anyhow!("missing '=' separator"))?;
-    let (from, hosts_str) = rest
-        .split_once('@')
+    let (value, hosts_str) = rest
+        .rsplit_once('@')
         .ok_or_else(|| anyhow::anyhow!("missing '@' separator for hosts"))?;
-    let hosts: Vec<String> = hosts_str.split(',').map(|h| h.trim().to_string()).collect();
-    if name.is_empty() || from.is_empty() || hosts.is_empty() {
-        bail!("name, env var, and hosts must all be non-empty");
+    let hosts: Vec<String> = hosts_str
+        .split(',')
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty())
+        .map(|h| h.to_string())
+        .collect();
+    if name.is_empty() || value.is_empty() || hosts.is_empty() {
+        bail!("name, value, and hosts must all be non-empty");
     }
-    Ok((name.to_string(), from.to_string(), hosts))
+    Ok((name.to_string(), value.to_string(), hosts))
 }
 
 fn parse_port_mapping(s: &str) -> Result<PortMapping> {
@@ -363,4 +368,40 @@ fn parse_port_mapping(s: &str) -> Result<PortMapping> {
         host_port,
         guest_port,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_secret_flag;
+
+    #[test]
+    fn parses_literal_secret_flag() {
+        let (name, value, hosts) =
+            parse_secret_flag("API_KEY=sk-test@api.openai.com").expect("flag should parse");
+
+        assert_eq!(name, "API_KEY");
+        assert_eq!(value, "sk-test");
+        assert_eq!(hosts, vec!["api.openai.com"]);
+    }
+
+    #[test]
+    fn parses_secret_flag_using_last_at_as_host_separator() {
+        let (name, value, hosts) =
+            parse_secret_flag("AUTH_TOKEN=tok@segment@api.openai.com,api.anthropic.com")
+                .expect("flag should parse");
+
+        assert_eq!(name, "AUTH_TOKEN");
+        assert_eq!(value, "tok@segment");
+        assert_eq!(hosts, vec!["api.openai.com", "api.anthropic.com"]);
+    }
+
+    #[test]
+    fn rejects_secret_flag_without_hosts() {
+        let err =
+            parse_secret_flag("API_KEY=sk-test@").expect_err("flag without hosts should fail");
+
+        assert!(err
+            .to_string()
+            .contains("name, value, and hosts must all be non-empty"));
+    }
 }

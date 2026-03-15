@@ -98,16 +98,16 @@ Secrets keep API keys on the host. The guest receives a random placeholder token
 
 ```sh
 # Inject a secret via CLI
-shuru run --allow-net --secret API_KEY=OPENAI_API_KEY@api.openai.com -- curl https://api.openai.com/v1/models
+shuru run --allow-net --secret API_KEY=sk-your-openai-key@api.openai.com -- curl https://api.openai.com/v1/models
 
 # Multiple secrets
 shuru run --allow-net \
-  --secret API_KEY=OPENAI_API_KEY@api.openai.com \
-  --secret GH_TOKEN=GITHUB_TOKEN@api.github.com \
+  --secret API_KEY=sk-your-openai-key@api.openai.com \
+  --secret GH_TOKEN=github_pat_your_token@api.github.com \
   -- sh
 ```
 
-Format: `NAME=ENV_VAR@host1,host2` — `NAME` is the env var the guest sees, `ENV_VAR` is the host env var with the real value, and hosts are where the proxy substitutes it.
+Format: `NAME=VALUE@host1,host2` — `NAME` is the env var the guest sees, `VALUE` is the literal secret held on the host, and hosts are where the proxy substitutes it.
 
 Secrets can also be set in `shuru.json` (see [Config file](#config-file)).
 
@@ -126,7 +126,7 @@ Shuru loads `shuru.json` from the current directory (or `--config PATH`). All fi
   "command": ["python", "script.py"],
   "secrets": {
     "API_KEY": {
-      "from": "OPENAI_API_KEY",
+      "value": "sk-your-openai-key",
       "hosts": ["api.openai.com"]
     }
   },

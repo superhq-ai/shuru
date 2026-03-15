@@ -35,14 +35,14 @@ Secrets let the guest use API keys without exposing the real values. The guest r
   "allow_net": true,
   "secrets": {
     "API_KEY": {
-      "from": "OPENAI_API_KEY",
+      "value": "sk-your-openai-key",
       "hosts": ["api.openai.com"]
     }
   }
 }
 ```
 
-- `from`: host environment variable containing the real value
+- `value`: literal secret value held on the host
 - `hosts`: domains where the proxy will substitute the placeholder with the real value
 
 The guest sees `$API_KEY=shuru_tok_...`. The real secret never enters the VM.
@@ -77,7 +77,7 @@ Restrict which domains the guest can reach:
   "command": ["/bin/sh", "-c", "cd /workspace && sh"],
   "secrets": {
     "API_KEY": {
-      "from": "OPENAI_API_KEY",
+      "value": "sk-your-openai-key",
       "hosts": ["api.openai.com"]
     }
   },

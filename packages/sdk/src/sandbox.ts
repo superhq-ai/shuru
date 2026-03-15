@@ -202,7 +202,7 @@ export function buildArgs(bin: string, opts: StartOptions): string[] {
 
 	if (opts.secrets) {
 		for (const [name, secret] of Object.entries(opts.secrets)) {
-			args.push("--secret", `${name}=${secret.from}@${secret.hosts.join(",")}`);
+			args.push("--secret", `${name}=${secret.value}@${secret.hosts.join(",")}`);
 		}
 	}
 
