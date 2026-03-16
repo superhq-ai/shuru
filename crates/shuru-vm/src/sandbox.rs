@@ -718,7 +718,7 @@ impl Sandbox {
                             let vm = Arc::clone(&vm);
                             std::thread::spawn(move || {
                                 if let Err(e) = handle_forward_connection(tcp_stream, &vm, guest_port) {
-                                    eprintln!("shuru: port forward error: {}", e);
+                                    tracing::debug!("port forward error: {}", e);
                                 }
                             });
                         }
@@ -740,7 +740,7 @@ impl Sandbox {
 
         Ok(PortForwardHandle {
             stop,
-            _threads: listeners,
+            threads: listeners,
         })
     }
 
@@ -778,15 +778,18 @@ impl Sandbox {
 // --- Port forwarding ---
 
 /// Handle returned by `start_port_forwarding`. Signals all listener threads
-/// to stop when dropped.
+/// to stop and joins them when dropped.
 pub struct PortForwardHandle {
     stop: Arc<AtomicBool>,
-    _threads: Vec<std::thread::JoinHandle<()>>,
+    threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for PortForwardHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
     }
 }
 

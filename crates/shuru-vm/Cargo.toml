@@ -1,6 +1,6 @@
 [package]
 name = "shuru-vm"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "High-level VM management for shuru"
 license = "Apache-2.0"

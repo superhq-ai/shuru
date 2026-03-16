@@ -365,6 +365,7 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
 
     let mut pid_counter: u64 = 0;
     let mut processes: HashMap<String, ProcessHandle> = HashMap::new();
+    let mut bg_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
     // Spawn a thread to drain events and write notifications to stdout.
     // This ensures we never block the main stdin-reading loop.
@@ -471,7 +472,7 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let mut spawn_env = secret_env.clone();
                 spawn_env.extend(params.env.into_iter());
 
-                std::thread::spawn(move || {
+                bg_threads.push(std::thread::spawn(move || {
                     let argv: Vec<&str> = params.argv.iter().map(|s| s.as_str()).collect();
                     let stream = match sb.open_exec(&argv, &spawn_env, params.cwd.as_deref()) {
                         Ok(s) => s,
@@ -564,7 +565,7 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                     }
 
                     let _ = input_thread.join();
-                });
+                }));
 
                 send_result_shared(&out, req.id, SpawnResultPayload { pid })?;
             }
@@ -610,7 +611,7 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let path = params.path.clone();
                 let recursive = params.recursive;
 
-                std::thread::spawn(move || {
+                bg_threads.push(std::thread::spawn(move || {
                     let stream = match sb.open_watch(&path, recursive) {
                         Ok(s) => s,
                         Err(e) => {
@@ -632,7 +633,7 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                             _ => break,
                         }
                     }
-                });
+                }));
 
                 send_result_shared(&out, req.id, EmptyResult {})?;
             }
@@ -807,7 +808,15 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
         }
     }
 
+    // Stop the VM first — this closes vsock connections, unblocking
+    // any background threads stuck on read_frame().
     let _ = sandbox.stop();
+
+    // Wait briefly for background threads to notice and exit
+    for thread in bg_threads {
+        let _ = thread.join();
+    }
+
     drop(event_tx);
     let _ = event_thread.join();
     Ok(0)

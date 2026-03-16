@@ -7,9 +7,9 @@ license = "Apache-2.0"
 repository = "https://github.com/superhq-ai/shuru"
 
 [dependencies]
-shuru-vm = { version = "0.3.0", path = "../shuru-vm" }
+shuru-vm = { version = "0.3.1", path = "../shuru-vm" }
 shuru-proto = { version = "0.3.0", path = "../shuru-proto" }
-shuru-proxy = { version = "0.1.0", path = "../shuru-proxy" }
+shuru-proxy = { version = "0.2.0", path = "../shuru-proxy" }
 tokio = { version = "1", features = ["sync"] }
 anyhow = "1"
 libc = "0.2"

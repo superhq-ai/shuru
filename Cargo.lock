@@ -1069,7 +1069,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shuru-cli"
-version = "0.5.0"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "shuru-proxy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "shuru-vm"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",

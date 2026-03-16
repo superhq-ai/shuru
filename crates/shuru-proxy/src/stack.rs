@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::RawFd;
 
@@ -66,8 +66,16 @@ pub struct NetworkStack {
     sockets: SocketSet<'static>,
     dns_handle: SocketHandle,
     connections: HashMap<SocketHandle, SocketAddr>,
-    listening: HashMap<(Ipv4Address, u16), SocketHandle>,
+    /// Listening sockets per destination. Multiple sockets support concurrent
+    /// connections to the same IP:port (e.g. parallel npm downloads).
+    listening: HashMap<(Ipv4Address, u16), Vec<SocketHandle>>,
     pending_send: HashMap<SocketHandle, VecDeque<u8>>,
+    /// Sockets waiting for pending_send to drain before closing.
+    closing: HashSet<SocketHandle>,
+    /// Reusable buffer for poll_tcp_sockets recv_slice.
+    recv_buf: Vec<u8>,
+    /// Reusable scratch map for inspect_pending_frames.
+    syn_scratch: HashMap<(Ipv4Address, u16), usize>,
     event_tx: mpsc::UnboundedSender<StackEvent>,
     cmd_rx: mpsc::UnboundedReceiver<StackCommand>,
 }
@@ -115,6 +123,9 @@ impl NetworkStack {
             connections: HashMap::new(),
             listening: HashMap::new(),
             pending_send: HashMap::new(),
+            closing: HashSet::new(),
+            recv_buf: vec![0u8; TCP_RX_BUF_SIZE],
+            syn_scratch: HashMap::new(),
             event_tx,
             cmd_rx,
         }
@@ -125,9 +136,9 @@ impl NetworkStack {
         loop {
             self.process_commands();
 
-            // Pre-read a frame and inspect it for TCP SYN
-            self.device.try_recv();
-            self.inspect_pending_frame();
+            // Drain all available frames and inspect for TCP SYN
+            self.device.drain_recv();
+            self.inspect_pending_frames();
 
             self.iface
                 .poll(Self::now(), &mut self.device, &mut self.sockets);
@@ -163,10 +174,17 @@ impl NetworkStack {
                         .extend(&payload);
                 }
                 StackCommand::Close { id } => {
-                    let socket = self.sockets.get_mut::<TcpSocket>(id.0);
-                    socket.close();
-                    self.connections.remove(&id.0);
-                    self.pending_send.remove(&id.0);
+                    // Defer close until pending_send is drained so we don't
+                    // drop data that hasn't been pushed to smoltcp yet.
+                    if self.pending_send.get(&id.0).map_or(true, |p| p.is_empty()) {
+                        // Nothing pending — close immediately
+                        let socket = self.sockets.get_mut::<TcpSocket>(id.0);
+                        socket.close();
+                        self.connections.remove(&id.0);
+                        self.pending_send.remove(&id.0);
+                    } else {
+                        self.closing.insert(id.0);
+                    }
                 }
                 StackCommand::DnsResponse { dst, payload } => {
                     let socket = self.sockets.get_mut::<UdpSocket>(self.dns_handle);
@@ -178,43 +196,48 @@ impl NetworkStack {
         }
     }
 
-    fn inspect_pending_frame(&mut self) {
-        // Extract SYN destination from the pending frame without copying the
-        // entire frame — only borrow self.device immutably for parsing, then
-        // release the borrow before mutating self.listening/self.sockets.
-        let (dst_ip, dst_port) = match self.device.peek_frame() {
-            Some(frame) => match Self::parse_syn_dst(frame) {
-                Some(pair) => pair,
-                None => return,
-            },
-            None => return,
-        };
-
-        if self.listening.contains_key(&(dst_ip, dst_port)) {
-            return;
+    fn inspect_pending_frames(&mut self) {
+        // Count SYNs per destination. Multiple SYNs to the same IP:port
+        // need separate listening sockets (one per connection).
+        self.syn_scratch.clear();
+        for frame in self.device.pending_frames() {
+            if let Some((dst_ip, dst_port)) = Self::parse_syn_dst(frame) {
+                *self.syn_scratch.entry((dst_ip, dst_port)).or_default() += 1;
+            }
         }
 
-        let dst_addr = SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::from(dst_ip.octets())),
-            dst_port,
-        );
-        if self.connections.values().any(|a| *a == dst_addr) {
-            return;
+        // Drain into a local vec to release &mut self borrow on syn_scratch
+        let syn_entries: Vec<_> = self.syn_scratch.drain().collect();
+        for ((dst_ip, dst_port), syn_count) in syn_entries {
+            let existing = self
+                .listening
+                .get(&(dst_ip, dst_port))
+                .map_or(0, |v| v.len());
+            let needed = syn_count.saturating_sub(existing);
+
+            for _ in 0..needed {
+                debug!("SYN → {}:{}, adding listener", dst_ip, dst_port);
+
+                let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUF_SIZE]);
+                let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUF_SIZE]);
+                let mut socket = TcpSocket::new(rx_buf, tx_buf);
+                if socket
+                    .listen(IpListenEndpoint {
+                        addr: Some(IpAddress::Ipv4(dst_ip)),
+                        port: dst_port,
+                    })
+                    .is_err()
+                {
+                    warn!("failed to listen on {}:{}", dst_ip, dst_port);
+                    continue;
+                }
+                let handle = self.sockets.add(socket);
+                self.listening
+                    .entry((dst_ip, dst_port))
+                    .or_default()
+                    .push(handle);
+            }
         }
-
-        debug!("SYN → {}:{}, adding listener", dst_ip, dst_port);
-
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUF_SIZE]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUF_SIZE]);
-        let mut socket = TcpSocket::new(rx_buf, tx_buf);
-        socket
-            .listen(IpListenEndpoint {
-                addr: Some(IpAddress::Ipv4(dst_ip)),
-                port: dst_port,
-            })
-            .expect("listen on dynamic port");
-        let handle = self.sockets.add(socket);
-        self.listening.insert((dst_ip, dst_port), handle);
     }
 
     /// Parse a TCP SYN's destination from a raw Ethernet frame.
@@ -239,25 +262,35 @@ impl NetworkStack {
         let handles: Vec<SocketHandle> = self.pending_send.keys().copied().collect();
         for handle in handles {
             let socket = self.sockets.get_mut::<TcpSocket>(handle);
-            if !socket.can_send() {
-                continue;
-            }
+            let mut drained_empty = false;
             if let Some(pending) = self.pending_send.get_mut(&handle) {
-                let (a, b) = pending.as_slices();
-                let slice = if !a.is_empty() { a } else { b };
-                if slice.is_empty() {
-                    continue;
-                }
-                match socket.send_slice(slice) {
-                    Ok(n) if n > 0 => {
-                        pending.drain(..n);
+                // Loop to drain both slices of the VecDeque ring buffer
+                while !pending.is_empty() && socket.can_send() {
+                    let (a, _) = pending.as_slices();
+                    if a.is_empty() {
+                        break;
                     }
-                    Err(e) => {
-                        warn!("failed to send to guest: {e}");
-                        pending.clear();
+                    match socket.send_slice(a) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            pending.drain(..n);
+                        }
+                        Err(e) => {
+                            warn!("failed to send to guest: {e}");
+                            pending.clear();
+                            break;
+                        }
                     }
-                    _ => {}
                 }
+                drained_empty = pending.is_empty();
+            }
+            // If this socket was waiting to close and all data is now flushed,
+            // initiate the TCP close (FIN).
+            if drained_empty && self.closing.remove(&handle) {
+                let socket = self.sockets.get_mut::<TcpSocket>(handle);
+                socket.close();
+                self.connections.remove(&handle);
+                self.pending_send.remove(&handle);
             }
         }
     }
@@ -266,6 +299,7 @@ impl NetworkStack {
         let handles: Vec<SocketHandle> = self
             .listening
             .values()
+            .flatten()
             .copied()
             .chain(self.connections.keys().copied())
             .collect();
@@ -281,7 +315,13 @@ impl NetworkStack {
                     let ipv4 = match local.addr {
                         IpAddress::Ipv4(ip) => ip,
                     };
-                    self.listening.remove(&(ipv4, local.port));
+                    // Remove this specific handle from the listener vec
+                    if let Some(handles) = self.listening.get_mut(&(ipv4, local.port)) {
+                        handles.retain(|h| *h != handle);
+                        if handles.is_empty() {
+                            self.listening.remove(&(ipv4, local.port));
+                        }
+                    }
 
                     let actual_dst = SocketAddr::new(
                         IpAddr::V4(Ipv4Addr::from(ipv4.octets())),
@@ -298,13 +338,11 @@ impl NetworkStack {
 
             // Read data from established connections
             if self.connections.contains_key(&handle) && socket.can_recv() {
-                let mut buf = vec![0u8; TCP_RX_BUF_SIZE];
-                match socket.recv_slice(&mut buf) {
+                match socket.recv_slice(&mut self.recv_buf) {
                     Ok(n) if n > 0 => {
-                        buf.truncate(n);
                         let _ = self.event_tx.send(StackEvent::Data {
                             id: ConnectionId(handle),
-                            payload: buf,
+                            payload: self.recv_buf[..n].to_vec(),
                         });
                     }
                     _ => {}
