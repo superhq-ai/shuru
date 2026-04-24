@@ -15,14 +15,21 @@ shuru-vm = { path = "../shuru-vm" }
 shuru-proto = { path = "../shuru-proto" }
 shuru-proxy = { path = "../shuru-proxy" }
 shuru-store = { path = "../shuru-store" }
+kulfi-utils = { git = "https://github.com/fastn-stack/kulfi", rev = "ef84fd730f09010f38d73ee78a3aa3ee11c9778c", package = "kulfi-utils" }
+kulfi-id52 = { git = "https://github.com/fastn-stack/kulfi", rev = "ef84fd730f09010f38d73ee78a3aa3ee11c9778c", package = "kulfi-id52" }
 blake3 = "1"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
+eyre = "0.6"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "tokio", "http1", "http2"] }
+iroh = "0.95.1"
 libc = "0.2"
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tar = "0.4.45"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = { version = "3", features = ["json"] }

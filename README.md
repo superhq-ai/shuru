@@ -88,6 +88,26 @@ shuru run -p 8080:80 -p 8443:443 -- nginx
 
 Port forwards can also be set in `shuru.json` (see [Config file](#config-file)).
 
+### Kulfi tunnels
+
+Attach a Kulfi tunnel to an already-forwarded host port with `--kulfi HOST_PORT:http|tcp[:BRIDGE_PORT]`.
+
+```sh
+# HTTP service: host 3000 forwards into the guest, then shuru starts a local Kulfi bridge
+shuru run -p 3000:3000 --kulfi 3000:http -- python3 -m http.server 3000
+
+# TCP service with an explicit local bridge port
+shuru run -p 2222:22 --kulfi 2222:tcp:9001 -- /usr/sbin/sshd -D
+```
+
+For HTTP, shuru prints:
+
+- a localhost bridge URL you can test immediately
+- a Kulfi identity
+- a bridge-dependent public URL of the form `https://<id52>.<domain>`
+
+The current implementation is aimed at local testing first. It uses Kulfi's crates directly and starts a localhost bridge inside the same `shuru run`. The printed public URL depends on an external or self-hosted Kulfi HTTP bridge being available.
+
 ### Checkpoints
 
 Checkpoints save the disk state so you can reuse an environment across runs.

@@ -70,6 +70,25 @@ Port forwards can also be set in `shuru.json`:
 
 CLI `-p` flags are merged with config ports (not replaced).
 
+## Kulfi Tunnels
+
+Attach Kulfi exposure to an existing forwarded host port:
+
+```bash
+shuru run -p 3000:3000 --kulfi 3000:http -- python3 -m http.server 3000
+shuru run -p 2222:22 --kulfi 2222:tcp:9001 -- /usr/sbin/sshd -D
+```
+
+`--kulfi` takes `HOST_PORT:http|tcp[:BRIDGE_PORT]` and requires a matching `-p/--port` host port.
+
+For HTTP, shuru starts a localhost bridge and prints:
+
+- a local URL like `http://127.0.0.1:<port>` for immediate testing
+- the Kulfi identity
+- the bridge-dependent public URL `https://<id52>.<domain>`
+
+The public URL only works when a Kulfi HTTP bridge is available. The current integration is designed so the local bridge path works even when the default public bridge domain is down.
+
 ## Without Networking
 
 When `--allow-net` is not set, the VM has no network device. DNS resolution, HTTP requests, and package installs will fail. This is the intended default for maximum isolation.

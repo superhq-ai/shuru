@@ -139,6 +139,16 @@ shuru run --allow-net --from node-env -p 3000:3000 --mount .:/app -- sh -c '
 # Access at http://localhost:3000 on the host
 ```
 
+### Kulfi Tunnel For Local Testing
+
+Attach Kulfi to a forwarded host port:
+
+```bash
+shuru run -p 3000:3000 --kulfi 3000:http -- python3 -m http.server 3000
+```
+
+This keeps the normal `-p` forward and also starts a localhost Kulfi bridge so you can test the integration even if the public bridge domain is unavailable. `--kulfi` values are `HOST_PORT:http|tcp[:BRIDGE_PORT]` and must reference a host port already declared with `-p`.
+
 ### Stacking Checkpoints
 
 Build environments incrementally:
