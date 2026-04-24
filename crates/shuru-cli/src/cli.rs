@@ -38,6 +38,14 @@ pub(crate) struct VmArgs {
     #[arg(short = 'p', long = "port", value_name = "HOST:GUEST")]
     pub port: Vec<String>,
 
+    /// Expose a forwarded host port over Kulfi (HOST_PORT:http|tcp[:BRIDGE_PORT])
+    #[arg(long = "kulfi", value_name = "HOST_PORT:http|tcp[:BRIDGE_PORT]")]
+    pub kulfi: Vec<String>,
+
+    /// Domain suffix to print for Kulfi HTTP URLs
+    #[arg(long = "kulfi-bridge-domain", default_value = "kulfi.site")]
+    pub kulfi_bridge_domain: String,
+
     /// Mount a host directory into the VM (HOST:GUEST[:ro|:rw], default ro)
     #[arg(long = "mount", value_name = "HOST:GUEST[:ro|:rw]")]
     pub mount: Vec<String>,

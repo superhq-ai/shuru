@@ -2,6 +2,7 @@ mod assets;
 mod checkpoint;
 mod cli;
 mod config;
+mod kulfi;
 mod stdio;
 mod vm;
 
