@@ -262,4 +262,116 @@ mod tests {
         assert!(!VZDevice::is_icmp(&[]));
         assert!(!VZDevice::is_icmp(&[0u8; 23])); // too short to read proto field
     }
+
+    /// RAII socketpair: `(host_fd, peer_fd)` closed on drop. The host_fd is
+    /// the end given to a `VZDevice`; the peer_fd is the test driver's end.
+    struct Pair {
+        host_fd: RawFd,
+        peer_fd: RawFd,
+    }
+
+    impl Pair {
+        fn new() -> Self {
+            let mut fds = [0i32; 2];
+            let r = unsafe {
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr())
+            };
+            assert_eq!(r, 0, "socketpair failed");
+            // Generous buffer so we can queue >MAX_PENDING_FRAMES frames.
+            let bufsize: libc::c_int = 16 * 1024 * 1024;
+            for fd in fds.iter() {
+                unsafe {
+                    libc::setsockopt(
+                        *fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        &bufsize as *const _ as _,
+                        std::mem::size_of::<libc::c_int>() as _,
+                    );
+                    libc::setsockopt(
+                        *fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVBUF,
+                        &bufsize as *const _ as _,
+                        std::mem::size_of::<libc::c_int>() as _,
+                    );
+                }
+            }
+            Pair {
+                host_fd: fds[1],
+                peer_fd: fds[0],
+            }
+        }
+
+        fn send(&self, frame: &[u8]) {
+            let n = unsafe {
+                libc::send(
+                    self.peer_fd,
+                    frame.as_ptr() as *const libc::c_void,
+                    frame.len(),
+                    0,
+                )
+            };
+            assert!(n > 0, "send failed: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    impl Drop for Pair {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.host_fd);
+                libc::close(self.peer_fd);
+            }
+        }
+    }
+
+    #[test]
+    fn drain_recv_returns_wouldblock_on_empty_fd() {
+        let pair = Pair::new();
+        let mut device = VZDevice::new(pair.host_fd);
+        assert_eq!(device.drain_recv(), DrainStatus::WouldBlock);
+        assert!(device.pending_rx_empty());
+    }
+
+    #[test]
+    fn drain_recv_accumulates_non_icmp_frames() {
+        let pair = Pair::new();
+        let frame = make_frame(6); // TCP
+        for _ in 0..3 {
+            pair.send(&frame);
+        }
+        let mut device = VZDevice::new(pair.host_fd);
+        assert_eq!(device.drain_recv(), DrainStatus::WouldBlock);
+        assert_eq!(device.pending_rx.len(), 3);
+    }
+
+    #[test]
+    fn drain_recv_discards_icmp_frames() {
+        let pair = Pair::new();
+        pair.send(&make_frame(1)); // ICMP — should be dropped
+        pair.send(&make_frame(6)); // TCP — should be kept
+        pair.send(&make_frame(1)); // ICMP — should be dropped
+        pair.send(&make_frame(17)); // UDP — should be kept
+        let mut device = VZDevice::new(pair.host_fd);
+        assert_eq!(device.drain_recv(), DrainStatus::WouldBlock);
+        assert_eq!(device.pending_rx.len(), 2);
+    }
+
+    #[test]
+    fn drain_recv_returns_hit_cap_when_pending_rx_fills() {
+        let pair = Pair::new();
+        let frame = make_frame(6); // TCP
+        // Send slightly more than MAX_PENDING_FRAMES so HitCap is unambiguous.
+        for _ in 0..(MAX_PENDING_FRAMES + 16) {
+            pair.send(&frame);
+        }
+        let mut device = VZDevice::new(pair.host_fd);
+        assert_eq!(device.drain_recv(), DrainStatus::HitCap);
+        assert_eq!(device.pending_rx.len(), MAX_PENDING_FRAMES);
+        // A second drain should pick up the rest and end at WouldBlock.
+        device.pending_rx.clear();
+        let status = device.drain_recv();
+        assert!(matches!(status, DrainStatus::WouldBlock | DrainStatus::HitCap));
+    }
+
 }
