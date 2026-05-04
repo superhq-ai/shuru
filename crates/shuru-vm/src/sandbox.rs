@@ -186,7 +186,13 @@ impl VmConfigBuilder {
         config.set_storage_devices(&[&block_device]);
 
         if let Some(fd) = self.network_fd {
-            let net_attachment = FileHandleNetworkAttachment::new(fd);
+            // IP-MTU 65535: hands smoltcp/host one ~64 KiB super-frame per
+            // syscall instead of segmenting at 1500 B. Must match
+            // `shuru_proxy::device::MTU` (Ethernet frame size = 14 + this).
+            // The associated socket buffers are sized in
+            // `shuru_proxy::create_socketpair`.
+            const NET_IP_MTU: i64 = 65535;
+            let net_attachment = FileHandleNetworkAttachment::new(fd, NET_IP_MTU);
             let net_device = VirtioNetworkDevice::new_with_attachment(&net_attachment);
             net_device.set_mac_address(&MACAddress::random_local());
             config.set_network_devices(&[net_device]);
