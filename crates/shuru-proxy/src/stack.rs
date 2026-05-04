@@ -21,8 +21,11 @@ const PREFIX_LEN: u8 = 24;
 /// Gateway MAC address (locally administered).
 const GATEWAY_MAC: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
 
-const TCP_RX_BUF_SIZE: usize = 65536;
-const TCP_TX_BUF_SIZE: usize = 65536;
+// 4 MiB per direction: with TCP window scaling (RFC 1323) this lifts the
+// Bandwidth-Delay Product ceiling to ~70 MB/s at 50 ms RTT. Each established
+// connection costs (RX + TX) of host RAM in smoltcp ring buffers.
+const TCP_RX_BUF_SIZE: usize = 4 * 1024 * 1024;
+const TCP_TX_BUF_SIZE: usize = 4 * 1024 * 1024;
 
 /// A new TCP connection from the guest, ready to be proxied.
 pub struct TcpConnection {
