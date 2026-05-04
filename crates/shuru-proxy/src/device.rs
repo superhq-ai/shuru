@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::io;
 use std::os::unix::io::RawFd;
 
 use smoltcp::phy::{self, Checksum, Device, DeviceCapabilities, Medium};
@@ -6,6 +7,31 @@ use smoltcp::time::Instant;
 
 const MTU: usize = 1514; // 14-byte Ethernet header + 1500-byte IP payload
 const MAX_PENDING_FRAMES: usize = 256;
+
+/// Result of pulling a single frame from the host AF_UNIX socket.
+enum RecvOne {
+    /// A frame was read into the buffer.
+    Frame(Vec<u8>),
+    /// `recv()` returned `EAGAIN`/`EWOULDBLOCK`: the socket is fully drained.
+    WouldBlock,
+    /// `recv()` returned a real error or 0-byte EOF.
+    Error(io::Error),
+}
+
+/// Outcome of [`VZDevice::drain_recv`]. Drives readiness bookkeeping in the
+/// event-driven poll loop: we may only `clear_ready()` on the host FD when
+/// the kernel has actually told us `WouldBlock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainStatus {
+    /// Drained until `recv()` returned `EWOULDBLOCK` — no more frames.
+    WouldBlock,
+    /// Stopped early because `pending_rx` reached `MAX_PENDING_FRAMES`. The
+    /// kernel buffer may still hold data; the loop must re-poll without
+    /// clearing FD readiness.
+    HitCap,
+    /// `recv()` returned an error (other than `EWOULDBLOCK`) or EOF.
+    Error,
+}
 
 /// smoltcp Device backed by a Unix datagram socketpair fd.
 ///
@@ -28,8 +54,20 @@ impl VZDevice {
         }
     }
 
+    /// The host end of the AF_UNIX socketpair. Used by the network stack to
+    /// register readiness with the async runtime.
+    pub fn fd(&self) -> RawFd {
+        self.fd
+    }
+
+    /// Whether any pre-read frames are still queued for smoltcp to consume.
+    pub fn pending_rx_empty(&self) -> bool {
+        self.pending_rx.is_empty()
+    }
+
     /// Non-blocking read of a single frame from the socketpair.
-    fn recv_one_frame(&mut self) -> Option<Vec<u8>> {
+    /// Distinguishes "no data right now" (`WouldBlock`) from real errors.
+    fn recv_one_frame(&mut self) -> RecvOne {
         let n = unsafe {
             libc::recv(
                 self.fd,
@@ -38,10 +76,18 @@ impl VZDevice {
                 libc::MSG_DONTWAIT,
             )
         };
-        if n <= 0 {
-            return None;
+        if n > 0 {
+            return RecvOne::Frame(self.recv_buf[..n as usize].to_vec());
         }
-        Some(self.recv_buf[..n as usize].to_vec())
+        if n == 0 {
+            return RecvOne::Error(io::Error::new(io::ErrorKind::UnexpectedEof, "fd closed"));
+        }
+        let err = io::Error::last_os_error();
+        // On Darwin/Linux EAGAIN == EWOULDBLOCK; match on the value once.
+        match err.raw_os_error() {
+            Some(libc::EAGAIN) => RecvOne::WouldBlock,
+            _ => RecvOne::Error(err),
+        }
     }
 
     /// Drain all available frames from the socketpair (non-blocking).
@@ -51,14 +97,19 @@ impl VZDevice {
     /// DNS (UDP 53). Without this filter, smoltcp auto-replies to ICMP
     /// echo requests for any IP (due to any_ip=true), which leaks a
     /// response channel even though no data actually reaches the internet.
-    pub fn drain_recv(&mut self) {
+    pub fn drain_recv(&mut self) -> DrainStatus {
         while self.pending_rx.len() < MAX_PENDING_FRAMES {
             match self.recv_one_frame() {
-                Some(frame) if Self::is_icmp(&frame) => continue,
-                Some(frame) => self.pending_rx.push_back(frame),
-                None => break,
+                RecvOne::Frame(frame) if Self::is_icmp(&frame) => continue,
+                RecvOne::Frame(frame) => self.pending_rx.push_back(frame),
+                RecvOne::WouldBlock => return DrainStatus::WouldBlock,
+                RecvOne::Error(e) => {
+                    tracing::debug!("host_fd recv error: {e}");
+                    return DrainStatus::Error;
+                }
             }
         }
+        DrainStatus::HitCap
     }
 
     /// Check if a raw Ethernet frame carries an ICMP packet.
@@ -124,10 +175,13 @@ impl Device for VZDevice {
         // socketpair for frames that arrived during poll. Drop ICMP in both
         // paths to match the filter in drain_recv().
         loop {
-            let buffer = self
-                .pending_rx
-                .pop_front()
-                .or_else(|| self.recv_one_frame())?;
+            let buffer = match self.pending_rx.pop_front() {
+                Some(b) => b,
+                None => match self.recv_one_frame() {
+                    RecvOne::Frame(b) => b,
+                    RecvOne::WouldBlock | RecvOne::Error(_) => return None,
+                },
+            };
             if Self::is_icmp(&buffer) {
                 continue;
             }

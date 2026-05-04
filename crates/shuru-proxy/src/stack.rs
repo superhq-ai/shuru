@@ -10,10 +10,12 @@ use smoltcp::wire::{
     EthernetAddress, EthernetFrame, HardwareAddress, IpAddress, IpCidr, IpEndpoint,
     IpListenEndpoint, Ipv4Address, Ipv4Packet, TcpPacket,
 };
+use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::device::VZDevice;
+use crate::device::{DrainStatus, VZDevice};
 
 /// Gateway IP inside the virtual network (host-side smoltcp).
 pub const GATEWAY_IP: Ipv4Address = Ipv4Address::new(10, 0, 0, 1);
@@ -134,73 +136,135 @@ impl NetworkStack {
         }
     }
 
-    /// Run the poll loop. Blocks the current thread.
+    /// Run the poll loop. Blocks the current thread until the proxy engine
+    /// drops `cmd_tx` or the host FD closes.
+    ///
+    /// Internally this hosts a Tokio current-thread runtime so the loop can
+    /// `select!` over (a) host FD readiness via [`AsyncFd`], (b) commands on
+    /// `cmd_rx`, and (c) smoltcp's own timer (`poll_delay`). This replaces a
+    /// previous `thread::sleep(1ms)` busy-wait that bounded the smoltcp ↔
+    /// guest internal RTT and capped throughput at ~1 MB/s regardless of
+    /// buffer sizes.
     pub fn run(&mut self) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("failed to build current-thread runtime for netstack");
+        rt.block_on(self.run_async());
+    }
+
+    async fn run_async(&mut self) {
+        let async_fd = match AsyncFd::with_interest(self.device.fd(), Interest::READABLE) {
+            Ok(fd) => fd,
+            Err(e) => {
+                warn!("AsyncFd registration failed for host_fd: {e}");
+                return;
+            }
+        };
+
         loop {
-            self.process_commands();
-
-            // Drain all available frames and inspect for TCP SYN
-            self.device.drain_recv();
+            // Synchronous work phase: drain everything available right now.
+            // (Commands are drained inside the select! arm so they share a
+            //  single waker; this top-of-loop drain is just for frames.)
+            let drain_status = self.device.drain_recv();
             self.inspect_pending_frames();
-
             self.iface
                 .poll(Self::now(), &mut self.device, &mut self.sockets);
-
             self.poll_tcp_sockets();
             self.drain_pending_sends();
             self.poll_dns_socket();
 
-            let delay = self
-                .iface
-                .poll_delay(Self::now(), &self.sockets)
-                .map(|d| {
-                    let micros = d.total_micros();
-                    if micros == 0 {
-                        std::time::Duration::from_millis(1)
-                    } else {
-                        std::time::Duration::from_micros(micros.min(50_000))
-                    }
-                })
-                .unwrap_or(std::time::Duration::from_millis(1));
+            let poll_delay = self.iface.poll_delay(Self::now(), &self.sockets);
 
-            std::thread::sleep(delay);
+            // If there is still local work, do not await — loop immediately.
+            // This covers: drain stopped at MAX_PENDING_FRAMES with the
+            // kernel buffer still non-empty, smoltcp wants an immediate
+            // re-poll, or pre-read frames remain queued (e.g. produced by
+            // smoltcp itself during the previous poll).
+            let immediate = matches!(drain_status, DrainStatus::HitCap)
+                || !self.device.pending_rx_empty()
+                || matches!(poll_delay, Some(d) if d.total_micros() == 0);
+            if immediate {
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            // Convert smoltcp's poll_delay into a tokio sleep deadline.
+            let sleep_micros = poll_delay.map(|d| d.total_micros());
+
+            tokio::select! {
+                biased;
+                // (1) Frame arrived from guest.
+                ready = async_fd.readable() => {
+                    match ready {
+                        Ok(mut guard) => {
+                            // Acknowledge readiness; the next loop iteration
+                            // will drain via MSG_DONTWAIT. If we are wrong and
+                            // the FD isn't really readable yet, drain_recv()
+                            // will return WouldBlock and we re-await.
+                            guard.clear_ready();
+                        }
+                        Err(e) => {
+                            warn!("AsyncFd readable error: {e}");
+                            return;
+                        }
+                    }
+                }
+                // (2) Command arrived from proxy engine. Drain the rest with
+                //     try_recv() so a burst of commands costs one wake.
+                maybe_cmd = self.cmd_rx.recv() => {
+                    match maybe_cmd {
+                        Some(cmd) => {
+                            self.handle_command(cmd);
+                            while let Ok(cmd) = self.cmd_rx.try_recv() {
+                                self.handle_command(cmd);
+                            }
+                        }
+                        None => {
+                            // Proxy engine dropped its cmd_tx — shut down.
+                            return;
+                        }
+                    }
+                }
+                // (3) smoltcp's own timer (retransmit / delayed ACK).
+                _ = sleep_or_pending(sleep_micros) => {}
+            }
         }
     }
 
-    fn process_commands(&mut self) {
-        while let Ok(cmd) = self.cmd_rx.try_recv() {
-            match cmd {
-                StackCommand::Send { id, payload } => {
-                    // Ignore sends for connections already removed by poll_tcp_sockets
-                    if !self.connections.contains_key(&id.0) {
-                        continue;
-                    }
-                    self.pending_send.entry(id.0).or_default().extend(&payload);
+    fn handle_command(&mut self, cmd: StackCommand) {
+        match cmd {
+            StackCommand::Send { id, payload } => {
+                // Ignore sends for connections already removed by poll_tcp_sockets
+                if !self.connections.contains_key(&id.0) {
+                    return;
                 }
-                StackCommand::Close { id } => {
-                    // Connection may have already been cleaned up by poll_tcp_sockets
-                    if !self.connections.contains_key(&id.0) {
-                        self.pending_send.remove(&id.0);
-                        self.closing.remove(&id.0);
-                        continue;
-                    }
-                    // Defer close until pending_send is drained so we don't
-                    // drop data that hasn't been pushed to smoltcp yet.
-                    if self.pending_send.get(&id.0).map_or(true, |p| p.is_empty()) {
-                        // Nothing pending — close immediately
-                        let socket = self.sockets.get_mut::<TcpSocket>(id.0);
-                        socket.close();
-                        self.connections.remove(&id.0);
-                        self.pending_send.remove(&id.0);
-                    } else {
-                        self.closing.insert(id.0);
-                    }
+                self.pending_send.entry(id.0).or_default().extend(&payload);
+            }
+            StackCommand::Close { id } => {
+                // Connection may have already been cleaned up by poll_tcp_sockets
+                if !self.connections.contains_key(&id.0) {
+                    self.pending_send.remove(&id.0);
+                    self.closing.remove(&id.0);
+                    return;
                 }
-                StackCommand::DnsResponse { dst, payload } => {
-                    let socket = self.sockets.get_mut::<UdpSocket>(self.dns_handle);
-                    if let Err(e) = socket.send_slice(&payload, dst) {
-                        warn!("failed to send DNS response: {e}");
-                    }
+                // Defer close until pending_send is drained so we don't
+                // drop data that hasn't been pushed to smoltcp yet.
+                if self.pending_send.get(&id.0).map_or(true, |p| p.is_empty()) {
+                    // Nothing pending — close immediately
+                    let socket = self.sockets.get_mut::<TcpSocket>(id.0);
+                    socket.close();
+                    self.connections.remove(&id.0);
+                    self.pending_send.remove(&id.0);
+                } else {
+                    self.closing.insert(id.0);
+                }
+            }
+            StackCommand::DnsResponse { dst, payload } => {
+                let socket = self.sockets.get_mut::<UdpSocket>(self.dns_handle);
+                if let Err(e) = socket.send_slice(&payload, dst) {
+                    warn!("failed to send DNS response: {e}");
                 }
             }
         }
@@ -399,5 +463,16 @@ impl NetworkStack {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap();
         Instant::from_micros(ts.as_micros() as i64)
+    }
+}
+
+/// Sleep for `micros` microseconds, or never resolve if `None`.
+/// Used as the third arm of `select!` so the loop wakes when smoltcp's own
+/// timer fires (delayed ACK / retransmit) but stays asleep otherwise.
+async fn sleep_or_pending(micros: Option<u64>) {
+    match micros {
+        Some(0) => {} // immediate; loop will continue without awaiting wakers
+        Some(us) => tokio::time::sleep(std::time::Duration::from_micros(us)).await,
+        None => std::future::pending::<()>().await,
     }
 }
