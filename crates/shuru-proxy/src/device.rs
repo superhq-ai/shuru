@@ -6,7 +6,13 @@ use smoltcp::phy::{self, Checksum, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
 const MTU: usize = 1514; // 14-byte Ethernet header + 1500-byte IP payload
-const MAX_PENDING_FRAMES: usize = 256;
+// Sized to comfortably hold a full 4 MiB BDP burst (≈ 2 800 frames) in a
+// single drain, so smoltcp processes it as one batch (one ACK round, one
+// socket walk) instead of fragmenting across many poll iterations. The
+// upper bound on memory is `MAX_PENDING_FRAMES × MTU` ≈ 6 MiB transient,
+// freed each poll cycle. Real ceiling on RX is the kernel SO_RCVBUF (4 MiB)
+// set in `lib.rs::create_socketpair`.
+const MAX_PENDING_FRAMES: usize = 4096;
 
 /// Result of pulling a single frame from the host AF_UNIX socket.
 enum RecvOne {
