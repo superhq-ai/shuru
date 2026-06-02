@@ -209,3 +209,57 @@ File issues at [github.com/superhq-ai/shuru/issues](https://github.com/superhq-a
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=superhq-ai/shuru&type=date&legend=top-left" />
  </picture>
 </a>
+
+## FAQ
+
+### What is Shuru?
+
+Shuru is a local-first microVM sandbox for running AI agents safely on your machine. It provides a secure, isolated environment for AI agents to execute tasks without risking your host system.
+
+### Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **Local-First** | Run AI agents on your own machine without cloud dependencies |
+| **MicroVM Sandbox** | Lightweight virtual machines for isolation |
+| **Security Isolation** | Agents run in isolated environments |
+| **Resource Control** | Limit CPU, memory, and network access |
+| **Easy Setup** | Quick installation and configuration |
+
+### How to get started?
+
+1. Check the [Installation Guide](#installation) in the README
+2. Configure your microVM settings
+3. Set up your AI agent framework
+4. Start running agents in isolated sandboxes
+5. Monitor and manage agent activities
+
+### What AI agents are supported?
+
+Shuru works with:
+- **Claude Code** - Anthropic's coding assistant
+- **Codex CLI** - OpenAI's code generation tool
+- **Cursor** - AI-powered IDE
+- **OpenClaw** - Open-source AI assistant
+- **Custom Agents** - Any AI agent with command-line interface
+
+### Is this project free and open source?
+
+Yes! Shuru is open-source and free to use. You can run it locally without any cloud costs. Check the [License](#license) section for details.
+
+### How can I contribute?
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes with clear commit messages
+4. Submit a pull request following the project's guidelines
+
+### Where can I get help?
+
+- **Documentation** - Check the README and docs folder
+- **GitHub Issues** - Report bugs or request features
+- **Community Discussions** - Join the conversation
+
+---
+
+**Made with ❤️ by the Shuru team**
