@@ -205,10 +205,10 @@ File issues at [github.com/superhq-ai/shuru/issues](https://github.com/superhq-a
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=superhq-ai%2Fshuru&type=date&legend=top-left">
+<a href="https://star-history.dera.page/#superhq-ai/shuru&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=superhq-ai/shuru&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=superhq-ai/shuru&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=superhq-ai/shuru&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=superhq-ai/shuru&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=superhq-ai/shuru&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=superhq-ai/shuru&type=date&legend=top-left" />
  </picture>
 </a>
