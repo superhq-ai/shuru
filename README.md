@@ -191,6 +191,22 @@ cp -r skills/shuru .claude/skills/shuru
 
 Once installed, agents will use `shuru run` whenever they need sandboxed execution.
 
+## Browser Use
+
+Create a reusable Chromium checkpoint once, then let Browser Use drive that
+isolated browser through Shuru's localhost port forwarding:
+
+```sh
+shuru checkpoint create browser-use --allow-net -- \
+  sh -lc 'apt-get update && apt-get install -y chromium'
+
+OPENAI_API_KEY=... \
+uv run --with browser-use --with openai examples/browser-use.py
+```
+
+The example keeps Chromium inside the microVM and exposes only its CDP port to
+the host.
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes and breaking changes.
