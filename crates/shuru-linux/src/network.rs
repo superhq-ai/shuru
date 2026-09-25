@@ -8,7 +8,9 @@ pub struct FileHandleNetworkAttachment {
 impl FileHandleNetworkAttachment {
     /// Creates a network attachment from a connected datagram socket fd.
     /// The fd should be one end of `socketpair(AF_UNIX, SOCK_DGRAM)`.
-    pub fn new(fd: RawFd) -> Self {
+    /// `mtu` is accepted for API parity with the Darwin implementation
+    /// and ignored on this platform (Linux build is a stub).
+    pub fn new(fd: RawFd, _mtu: i64) -> Self {
         FileHandleNetworkAttachment { fd }
     }
 }
