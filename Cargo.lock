@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "shuru-proxy"
-version = "0.4.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "boring",

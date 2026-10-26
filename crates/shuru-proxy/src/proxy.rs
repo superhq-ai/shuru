@@ -10,7 +10,6 @@ use tracing::{debug, info, warn};
 
 use crate::config::ProxyConfig;
 use crate::dns;
-use crate::redact::Redactor;
 use crate::secrets::SecretResolver;
 use crate::stack::{ConnectionId, StackCommand, StackEvent, TcpConnection};
 use crate::stream::ChannelStream;
@@ -365,11 +364,6 @@ async fn handle_mitm(
     let (mut guest_rd, mut guest_wr) = tokio::io::split(guest_tls);
     let (mut upstream_rd, mut upstream_wr) = tokio::io::split(upstream_tls);
 
-    // Values learned by the request side reach the response side here, so a
-    // rotated credential is redacted as soon as it can be sent.
-    let (fresh_tx, mut fresh_rx) = mpsc::unbounded_channel::<Vec<(String, String)>>();
-    let mut redactor = Redactor::new(substitutions.clone());
-
     let guest_to_upstream = async move {
         let mut buf = vec![0u8; 65536];
         let mut requests = RequestStream::new(substitutions);
@@ -393,7 +387,6 @@ async fn handle_mitm(
                     // have cost at connection setup.
                     if !requests.is_tunnel() && last_refresh.elapsed() >= SECRET_REFRESH_INTERVAL {
                         if let Ok(fresh) = secrets.substitutions_for_domain(&domain).await {
-                            let _ = fresh_tx.send(fresh.clone());
                             requests.update(fresh);
                         }
                         last_refresh = std::time::Instant::now();
@@ -412,19 +405,9 @@ async fn handle_mitm(
         let mut buf = vec![0u8; 65536];
         loop {
             match upstream_rd.read(&mut buf).await {
-                Ok(0) | Err(_) => {
-                    let tail = redactor.flush();
-                    if !tail.is_empty() {
-                        let _ = guest_wr.write_all(&tail).await;
-                    }
-                    break;
-                }
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    while let Ok(fresh) = fresh_rx.try_recv() {
-                        redactor.add(fresh);
-                    }
-                    let out = redactor.push(&buf[..n]);
-                    if !out.is_empty() && guest_wr.write_all(&out).await.is_err() {
+                    if guest_wr.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
                 }
