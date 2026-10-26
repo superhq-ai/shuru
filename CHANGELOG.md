@@ -22,7 +22,10 @@ steps, fetched from GitHub at an exact commit or read from a local path.
 this way record their source and revision, visible in `shuru checkpoint
 list`, and a changed recipe rebuilds on the next run. `--checkpoint NAME`
 on `run` picks the checkpoint name instead of the recipe name. Third-party
-recipes ask for confirmation or `--yes`. See docs/rfcs/0005-recipes.md.
+recipes ask for confirmation or `--yes`. The catalog ships `docker` and
+`browser`, headless Chromium as a guest service with the DevTools protocol
+on port 9222, which the Browser Use example now uses. See
+docs/rfcs/0005-recipes.md.
 
 ### checkpoint update
 

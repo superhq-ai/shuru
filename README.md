@@ -213,19 +213,22 @@ Once installed, agents will use `shuru run` whenever they need sandboxed executi
 
 ## Browser Use
 
-Create a reusable Chromium checkpoint once, then let Browser Use drive that
-isolated browser through Shuru's localhost port forwarding:
+The `browser` recipe installs Chromium from Debian and runs it headless as a
+guest service, under an unprivileged user, with the DevTools protocol on
+port 9222 inside the VM. Forward that port and point any CDP client at it:
 
 ```sh
-shuru checkpoint create browser-use --allow-net -- \
-  sh -lc 'apt-get update && apt-get install -y chromium'
+shuru run --recipe browser -p 9222:9222 -- sleep infinity
+curl -s http://127.0.0.1:9222/json/version
+```
 
+The Browser Use example does exactly that. Chromium stays inside the
+microVM and only its CDP port reaches the host:
+
+```sh
 OPENAI_API_KEY=... \
 uv run --with browser-use --with openai examples/browser-use.py
 ```
-
-The example keeps Chromium inside the microVM and exposes only its CDP port to
-the host.
 
 ## Recipes
 
