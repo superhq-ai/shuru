@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
 
 ### Guest services
 
@@ -20,8 +20,9 @@ steps, fetched from GitHub at an exact commit or read from a local path.
 `shuru recipe list` shows the official catalog in superhq-ai/recipes and
 `shuru recipe show REF` prints a recipe before it is built. Checkpoints built
 this way record their source and revision, visible in `shuru checkpoint
-list`, and a changed recipe rebuilds on the next run. Third-party recipes
-ask for confirmation or `--yes`. See docs/rfcs/0005-recipes.md.
+list`, and a changed recipe rebuilds on the next run. `--checkpoint NAME`
+on `run` picks the checkpoint name instead of the recipe name. Third-party
+recipes ask for confirmation or `--yes`. See docs/rfcs/0005-recipes.md.
 
 ### checkpoint update
 
