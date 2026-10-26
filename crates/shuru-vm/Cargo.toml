@@ -1,13 +1,13 @@
 [package]
 name = "shuru-vm"
-version = "0.3.8"
+version = "0.4.0"
 edition = "2021"
 description = "High-level VM management for shuru"
 license = "Apache-2.0"
 repository = "https://github.com/superhq-ai/shuru"
 
 [dependencies]
-shuru-proto = { version = "0.3.3", path = "../shuru-proto" }
+shuru-proto = { version = "0.4.0", path = "../shuru-proto" }
 anyhow = "1"
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
