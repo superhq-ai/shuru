@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.1
 
 ### Linux: reflink clones instead of copies
 
