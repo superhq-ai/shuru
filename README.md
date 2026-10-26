@@ -162,6 +162,20 @@ Shuru loads `shuru.json` from the current directory (or `--config PATH`). All fi
 
 The `network.allow` list restricts which hosts the guest can reach. Omit it to allow all hosts.
 
+### Environment variables
+
+Per-machine settings live in the environment rather than in `shuru.json`, so
+a project file never decides where assets live or how checkpoints are stored
+on someone else. None of these can grant a permission; networking, mounts and
+host writes stay on flags and in the project file.
+
+| Variable | Effect |
+|---|---|
+| `SHURU_DATA_DIR` | Where assets, checkpoints and instance data live. Default `~/.local/share/shuru`. |
+| `SHURU_KERNEL`, `SHURU_INITRD`, `SHURU_ROOTFS` | Boot from these files instead of the installed assets. Same as `--kernel`, `--initrd` and `--rootfs`, which win when both are given. |
+| `SHURU_STORAGE` | `cas` saves new checkpoints as `.idx` indexes into the chunk store under the data dir. Unset or any other value keeps the default flat `.ext4` copies. A `.idx` checkpoint always boots through the chunk store. |
+| `SHURU_BOOT_TRACE` | When set, prints boot timings to stderr. |
+
 ## SDK
 
 Use shuru programmatically from TypeScript with the [`@superhq/shuru`](https://www.npmjs.com/package/@superhq/shuru) package.
