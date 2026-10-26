@@ -57,12 +57,11 @@ pub(crate) fn create_with_config(
         nbd_handle.save_checkpoint(&index_path)?;
     } else {
         let ext4_path = format!("{}/{}.ext4", checkpoints_dir, name);
-        vm::clone_file(&prepared.work_rootfs, &ext4_path)?;
+        prepared.work_disk.save_to(&ext4_path)?;
     }
     eprintln!("shuru: checkpoint '{}' saved", name);
 
     drop(result.nbd_handle);
-    let _ = std::fs::remove_dir_all(&prepared.instance_dir);
     Ok(result.exit_code)
 }
 

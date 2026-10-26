@@ -1,5 +1,6 @@
 mod kvm;
 
+mod anonfile;
 mod bootloader;
 mod configuration;
 mod directory_sharing;
@@ -13,6 +14,7 @@ mod storage;
 pub mod terminal;
 mod vm;
 
+pub use anonfile::{open_anonymous, reflink};
 pub use bootloader::LinuxBootLoader;
 pub use configuration::VirtualMachineConfiguration;
 pub use directory_sharing::{SharedDirectory, VirtioFileSystemDevice};

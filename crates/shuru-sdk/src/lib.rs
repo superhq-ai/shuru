@@ -3,7 +3,7 @@ use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
@@ -310,25 +310,24 @@ enum SandboxCmd {
 /// Virtualization framework's Objective-C objects.
 pub struct AsyncSandbox {
     cmd_tx: std::sync::mpsc::Sender<SandboxCmd>,
-    instance_dir: String,
 }
 
 impl AsyncSandbox {
     /// Boot a new sandbox VM with the given configuration.
     pub async fn boot(config: SandboxConfig) -> Result<Self> {
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<String>>();
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
 
         std::thread::Builder::new()
             .name("shuru-vm".into())
             .spawn(move || match boot_vm(config) {
                 Ok(booted) => {
-                    if ready_tx.send(Ok(booted.instance_dir.clone())).is_err() {
+                    if ready_tx.send(Ok(())).is_err() {
                         return;
                     }
                     run_vm_loop(
                         booted.sandbox,
-                        &booted.instance_dir,
+                        booted.work_disk,
                         &booted.data_dir,
                         cmd_rx,
                         booted.proxy_handle,
@@ -343,12 +342,9 @@ impl AsyncSandbox {
                 }
             })?;
 
-        let instance_dir = ready_rx.await??;
+        ready_rx.await??;
 
-        Ok(Self {
-            cmd_tx,
-            instance_dir,
-        })
+        Ok(Self { cmd_tx })
     }
 
     /// Execute a command and wait for the result.
@@ -678,11 +674,6 @@ impl AsyncSandbox {
         let _ = self.cmd_tx.send(SandboxCmd::Stop { reply: reply_tx });
         reply_rx.await.unwrap_or(Ok(()))
     }
-
-    /// Get the instance directory path (contains the working rootfs copy).
-    pub fn instance_dir(&self) -> &str {
-        &self.instance_dir
-    }
 }
 
 impl Drop for AsyncSandbox {
@@ -690,8 +681,6 @@ impl Drop for AsyncSandbox {
         // Signal the VM thread to stop
         let (reply_tx, _) = oneshot::channel();
         let _ = self.cmd_tx.send(SandboxCmd::Stop { reply: reply_tx });
-        // Clean up instance directory
-        let _ = std::fs::remove_dir_all(&self.instance_dir);
     }
 }
 
@@ -699,38 +688,9 @@ impl Drop for AsyncSandbox {
 // Internal: VM boot & command loop (runs on dedicated OS thread)
 // ---------------------------------------------------------------------------
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Monotonic counter to ensure each SDK sandbox gets a unique instance directory,
-/// even when multiple sandboxes boot concurrently in the same process.
-static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32) -> libc::c_int;
-}
-
-#[cfg(target_os = "macos")]
-fn clone_file_cow(src: &str, dst: &str) -> Result<()> {
-    let c_src = std::ffi::CString::new(src).context("invalid source path")?;
-    let c_dst = std::ffi::CString::new(dst).context("invalid destination path")?;
-    let ret = unsafe { clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
-        bail!("clonefile({} -> {}) failed: {}", src, dst, err);
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn clone_file_cow(src: &str, dst: &str) -> Result<()> {
-    std::fs::copy(src, dst).with_context(|| format!("failed to copy {} -> {}", src, dst))?;
-    Ok(())
-}
-
 struct BootedVm {
     sandbox: shuru_vm::Sandbox,
-    instance_dir: String,
+    work_disk: shuru_vm::WorkDisk,
     data_dir: String,
     proxy_handle: Option<shuru_proxy::ProxyHandle>,
     fwd_handle: Option<shuru_vm::PortForwardHandle>,
@@ -805,37 +765,23 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
     #[cfg(not(feature = "cas"))]
     let use_nbd = false;
 
-    // Create per-instance working copy.
-    // Use PID + atomic counter so concurrent boots in the same process
-    // each get their own directory (avoids remove_dir_all racing).
-    let seq = INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let instance_dir = format!("{}/instances/sdk-{}-{}", data_dir, std::process::id(), seq,);
-    std::fs::create_dir_all(&instance_dir)?;
-    let work_rootfs = format!("{}/rootfs.ext4", instance_dir);
-
-    if use_nbd {
-        // CAS mode: NBD server handles I/O, just need a placeholder file
-        std::fs::File::create(&work_rootfs)?;
+    // A CAS run is served over NBD, so its disk is only a placeholder.
+    let work_disk = if use_nbd {
+        shuru_vm::WorkDisk::empty(&data_dir)?
     } else {
-        // Direct mode: CoW clone the source rootfs
-        clone_file_cow(&source, &work_rootfs)?;
-    }
-
-    // Extend disk to requested size (only meaningful for direct mode)
-    if !use_nbd {
-        let f = std::fs::OpenOptions::new().write(true).open(&work_rootfs)?;
-        let target = config.disk_size_mb * 1024 * 1024;
-        let current = f.metadata()?.len();
-        if target > current {
-            f.set_len(target)?;
-        }
-        drop(f);
-    }
+        shuru_vm::WorkDisk::clone_from(&source, &data_dir, config.disk_size_mb)?
+    };
 
     // Start CAS NBD server if needed
     #[cfg(feature = "cas")]
     let nbd_handle = if use_nbd {
-        let socket_path = format!("{}/nbd.sock", instance_dir);
+        std::fs::create_dir_all(format!("{}/cas", data_dir))?;
+        let socket_path = format!(
+            "{}/cas/nbd-{}-{}.sock",
+            data_dir,
+            std::process::id(),
+            work_disk.as_raw_fd()
+        );
         let cas_dir_str = match &config.storage {
             StorageMode::Cas { cas_dir } => cas_dir
                 .clone()
@@ -883,7 +829,7 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
     // Build the VM
     let mut builder = shuru_vm::Sandbox::builder()
         .kernel(&kernel_path)
-        .rootfs(&work_rootfs)
+        .rootfs(work_disk.attach_path())
         .cpus(config.cpus)
         .memory_mb(config.memory_mb)
         .console(false); // No serial console in SDK mode
@@ -937,7 +883,7 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
 
     Ok(BootedVm {
         sandbox,
-        instance_dir,
+        work_disk,
         data_dir,
         proxy_handle,
         fwd_handle,
@@ -949,7 +895,7 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
 
 fn run_vm_loop(
     sandbox: shuru_vm::Sandbox,
-    instance_dir: &str,
+    work_disk: shuru_vm::WorkDisk,
     data_dir: &str,
     cmd_rx: std::sync::mpsc::Receiver<SandboxCmd>,
     proxy_handle: Option<shuru_proxy::ProxyHandle>,
@@ -1113,8 +1059,7 @@ fn run_vm_loop(
                     if std::path::Path::new(&checkpoint_path).exists() {
                         std::fs::remove_file(&checkpoint_path)?;
                     }
-                    let work_rootfs = format!("{}/rootfs.ext4", instance_dir);
-                    clone_file_cow(&work_rootfs, &checkpoint_path)?;
+                    work_disk.save_to(&checkpoint_path)?;
                     info!("checkpoint '{}' saved", name);
                     Ok(())
                 })();

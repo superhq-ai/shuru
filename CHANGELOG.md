@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.9.2
+
+### The working disk can no longer outlive its run
+
+Every run clones the base image, and until now the clone was a named file
+under `instances/<pid>` that the process deleted on a clean exit. A run
+ended by SIGTERM, a kill, a crash or an SDK program dying left the clone
+behind, and `shuru prune` could not tell: SDK directories were never
+matched, and a reused PID looked alive. Disk usage grew with every
+interrupted run.
+
+The clone is anonymous now. On Linux it is created with `O_TMPFILE` and
+never has a name; on macOS the framework needs a path, so the clone is
+named for the two syscalls between creation and open, then unlinked and
+attached through `/dev/fd`. The kernel frees the blocks when the last
+descriptor closes, however the process ends. Checkpoints are cloned out of
+the open descriptor, instantly on APFS, XFS and btrfs. The `instances`
+directory, the PID naming and `shuru prune` are gone; `shuru upgrade`
+removes a leftover `instances` directory from earlier versions.
+
+Measured on macOS: a run killed with SIGKILL while writing 600 MB returned
+the space to the volume within seconds and left no file behind.
+
+### Crates
+
+- `shuru-darwin` 0.2.1: `clone_path` and `clone_fd` (APFS clones).
+- `shuru-linux` 0.3.1: `open_anonymous` and `reflink`.
+- `shuru-vm` 0.5.1: `WorkDisk`, the anonymous clone, with `attach_path`
+  and `save_to`. Stays free of unsafe code.
+- `shuru-sdk` 0.7.0: breaking. `AsyncSandbox::instance_dir` is removed,
+  there is no directory any more. The Linux SDK path now reflinks instead
+  of copying the base image.
+
 ## 0.9.1
 
 ### CLI downloads trust the platform certificate store

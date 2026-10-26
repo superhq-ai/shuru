@@ -103,6 +103,8 @@ pub fn upgrade(data_dir: &str) -> Result<()> {
             bail!("This copy was installed via Homebrew. Please run `brew upgrade shuru` instead");
         }
     }
+    // Working disks lived here before 0.9.2 and could outlive a crashed run.
+    let _ = std::fs::remove_dir_all(format!("{}/instances", data_dir));
 
     eprintln!("shuru: checking for updates...");
 
