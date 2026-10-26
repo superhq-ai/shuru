@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.1
+
+### CLI downloads trust the platform certificate store
+
+`shuru upgrade`, `shuru init` and `shuru recipe` verified TLS against a
+bundled root list, so a corporate TLS interceptor such as Netskope failed
+with `UnknownIssuer` (#27). They now use the platform verifier: the system
+keychain on macOS, the system store plus `SSL_CERT_FILE` and `SSL_CERT_DIR`
+on Linux. The connection the proxy opens to a host a secret is bound to
+already honours `SSL_CERT_FILE` and `SSL_CERT_DIR` on both platforms, and
+that is the way to trust an interceptor there; documented in the README.
+
+### Docs
+
+The secrets section now says what responses from a bound host do: they come
+back untouched, so a host that reflects the request shows the real value to
+the guest. Bind a secret only to hosts you trust with it.
+
 ## 0.9.0
 
 ### Network throughput inside the VM, about 80 times faster

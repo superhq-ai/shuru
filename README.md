@@ -120,7 +120,7 @@ shuru checkpoint delete myenv
 
 ### Secrets
 
-Secrets keep API keys on the host. The guest receives a random placeholder token; the proxy substitutes the real value only on HTTPS requests to the specified hosts. The real secret never enters the VM.
+Secrets keep API keys on the host. The guest receives a random placeholder token; the proxy substitutes the real value only on HTTPS requests to the specified hosts. The real secret is never placed in the VM. Bind a secret only to hosts you trust with it: responses come back untouched, so a bound host that reflects the request, as echo and debug endpoints do, shows the real value to the guest.
 
 ```sh
 # Inject a secret via CLI
@@ -177,6 +177,7 @@ host writes stay on flags and in the project file.
 | `SHURU_KERNEL`, `SHURU_INITRD`, `SHURU_ROOTFS` | Boot from these files instead of the installed assets. Same as `--kernel`, `--initrd` and `--rootfs`, which win when both are given. |
 | `SHURU_STORAGE` | `cas` saves new checkpoints as `.idx` indexes into the chunk store under the data dir. Unset or any other value keeps the default flat `.ext4` copies. A `.idx` checkpoint always boots through the chunk store. |
 | `SHURU_BOOT_TRACE` | When set, prints boot timings to stderr. |
+| `SSL_CERT_FILE`, `SSL_CERT_DIR` | Extra roots for the proxy when it opens its own TLS connection to a host a secret is bound to. Needed behind a TLS interceptor such as Netskope, since that connection does not read the macOS keychain. CLI downloads use the platform store and need this only on Linux. |
 
 ## SDK
 

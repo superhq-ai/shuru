@@ -46,7 +46,7 @@ Secrets let the guest use API keys without exposing the real values. The guest r
 - `from`: host environment variable containing the real value
 - `hosts`: domains where the proxy will substitute the placeholder with the real value
 
-The guest sees `$API_KEY=shuru_tok_...`. The real secret never enters the VM.
+The guest sees `$API_KEY=shuru_tok_...`. The real secret is never placed in the VM. Bind a secret only to hosts you trust with it: responses are not rewritten, so a bound host that reflects the request shows the real value to the guest.
 
 Substitution applies to the request head: the request line and any header
 value, whatever the header is named. A custom `X-My-Vendor-Token` works with

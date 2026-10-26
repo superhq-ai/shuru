@@ -2,6 +2,7 @@ mod assets;
 mod checkpoint;
 mod cli;
 mod config;
+mod http;
 mod recipe;
 mod stdio;
 mod vm;
