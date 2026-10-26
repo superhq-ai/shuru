@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-KERNEL_VERSION="${KERNEL_VERSION:-6.12.17}"
+KERNEL_VERSION="${KERNEL_VERSION:-6.12.114}"
 KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
-DATA_DIR="${HOME}/.local/share/shuru"
+DATA_DIR="${SHURU_DATA_DIR:-${HOME}/.local/share/shuru}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 DEFCONFIG="${REPO_DIR}/kernel/shuru_defconfig"

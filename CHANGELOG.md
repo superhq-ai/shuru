@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.8.0
+
+### Guest services
+
+An image can declare long running processes in
+`/etc/shuru/services/<name>.json`. The guest init starts them at boot,
+waits for their readiness check before running the command, and stops them
+with SIGTERM before the VM powers off. The host now asks the guest to shut
+down over vsock, which also syncs the disk, so checkpoints are cloned from
+a consistent image on every stop path. `Sandbox::stop()` is graceful and
+`Sandbox::kill()` is the old hard stop. See docs/rfcs/0004-guest-services.md.
+
+### Recipes
+
+`shuru run --recipe REF` and `shuru checkpoint create NAME --recipe REF`
+build a checkpoint from a recipe: a directory with `recipe.json` and shell
+steps, fetched from GitHub at an exact commit or read from a local path.
+`shuru recipe list` shows the official catalog in superhq-ai/recipes and
+`shuru recipe show REF` prints a recipe before it is built. Checkpoints built
+this way record their source and revision, visible in `shuru checkpoint
+list`, and a changed recipe rebuilds on the next run. `--checkpoint NAME`
+on `run` picks the checkpoint name instead of the recipe name. Third-party
+recipes ask for confirmation or `--yes`. See docs/rfcs/0005-recipes.md.
+
+### checkpoint update
+
+`shuru checkpoint update NAME ...` takes the same arguments as `create` and
+replaces an existing checkpoint, or creates it when missing. The new
+checkpoint is built under a staging name and swapped in only when the
+command exits 0, so a failed update leaves the old one in place.
+`--from NAME` layers the command onto the existing checkpoint and
+`--recipe REF` rebuilds from a recipe. Closes #44.
+
+### Docker Engine runs inside the VM
+
+The `docker` recipe installs pinned docker-ce 29.9.2 and containerd 2.4.2,
+declares dockerd as a guest service, and pre-pulls one image, so
+`shuru checkpoint create docker --recipe docker` followed by
+`shuru run --from docker -- docker run ...` just works, as does
+`shuru run --recipe docker` on its own. Containers get the same boundary as
+any guest process: no egress without `--allow-net`, the host allowlist
+applied by the proxy, host ports only through `-p`.
+
+To support it, the guest kernel gains cgroup v2 controllers, cgroup BPF,
+seccomp filters, veth, and the netfilter targets dockerd installs, and moves
+to Linux 6.12.114. The guest init now mounts cgroup2 on /sys/fs/cgroup and
+tmpfs on /run and /dev/shm. `/run` is therefore no longer persisted into
+checkpoints.
+
+`SHURU_DATA_DIR` overrides the data directory so builds and tests can use
+their own kernel, initramfs and checkpoints. `scripts/build-kernel-hf.sh`
+builds the kernel on a Hugging Face CPU job.
+
+See docs/rfcs/0003-docker-on-shuru.md.
+
 ## 0.7.0
 
 ### Secrets can be refreshed while the VM runs

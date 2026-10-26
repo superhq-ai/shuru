@@ -53,6 +53,10 @@ pub const DISCARD_RESP: u8 = 0x4F;
 pub const DOWNLOAD_REQ: u8 = 0x50;
 pub const DOWNLOAD_PROGRESS: u8 = 0x51;
 
+// Shutdown: host asks the guest to stop its services and sync the disk
+pub const SHUTDOWN_REQ: u8 = 0x60;
+pub const SHUTDOWN_RESP: u8 = 0x61;
+
 const MAX_FRAME: u32 = 1 << 20; // 1 MB
 
 /// Write a binary frame: `[u32 BE length][u8 type][payload]`.
@@ -98,7 +102,7 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {
 
 /// Serialize `msg` as JSON and send it as a typed frame.
 pub fn send_json(w: &mut impl Write, msg_type: u8, msg: &impl serde::Serialize) -> io::Result<()> {
-    let payload = serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let payload = serde_json::to_vec(msg).map_err(io::Error::other)?;
     write_frame(w, msg_type, &payload)
 }
 

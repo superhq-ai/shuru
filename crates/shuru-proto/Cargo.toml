@@ -1,6 +1,6 @@
 [package]
 name = "shuru-proto"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 description = "Shared wire protocol for shuru host/guest communication"
 license = "Apache-2.0"

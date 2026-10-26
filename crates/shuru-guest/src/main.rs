@@ -1,4 +1,7 @@
 #[cfg(target_os = "linux")]
+mod services;
+
+#[cfg(target_os = "linux")]
 mod guest {
     use std::io::{Read, Write};
     use std::os::unix::io::FromRawFd;
@@ -38,7 +41,7 @@ mod guest {
             if libc::fcntl(2, libc::F_GETFD) >= 0 {
                 return;
             }
-            let fd = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
+            let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
             if fd >= 0 {
                 for t in 0..3 {
                     libc::dup2(fd, t);
@@ -103,6 +106,40 @@ mod guest {
             Some("newinstance,ptmxmode=0666"),
         );
         mount_fs("tmpfs", "/tmp", "tmpfs", None);
+        // Runtime state lives on tmpfs so pid files and sockets never land in
+        // a checkpoint. A stale /run/docker.pid otherwise blocks dockerd on
+        // the next boot.
+        // Both are guest RAM, so cap them well below the VM memory.
+        mount_fs("tmpfs", "/run", "tmpfs", Some("mode=0755,size=64m"));
+        std::fs::create_dir_all("/run/lock").ok();
+        std::fs::create_dir_all("/dev/shm").ok();
+        mount_fs("tmpfs", "/dev/shm", "tmpfs", Some("mode=1777,size=256m"));
+        mount_cgroup2();
+    }
+
+    /// Unified cgroup hierarchy with every controller delegated below the
+    /// root, which is what runc and containerd expect to find.
+    fn mount_cgroup2() {
+        if !mount_fs(
+            "cgroup2",
+            "/sys/fs/cgroup",
+            "cgroup2",
+            Some("nsdelegate,memory_recursiveprot"),
+        ) {
+            return;
+        }
+        let controllers = match std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers") {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for name in controllers.split_whitespace() {
+            if let Err(e) = std::fs::write(
+                "/sys/fs/cgroup/cgroup.subtree_control",
+                format!("+{}", name),
+            ) {
+                eprintln!("shuru-guest: failed to enable cgroup controller {}: {}", name, e);
+            }
+        }
     }
 
     fn process_mount(req: &MountRequest) -> MountResponse {
@@ -189,7 +226,7 @@ mod guest {
             let copy_len = name.len().min(libc::IFNAMSIZ);
             std::ptr::copy_nonoverlapping(
                 name.as_ptr(),
-                ifr.ifr_name.as_mut_ptr() as *mut u8,
+                ifr.ifr_name.as_mut_ptr().cast::<u8>(),
                 copy_len,
             );
 
@@ -223,11 +260,7 @@ mod guest {
             // Check if eth0 exists (network device present)
             let has_eth0 = {
                 let mut ifr: libc::ifreq = std::mem::zeroed();
-                std::ptr::copy_nonoverlapping(
-                    b"eth0\0".as_ptr(),
-                    ifr.ifr_name.as_mut_ptr() as *mut u8,
-                    5,
-                );
+                std::ptr::copy_nonoverlapping(c"eth0".as_ptr(), ifr.ifr_name.as_mut_ptr(), 5);
                 libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) == 0
             };
 
@@ -240,11 +273,7 @@ mod guest {
             // Check if eth0 already has an IP (configured by initramfs)
             let has_ip = {
                 let mut ifr: libc::ifreq = std::mem::zeroed();
-                std::ptr::copy_nonoverlapping(
-                    b"eth0\0".as_ptr(),
-                    ifr.ifr_name.as_mut_ptr() as *mut u8,
-                    5,
-                );
+                std::ptr::copy_nonoverlapping(c"eth0".as_ptr(), ifr.ifr_name.as_mut_ptr(), 5);
                 libc::ioctl(sock, libc::SIOCGIFADDR as _, &mut ifr) == 0
             };
 
@@ -260,10 +289,12 @@ mod guest {
 
     fn reap_zombies() {
         loop {
-            let ret = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            let mut status: libc::c_int = 0;
+            let ret = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
             if ret <= 0 {
                 break;
             }
+            crate::services::reaped(ret, status);
         }
     }
 
@@ -353,12 +384,8 @@ mod guest {
         let mut reader = stream.try_clone().expect("failed to clone stream");
         let mut writer = stream;
 
-        loop {
-            let (msg_type, payload) = match frame::read_frame(&mut reader) {
-                Ok(Some(f)) => f,
-                _ => break, // EOF or error
-            };
-
+        // Ends on EOF or a read error.
+        while let Ok(Some((msg_type, payload))) = frame::read_frame(&mut reader) {
             match msg_type {
                 frame::MOUNT_REQ => {
                     let mount_req: MountRequest = match serde_json::from_slice(&payload) {
@@ -384,6 +411,13 @@ mod guest {
 
                     if req.argv.is_empty() {
                         let _ = frame::write_frame(&mut writer, frame::ERROR, b"empty argv");
+                        continue;
+                    }
+
+                    // Services declared by the image must be ready before a
+                    // command runs against them (RFC 0004).
+                    if let Err(msg) = crate::services::wait_ready() {
+                        let _ = frame::write_frame(&mut writer, frame::ERROR, msg.as_bytes());
                         continue;
                     }
 
@@ -533,6 +567,10 @@ mod guest {
                         }
                     };
                     handle_download(&req, &mut writer);
+                }
+                frame::SHUTDOWN_REQ => {
+                    let resp = crate::services::shutdown();
+                    let _ = frame::send_json(&mut writer, frame::SHUTDOWN_RESP, &resp);
                 }
                 _ => {} // unknown type, skip
             }
@@ -1640,6 +1678,11 @@ mod guest {
 
         setup_networking();
         stage("networking ready");
+
+        let started = crate::services::start_all();
+        if started > 0 {
+            stage(&format!("{} service(s) starting", started));
+        }
 
         // Register signal handlers (PID 1 has no default signal dispositions)
         unsafe {

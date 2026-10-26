@@ -34,7 +34,15 @@ pub fn validate_checkpoint_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Where assets, checkpoints and instances live. `SHURU_DATA_DIR` overrides
+/// the default so a build or a test run can use its own kernel, rootfs and
+/// checkpoints without touching the installed ones.
 pub fn default_data_dir() -> String {
+    if let Ok(dir) = std::env::var("SHURU_DATA_DIR") {
+        if !dir.is_empty() {
+            return dir;
+        }
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     format!("{}/.local/share/shuru", home)
 }
