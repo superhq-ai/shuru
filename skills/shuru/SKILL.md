@@ -1,15 +1,15 @@
 ---
 name: shuru
-description: Run commands in an isolated Linux microVM sandbox using the shuru CLI. Use when the user asks to execute untrusted code, install packages safely, test in a clean environment, or needs Linux-specific tooling on macOS.
+description: Run commands in an isolated Linux microVM sandbox using the shuru CLI. Use when the user asks to execute untrusted code, install packages safely, test in a clean environment, run Docker containers or a headless browser inside a VM, or needs Linux-specific tooling on macOS.
 ---
 
 # Sandboxed Execution with Shuru
 
-Shuru boots an ephemeral Linux microVM (Debian, ARM64) on macOS. Each `shuru run` gets a fresh disk clone - all changes are discarded on exit. Use it whenever you need to run commands in isolation from the host.
+Shuru boots an ephemeral Linux microVM (Debian, ARM64) on macOS, with experimental support on Linux ARM64 hosts. Each `shuru run` gets a fresh disk clone and all changes are discarded on exit. Use it whenever you need to run commands in isolation from the host.
 
 ## Core Workflow
 
-The pattern is: **run in sandbox, mount to share files, checkpoint to persist state**.
+The pattern is: **run in sandbox, mount to share files, checkpoint to persist state, recipe for a ready-made environment**.
 
 ```bash
 # 1. Run a command in a fresh VM
@@ -24,6 +24,10 @@ shuru run --allow-net -- sh -c 'apt-get install -y curl && curl https://example.
 # 4. If setup is expensive, save a checkpoint and reuse it
 shuru checkpoint create node-env --allow-net -- apt-get install -y nodejs npm
 shuru run --from node-env --mount .:/workspace -- node /workspace/app.js
+
+# 5. For Docker or a browser, use a recipe from the official catalog
+shuru run --recipe docker -- docker run --rm hello-world
+shuru run --recipe browser -p 9222:9222 -- sleep infinity
 ```
 
 ## Command Chaining
@@ -60,6 +64,9 @@ shuru run --mount ./src:/src --mount ./data:/data -- ls /src /data
 
 # From a checkpoint
 shuru run --from myenv -- npm test
+
+# From a recipe: builds the checkpoint on first use, reuses it after
+shuru run --recipe docker -- docker ps
 ```
 
 ### Checkpoints
@@ -71,14 +78,47 @@ shuru checkpoint create <name> [flags] [-- command...]
 # Stack: create from an existing checkpoint
 shuru checkpoint create with-deps --from base-env --allow-net -- npm install
 
-# List all checkpoints (shows actual disk usage)
+# Update: rebuild in place; the old checkpoint stays until the new build succeeds
+shuru checkpoint update base-env --allow-net -- apt-get install -y build-essential git
+
+# Layer onto the existing checkpoint instead of starting over
+shuru checkpoint update base-env --from base-env --allow-net -- apt-get install -y jq
+
+# Build a checkpoint from a recipe
+shuru checkpoint create docker --recipe docker
+
+# List all checkpoints (shows actual disk usage and recipe source)
 shuru checkpoint list
 
 # Delete
 shuru checkpoint delete <name>
 ```
 
-Checkpoint names must be unique - delete the old one before re-creating with the same name.
+`create` refuses an existing name. Use `update` to replace a checkpoint; it builds under a staging name and swaps in only when the command exits 0, so a failed update leaves the old one intact.
+
+### Recipes
+
+A recipe is a versioned description of a checkpoint: a `recipe.json` plus shell steps, fetched from GitHub at an exact commit or read from a local directory. The official catalog is [superhq-ai/recipes](https://github.com/superhq-ai/recipes) and currently ships `docker` and `browser`.
+
+```bash
+shuru recipe list                                   # the official catalog
+shuru recipe show docker                            # metadata, services and every step, without booting
+shuru run --recipe docker -- docker ps              # build on first use, reuse after
+shuru checkpoint create docker --recipe docker      # build explicitly under that name
+shuru run --recipe docker --checkpoint ci -- ...    # pick the checkpoint name
+shuru checkpoint update docker --recipe docker      # force a rebuild at the current revision
+shuru run --recipe owner/repo/path@v1 --yes -- ...  # third-party, pinned to a tag
+shuru run --recipe ./my-recipe -- ...               # local directory while developing one
+```
+
+Rules that matter when scripting:
+
+- A bare name such as `docker` always means the official catalog. A local directory must be written as a path (`./dir`, `../dir`, `/abs`, `~/dir`).
+- Official and local recipes build without prompting. Third-party GitHub recipes ask for confirmation, so pass `--yes` in non-interactive runs.
+- References resolve to a commit SHA that is recorded next to the checkpoint. A changed recipe rebuilds on the next `run --recipe`; an unchanged one boots the existing checkpoint in seconds.
+- Builds use the network allowlist declared by the recipe, never the project `shuru.json`. The first build of `docker` or `browser` takes a few minutes.
+
+See [references/recipes.md](references/recipes.md) for the `recipe.json` format and guest services.
 
 ### Other Commands
 
@@ -108,12 +148,47 @@ shuru checkpoint create python-dev --allow-net -- sh -c 'apt-get install -y pyth
 shuru run --from python-dev --mount .:/workspace -- sh -c 'cd /workspace && pytest'
 ```
 
+### Docker Inside the VM
+
+The `docker` recipe installs Docker Engine, runs `dockerd` as a guest service, and pre-pulls `nginxinc/nginx-unprivileged:1.31.7-alpine-slim`. The command starts only after `docker info` answers.
+
+```bash
+# Build once (a few minutes), then every run boots in seconds
+shuru checkpoint create docker --recipe docker
+
+# Serve the pre-pulled image on host port 8080; no --allow-net needed
+shuru run --from docker -p 8080:8080 -- \
+  docker run --rm -p 8080:8080 nginxinc/nginx-unprivileged:1.31.7-alpine-slim
+
+# Pulling other images needs network
+shuru run --from docker --allow-net -- docker run --rm python:3.12-alpine python3 -c 'print(1)'
+
+# Build an image from a mounted project
+shuru run --from docker --mount .:/app -- sh -c 'cd /app && docker build -t app . && docker run --rm app'
+```
+
+Containers get the same boundary as any guest process: no egress without `--allow-net`, the host allowlist applies, and host ports only open through `-p`. Keep Docker at its defaults inside the VM; do not use `--privileged` or mount the Docker socket.
+
+### Headless Browser (CDP)
+
+The `browser` recipe runs Chromium headless as an unprivileged user with the DevTools protocol on port 9222 inside the VM. Forward that port and point any CDP client (Playwright, Puppeteer, browser-use) at `http://127.0.0.1:9222`.
+
+```bash
+# Keep the VM alive while a client on the host drives the browser
+shuru run --recipe browser -p 9222:9222 -- sleep infinity
+
+# In another terminal
+curl -s http://127.0.0.1:9222/json/version
+```
+
+Chromium stays inside the microVM; only its CDP port reaches the host. Add `--allow-net` when the browser must load real websites, and `--allow-host` to restrict which ones. The DevTools HTTP endpoint ignores HTTP/1.0 requests, so use a normal HTTP/1.1 client.
+
 ### Testing Untrusted Code
 
 Run untrusted scripts with no network access and no host filesystem access:
 
 ```bash
-# Fully isolated — no --allow-net, no --mount
+# Fully isolated: no --allow-net, no --mount
 shuru run -- sh -c 'echo "malicious script here" && rm -rf / 2>/dev/null; echo "host is safe"'
 ```
 
@@ -176,19 +251,21 @@ Place `shuru.json` in the project root to avoid repeating flags:
 }
 ```
 
-CLI flags override config values. When `secrets` are configured, the guest receives placeholder tokens and the proxy substitutes real values on HTTPS requests to allowed hosts. See [references/config.md](references/config.md) for all fields.
+CLI flags override config values. When `secrets` are configured, the guest receives placeholder tokens and the proxy substitutes real values on HTTPS requests to allowed hosts. A secret can also be minted by a `command` and refreshed before it expires. See [references/config.md](references/config.md) for all fields.
 
 ## Important Constraints
 
-- **Networking is off by default.** You must pass `--allow-net` to install packages or make HTTP requests.
+- **Networking is off by default.** You must pass `--allow-net` to install packages or make HTTP requests. Port forwarding with `-p` works without it.
 - **The guest is Debian Linux (aarch64).** Use `apt-get install` for packages.
 - **Ephemeral by default.** Everything is discarded on exit unless you checkpoint.
 - **Mounts are read-only by default.** Guest writes go to a tmpfs overlay and are discarded on exit. Use `:rw` suffix + `--allow-host-writes` to write to the host.
-- **macOS only** (Apple Silicon). Uses Apple Virtualization.framework.
+- **No systemd in the guest.** Long-running daemons are declared as guest services (see references/recipes.md); `systemctl` does not exist.
+- **Apple Silicon macOS**, plus experimental Linux ARM64 hosts with `/dev/kvm`.
 - **Default resources:** 2 CPUs, 2048 MB RAM, 4096 MB disk. Override with `--cpus`, `--memory`, `--disk-size`.
 
 ## Deep-Dive Documentation
 
-- [references/checkpoints.md](references/checkpoints.md) — checkpoint lifecycle, stacking, disk usage
-- [references/config.md](references/config.md) — shuru.json fields and resolution order
-- [references/networking.md](references/networking.md) — allow-net, port forwarding, proxy behavior
+- [references/checkpoints.md](references/checkpoints.md): checkpoint lifecycle, update, stacking, disk usage
+- [references/recipes.md](references/recipes.md): recipe.json format, references, trust, guest services
+- [references/config.md](references/config.md): shuru.json fields and resolution order
+- [references/networking.md](references/networking.md): allow-net, port forwarding, proxy behavior
