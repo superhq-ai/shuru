@@ -402,6 +402,15 @@ The fix is response side redaction, replacing the real value with the
 placeholder on the way back, and it inherits the framing problem in the
 response direction. This wants its own issue and its own design.
 
+Fixed in shuru-proxy 0.4.1 (`redact.rs`). It turned out not to need framing:
+a replacement that only touches an exact match of the value is safe on a raw
+byte stream, and holding back no more than the suffix that is still a prefix
+of some value keeps streaming responses prompt. Compression is handled on the
+request side: a head that carried a secret is sent with
+`Accept-Encoding: identity`, so an echo comes back readable. Not covered: a
+value split across chunk boundaries, or reflected base64 or URL encoded,
+which an honest upstream does not do.
+
 ## Future work
 
 - Reactive refresh on an upstream 401, covering providers that revoke early.

@@ -2,6 +2,7 @@ pub mod config;
 mod device;
 mod dns;
 mod proxy;
+mod redact;
 mod secrets;
 mod stack;
 mod stream;

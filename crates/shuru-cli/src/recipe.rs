@@ -169,7 +169,8 @@ fn parse_reference(reference: &str) -> Result<Source> {
 // --- Fetching ---
 
 fn http_get(url: &str, accept: &str) -> Result<String> {
-    let mut req = ureq::get(url)
+    let mut req = crate::http::agent()
+        .get(url)
         .header("User-Agent", USER_AGENT)
         .header("Accept", accept);
     if url.starts_with("https://api.github.com/") {

@@ -189,11 +189,58 @@ impl RequestStream {
         };
 
         let mut out = head;
+        let mut carried_secret = false;
         for (from, to) in &self.pairs {
-            out = replace_bytes(&out, from, to);
+            let replaced = replace_bytes(&out, from, to);
+            if replaced != out {
+                carried_secret = true;
+                out = replaced;
+            }
+        }
+        if carried_secret {
+            out = request_identity_encoding(&out);
         }
         out
     }
+}
+
+/// Rewrite a complete head so the upstream answers uncompressed.
+///
+/// A request that carried a secret may get it reflected back, and the
+/// response side can only redact what it can read. Without an Accept-Encoding
+/// field the upstream is free to compress, so the field is set rather than
+/// dropped.
+fn request_identity_encoding(head: &[u8]) -> Vec<u8> {
+    let Some(headers) = head.strip_suffix(HEAD_END) else {
+        return head.to_vec();
+    };
+
+    let mut out = Vec::with_capacity(head.len() + 32);
+    let mut dropping = false;
+    for (i, line) in headers.split(|b| *b == b'\n').enumerate() {
+        if i > 0 {
+            out.push(b'\n');
+        }
+        if i == 0 {
+            out.extend_from_slice(line);
+            continue;
+        }
+        // A folded continuation belongs to the field above it.
+        if dropping && line.first().is_some_and(|b| matches!(b, b' ' | b'\t')) {
+            out.pop();
+            continue;
+        }
+        let name = line.iter().position(|b| *b == b':').map(|i| &line[..i]);
+        dropping = name.is_some_and(|n| n.trim_ascii().eq_ignore_ascii_case(b"accept-encoding"));
+        if dropping {
+            out.pop();
+            continue;
+        }
+        out.extend_from_slice(line);
+    }
+    out.extend_from_slice(b"\r\nAccept-Encoding: identity");
+    out.extend_from_slice(HEAD_END);
+    out
 }
 
 impl Body {
@@ -398,6 +445,14 @@ mod tests {
         format!("GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\nAuthorization: Bearer {PLACEHOLDER}\r\n\r\n")
     }
 
+    /// What a head that carried the placeholder is forwarded as: the value
+    /// swapped in, and an identity encoding requested for the response.
+    fn substituted(req: &str) -> String {
+        let head = req.replace(PLACEHOLDER, SECRET);
+        let (head, rest) = head.split_once("\r\n\r\n").unwrap();
+        format!("{head}\r\nAccept-Encoding: identity\r\n\r\n{rest}")
+    }
+
     #[test]
     fn substitutes_in_any_header_not_a_fixed_list() {
         for name in [
@@ -410,7 +465,7 @@ mod tests {
             let out = stream().push(req.as_bytes());
             assert_eq!(
                 String::from_utf8(out).unwrap(),
-                req.replace(PLACEHOLDER, SECRET),
+                substituted(&req),
                 "header {name} was not substituted"
             );
         }
@@ -422,16 +477,13 @@ mod tests {
             "GET /v1?key={PLACEHOLDER}&x=1 HTTP/1.1\r\nHost: generativelanguage.googleapis.com\r\n\r\n"
         );
         let out = stream().push(req.as_bytes());
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            req.replace(PLACEHOLDER, SECRET)
-        );
+        assert_eq!(String::from_utf8(out).unwrap(), substituted(&req));
     }
 
     #[test]
     fn substitutes_at_every_split_point() {
         let req = get_request();
-        let expected = req.replace(PLACEHOLDER, SECRET);
+        let expected = substituted(&req);
         for size in 1..=req.len() {
             let mut s = stream();
             let mut out = feed(&mut s, req.as_bytes(), size);
@@ -458,7 +510,10 @@ mod tests {
         // Content-Length stays true.
         assert!(out.contains(&format!("Authorization: Bearer {SECRET}")));
         assert!(out.ends_with(&body));
-        assert_eq!(out.len(), req.len() - PLACEHOLDER.len() + SECRET.len());
+        assert_eq!(
+            out.len(),
+            req.len() - PLACEHOLDER.len() + SECRET.len() + "Accept-Encoding: identity\r\n".len()
+        );
     }
 
     #[test]
@@ -585,6 +640,52 @@ mod tests {
         s.update(vec![(PLACEHOLDER.to_string(), "rotated-value".to_string())]);
         let out = String::from_utf8(s.push(get_request().as_bytes())).unwrap();
         assert!(out.contains("rotated-value"));
+    }
+
+    #[test]
+    fn a_head_that_carried_a_secret_asks_for_an_identity_response() {
+        let req = format!(
+            "GET / HTTP/1.1\r\nHost: h\r\nAccept-Encoding: gzip, br\r\nAuthorization: Bearer {PLACEHOLDER}\r\nAccept: */*\r\n\r\n"
+        );
+        let out = String::from_utf8(stream().push(req.as_bytes())).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "GET / HTTP/1.1\r\nHost: h\r\nAuthorization: Bearer {SECRET}\r\nAccept: */*\r\nAccept-Encoding: identity\r\n\r\n"
+            )
+        );
+    }
+
+    #[test]
+    fn identity_is_requested_even_when_the_guest_sent_no_encoding_field() {
+        let req = format!("GET / HTTP/1.1\r\nHost: h\r\nX-Api-Key: {PLACEHOLDER}\r\n\r\n");
+        let out = String::from_utf8(stream().push(req.as_bytes())).unwrap();
+        assert!(
+            out.ends_with("\r\nAccept-Encoding: identity\r\n\r\n"),
+            "{out:?}"
+        );
+        assert_eq!(out.matches("Accept-Encoding").count(), 1);
+    }
+
+    #[test]
+    fn a_head_without_a_secret_keeps_its_encoding_field() {
+        let req = "GET / HTTP/1.1\r\nHost: h\r\nAccept-Encoding: gzip\r\n\r\n";
+        let out = stream().push(req.as_bytes());
+        assert_eq!(out, req.as_bytes());
+    }
+
+    #[test]
+    fn a_folded_encoding_field_is_dropped_whole() {
+        let req = format!(
+            "GET / HTTP/1.1\r\nHost: h\r\nAccept-Encoding: gzip,\r\n br\r\nAuthorization: {PLACEHOLDER}\r\n\r\n"
+        );
+        let out = String::from_utf8(stream().push(req.as_bytes())).unwrap();
+        assert!(!out.contains("gzip"), "{out:?}");
+        assert!(!out.contains(" br"), "{out:?}");
+        assert!(
+            out.contains(&format!("Authorization: {SECRET}\r\n")),
+            "{out:?}"
+        );
     }
 
     #[test]
