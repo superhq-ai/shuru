@@ -138,6 +138,13 @@ shuru run --cpus 4 --memory 4096 -- sh`;
               <strong>install script fails.</strong> Check you have <code>curl</code> and <code>tar</code> on
               <code>PATH</code>, and that GitHub Releases is reachable from your network.
             </li>
+            <li>
+              <strong>boots take ten seconds and checkpoints are 4 GB each.</strong> The data directory is on a
+              filesystem without reflinks, usually ext4, so shuru copies the disk image for every boot and prints a
+              note saying so. Put <code>~/.local/share/shuru</code> or <code>SHURU_DATA_DIR</code> on XFS with
+              <code>reflink=1</code> or on btrfs. Clones are then copy-on-write: about one second per boot and no
+              disk per checkpoint, the same as APFS on macOS.
+            </li>
           </ul>
         </div>
 

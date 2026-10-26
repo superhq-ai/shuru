@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::io::IsTerminal;
 
 use anyhow::{bail, Context, Result};
@@ -15,6 +14,8 @@ extern "C" {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn clone_file(src: &str, dst: &str) -> Result<()> {
+    use std::ffi::CString;
+
     let c_src = CString::new(src).context("invalid source path")?;
     let c_dst = CString::new(dst).context("invalid destination path")?;
     let ret = unsafe { clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
@@ -25,11 +26,40 @@ pub(crate) fn clone_file(src: &str, dst: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reflink the image when the filesystem supports it (XFS with reflink=1,
+/// btrfs), so a boot or a checkpoint costs no disk and no copy time, the
+/// same as clonefile on APFS. Filesystems without reflinks (ext4, tmpfs)
+/// fall back to a full copy, with a note the first time so an operator
+/// knows why boots are slow and disks fill up.
 #[cfg(target_os = "linux")]
 pub(crate) fn clone_file(src: &str, dst: &str) -> Result<()> {
-    std::fs::copy(src, dst)
-        .with_context(|| format!("failed to copy {} -> {}", src, dst))?;
-    Ok(())
+    use std::os::unix::io::AsRawFd;
+    use std::sync::Once;
+
+    static COPY_NOTE: Once = Once::new();
+
+    let src_file = std::fs::File::open(src).with_context(|| format!("failed to open {}", src))?;
+    let dst_file = std::fs::File::create(dst).with_context(|| format!("failed to create {}", dst))?;
+    let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), libc::FICLONE as _, src_file.as_raw_fd()) };
+    if ret == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EOPNOTSUPP) | Some(libc::ENOTTY) | Some(libc::EXDEV) | Some(libc::EINVAL) => {
+            drop(dst_file);
+            COPY_NOTE.call_once(|| {
+                let dir = std::path::Path::new(dst).parent().map(|p| p.display().to_string()).unwrap_or_default();
+                eprintln!(
+                    "shuru: note: {} does not support reflinks, copying disk images instead; put the data directory on XFS or btrfs for instant clones",
+                    dir
+                );
+            });
+            std::fs::copy(src, dst).with_context(|| format!("failed to copy {} -> {}", src, dst))?;
+            Ok(())
+        }
+        _ => bail!("reflink({} -> {}) failed: {}", src, dst, err),
+    }
 }
 
 use shuru_vm::{MountConfig, PortMapping, Sandbox};
