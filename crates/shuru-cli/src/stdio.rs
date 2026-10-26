@@ -488,7 +488,7 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let tx = event_tx.clone();
                 let pid_clone = pid.clone();
                 let mut spawn_env = secret_env.clone();
-                spawn_env.extend(params.env.into_iter());
+                spawn_env.extend(params.env);
 
                 bg_threads.push(std::thread::spawn(move || {
                     let argv: Vec<&str> = params.argv.iter().map(|s| s.as_str()).collect();
@@ -647,17 +647,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                         }
                     };
                     let mut reader = stream;
-                    loop {
-                        match frame::read_frame(&mut reader) {
-                            Ok(Some((frame::WATCH_EVENT, data))) => {
-                                if let Some(evt) = WatchEvent::decode(&data) {
-                                    let _ = tx.send(Event::FileChange {
-                                        path: evt.path,
-                                        event: evt.kind.to_string(),
-                                    });
-                                }
-                            }
-                            _ => break,
+                    while let Ok(Some((frame::WATCH_EVENT, data))) = frame::read_frame(&mut reader) {
+                        if let Some(evt) = WatchEvent::decode(&data) {
+                            let _ = tx.send(Event::FileChange {
+                                path: evt.path,
+                                event: evt.kind.to_string(),
+                            });
                         }
                     }
                 }));
