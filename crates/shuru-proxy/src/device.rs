@@ -9,7 +9,7 @@ use smoltcp::time::Instant;
 // passed to `FileHandleNetworkAttachment::new` in `shuru-vm::sandbox.rs`.
 // Jumbo frames collapse the per-frame syscall + checksum + smoltcp TCP
 // processing cost by ~40× vs the 1500-byte default.
-const MTU: usize = 65549;
+pub(crate) const MTU: usize = 65549;
 // At 65 KiB per frame, this caps transient buffer usage to ~16 MiB
 // (`MAX_PENDING_FRAMES × MTU`), still freed each poll cycle. Real ceiling
 // on RX is the kernel SO_RCVBUF (8 MiB) set in `lib.rs::create_socketpair`,

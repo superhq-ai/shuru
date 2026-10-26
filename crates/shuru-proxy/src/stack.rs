@@ -23,11 +23,17 @@ const PREFIX_LEN: u8 = 24;
 /// Gateway MAC address (locally administered).
 const GATEWAY_MAC: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
 
-// 4 MiB per direction: with TCP window scaling (RFC 1323) this lifts the
-// Bandwidth-Delay Product ceiling to ~70 MB/s at 50 ms RTT. Each established
-// connection costs (RX + TX) of host RAM in smoltcp ring buffers.
-const TCP_RX_BUF_SIZE: usize = 4 * 1024 * 1024;
-const TCP_TX_BUF_SIZE: usize = 4 * 1024 * 1024;
+// Per-connection smoltcp ring buffers, allocated eagerly on every SYN the
+// guest sends. With window scaling the receive side bounds throughput at
+// roughly buffer / RTT, so 1 MiB gives about 20 MB/s at 50 ms, which keeps
+// apt and npm fast while a guest opening hundreds of connections, or
+// sending a SYN flood, costs the host 1.5 MiB per socket rather than 8.
+const TCP_RX_BUF_SIZE: usize = 1024 * 1024;
+const TCP_TX_BUF_SIZE: usize = 512 * 1024;
+// Hard ceiling on live TCP sockets, listening or connected. At the buffer
+// sizes above this bounds the netstack at about 768 MiB no matter what the
+// guest does; SYNs beyond it are dropped and the guest retransmits.
+const MAX_TCP_SOCKETS: usize = 512;
 
 /// A new TCP connection from the guest, ready to be proxied.
 pub struct TcpConnection {
@@ -282,6 +288,7 @@ impl NetworkStack {
 
         // Drain into a local vec to release &mut self borrow on syn_scratch
         let syn_entries: Vec<_> = self.syn_scratch.drain().collect();
+        let mut live_sockets = self.sockets.iter().count();
         for ((dst_ip, dst_port), syn_count) in syn_entries {
             let existing = self
                 .listening
@@ -290,6 +297,13 @@ impl NetworkStack {
             let needed = syn_count.saturating_sub(existing);
 
             for _ in 0..needed {
+                if live_sockets >= MAX_TCP_SOCKETS {
+                    warn!(
+                        "SYN → {}:{} dropped: {} TCP sockets live, limit {}",
+                        dst_ip, dst_port, live_sockets, MAX_TCP_SOCKETS
+                    );
+                    break;
+                }
                 debug!("SYN → {}:{}, adding listener", dst_ip, dst_port);
 
                 let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUF_SIZE]);
@@ -306,6 +320,7 @@ impl NetworkStack {
                     continue;
                 }
                 let handle = self.sockets.add(socket);
+                live_sockets += 1;
                 self.listening
                     .entry((dst_ip, dst_port))
                     .or_default()

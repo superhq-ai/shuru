@@ -907,7 +907,10 @@ fn net_rx_loop(
 ) {
     let mut last_avail = rx_q.last_avail_idx;
     let mut used_idx: u16 = 0;
-    let mut buf = vec![0u8; 65535];
+    // One Ethernet frame at the 65535-byte IP-MTU the proxy stack uses:
+    // 14 bytes of header plus the IP payload. A datagram longer than the
+    // buffer would be truncated by recv.
+    let mut buf = vec![0u8; 14 + 65535];
 
     while running.load(Ordering::Acquire) {
         let mut pfd = libc::pollfd {

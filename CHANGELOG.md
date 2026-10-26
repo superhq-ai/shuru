@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.9.0
+
+### Network throughput inside the VM, about 80 times faster
+
+The proxy netstack that backs `--allow-net` capped every guest connection
+at about 1 MB/s whatever the host could do. Contributed by rsclarke in #35:
+the smoltcp poll loop no longer sleeps 1 ms between passes but waits on the
+host socket, the proxy command channel and the stack timer; the TCP buffers
+grow so window scaling can fill the pipe; and the VM network attachment
+runs at a 65535 byte IP-MTU so the stack handles one 64 KiB frame per
+syscall instead of forty at 1500 bytes. `apt-get`, `npm install` and
+release downloads inside the VM now run close to host speed.
+
+On top of that: per-connection buffers are 1 MiB receive and 512 KiB send
+rather than 4 MiB each way, with a ceiling of 512 live sockets, so a guest
+opening hundreds of connections costs the host a bounded amount of memory.
+The host socket buffers are read back after being set and a socket too
+small to carry one frame is an error rather than a silent stall. The Linux
+backend receives frames at the new size.
+
+### Crates
+
+- `shuru-proxy` 0.4.0: larger frames and buffers, `DrainStatus` on the
+  device, `create_socketpair` fails when the kernel caps the buffers.
+- `shuru-darwin` 0.2.0 and `shuru-linux` 0.3.0: breaking.
+  `FileHandleNetworkAttachment::new` takes the IP-MTU.
+- `shuru-vm` 0.5.0 and `shuru-sdk` 0.6.0: pick up the above.
+
 ## 0.8.1
 
 ### Linux: reflink clones instead of copies

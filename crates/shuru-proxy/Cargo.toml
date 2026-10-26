@@ -1,6 +1,6 @@
 [package]
 name = "shuru-proxy"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Transparent network proxy for shuru microVMs"
 license = "Apache-2.0"

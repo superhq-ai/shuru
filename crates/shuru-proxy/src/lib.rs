@@ -73,32 +73,55 @@ pub fn create_socketpair() -> anyhow::Result<(RawFd, RawFd)> {
 
     let host_fd = fds[1];
 
-    // Apple recommends SO_RCVBUF >= 2x SO_SNDBUF for VZFileHandleNetworkDeviceAttachment
-    // (recommended 4×). With the 65535-byte jumbo IP-MTU set on the attachment
-    // (see `shuru-vm::sandbox.rs`), each datagram can be ~64 KiB, so 8 MiB
-    // rcvbuf holds ~128 in-flight super-frames — enough headroom for the BDP
-    // window before back-pressure trips. macOS `kern.ipc.maxsockbuf` may cap
-    // these silently; setsockopt errors are ignored as best-effort tuning.
-    unsafe {
-        let sndbuf: libc::c_int = 2 * 1024 * 1024;
-        let rcvbuf: libc::c_int = 8 * 1024 * 1024;
-        libc::setsockopt(
-            host_fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &sndbuf as *const _ as _,
-            std::mem::size_of::<libc::c_int>() as _,
-        );
-        libc::setsockopt(
-            host_fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &rcvbuf as *const _ as _,
-            std::mem::size_of::<libc::c_int>() as _,
+    // Apple recommends SO_RCVBUF at least 2x SO_SNDBUF (4x preferred) for
+    // VZFileHandleNetworkDeviceAttachment. With the 65535-byte IP-MTU set on
+    // the attachment (see `shuru-vm::sandbox.rs`) each datagram can be one
+    // 64 KiB frame, so the receive buffer decides how many frames can be in
+    // flight before the guest is back-pressured. 6 MiB holds about 96 of
+    // them and stays under the macOS kern.ipc.maxsockbuf default of 8 MiB,
+    // which the kernel applies per buffer with some headroom removed; a
+    // request at the limit fails and leaves the AF_UNIX default of 4 KiB,
+    // too small to carry a single frame. The values are read back so a
+    // capped socket is reported instead of silently crippling the network.
+    let sndbuf = set_sockbuf(host_fd, libc::SO_SNDBUF, 2 * 1024 * 1024);
+    let rcvbuf = set_sockbuf(host_fd, libc::SO_RCVBUF, 6 * 1024 * 1024);
+    let frame = device::MTU as libc::c_int;
+    if rcvbuf < frame || sndbuf < frame {
+        return Err(anyhow::anyhow!(
+            "host socket buffers too small for a {} byte frame (SO_SNDBUF {}, SO_RCVBUF {}); raise kern.ipc.maxsockbuf",
+            frame,
+            sndbuf,
+            rcvbuf
+        ));
+    }
+    if rcvbuf < 4 * frame {
+        tracing::warn!(
+            "SO_RCVBUF is {} bytes, under four frames; guest throughput will be limited",
+            rcvbuf
         );
     }
 
     Ok((fds[0], fds[1]))
+}
+
+/// Request a socket buffer size and return what the kernel actually set,
+/// which may be smaller or unchanged when the request exceeds its limit.
+fn set_sockbuf(fd: RawFd, opt: libc::c_int, want: libc::c_int) -> libc::c_int {
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt,
+            &want as *const _ as _,
+            std::mem::size_of::<libc::c_int>() as _,
+        );
+        let mut got: libc::c_int = 0;
+        let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as _;
+        if libc::getsockopt(fd, libc::SOL_SOCKET, opt, &mut got as *mut _ as _, &mut len) != 0 {
+            return 0;
+        }
+        got
+    }
 }
 
 /// Start the proxy engine. Returns a handle that keeps it running.
