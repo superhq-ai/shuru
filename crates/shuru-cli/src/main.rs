@@ -32,6 +32,7 @@ fn main() -> Result<()> {
             from,
             recipe,
             yes,
+            checkpoint,
             console,
             stdio,
             command,
@@ -40,7 +41,12 @@ fn main() -> Result<()> {
 
             // A recipe is built (once) before the run, with its own policy.
             let from = match recipe {
-                Some(ref reference) => Some(recipe::ensure_checkpoint(reference, &vm, yes)?),
+                Some(ref reference) => Some(recipe::ensure_checkpoint(
+                    reference,
+                    &vm,
+                    yes,
+                    checkpoint.as_deref(),
+                )?),
                 None => from,
             };
 

@@ -635,12 +635,20 @@ pub(crate) fn update_checkpoint(name: &str, reference: &str, vm: &VmArgs, yes: b
     checkpoint::replace(name, &staging)
 }
 
-/// `shuru run --recipe REF`: make sure a checkpoint named after the recipe
-/// exists at the resolved revision, and return its name.
-pub(crate) fn ensure_checkpoint(reference: &str, vm: &VmArgs, yes: bool) -> Result<String> {
+/// `shuru run --recipe REF [--checkpoint NAME]`: make sure a checkpoint
+/// named after the recipe, or as given, exists at the resolved revision, and
+/// return its name.
+pub(crate) fn ensure_checkpoint(
+    reference: &str,
+    vm: &VmArgs,
+    yes: bool,
+    name: Option<&str>,
+) -> Result<String> {
     let recipe = resolve(reference)?;
     confirm(&recipe, yes)?;
-    let name = recipe.spec.name.clone();
+    let name = name
+        .map(str::to_string)
+        .unwrap_or_else(|| recipe.spec.name.clone());
     if checkpoint::exists(&name) {
         match read_meta(&name) {
             Some(meta) if meta.recipe.revision == recipe.revision => {

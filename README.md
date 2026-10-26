@@ -241,6 +241,7 @@ shuru run --from docker -- docker ps               # and start from it like any 
 shuru run --recipe docker -- docker ps             # or both at once: builds on first use, reuses after
 shuru checkpoint create mydocker --recipe docker   # the same recipe under a name of your own
 shuru checkpoint update docker --recipe docker     # force a rebuild at the current revision
+shuru run --recipe docker --checkpoint ci -- ...   # the one-liner under a name of your own
 shuru run --recipe owner/repo/path@v1 --yes -- ... # third-party, pinned to a tag
 shuru run --recipe ./my-recipe -- ...              # local directory while developing
 ```

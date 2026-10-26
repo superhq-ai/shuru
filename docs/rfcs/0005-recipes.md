@@ -144,7 +144,9 @@ with the image.
 ### `shuru run --recipe`
 
 1. Resolve the reference and confirm trust.
-2. Look for a checkpoint named after the recipe.
+2. Look for a checkpoint named after the recipe, or after `--checkpoint
+   NAME` when given. The flag keeps two recipes that share a `name`, such
+   as a fork and the official one, from rebuilding over each other.
    - Present with a matching revision: reuse it.
    - Present with a different revision: say so, delete it, rebuild.
    - Present without a sidecar: refuse, since it is not ours to replace.

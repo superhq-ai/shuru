@@ -96,6 +96,10 @@ pub(crate) enum Commands {
         #[arg(long)]
         yes: bool,
 
+        /// Name of the checkpoint --recipe builds and reuses (default: the recipe name)
+        #[arg(long, requires = "recipe", value_name = "NAME")]
+        checkpoint: Option<String>,
+
         /// Attach to raw serial console instead of running a command
         #[arg(long)]
         console: bool,

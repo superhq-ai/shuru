@@ -194,6 +194,39 @@ fn run_builds_once_reuses_and_rebuilds_when_the_recipe_changes() {
 }
 
 #[test]
+fn checkpoint_flag_requires_recipe() {
+    let out = shuru(&["run", "--checkpoint", "x", "--", "true"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(stderr(&out).contains("--recipe"), "{}", text(&out));
+}
+
+#[test]
+#[ignore]
+fn run_recipe_under_a_chosen_checkpoint_name() {
+    let name = unique("shuru-test-recipe-named-run");
+    let _cleanup = Cleanup(vec![name.clone()]);
+    let recipe = LocalRecipe::new(
+        "some-recipe",
+        r#"{"name": "NAME", "steps": ["build.sh"]}"#,
+        &[("build.sh", "echo named > /opt/marker\n")],
+    );
+
+    let args = ["run", "--recipe", &recipe.path_str(), "--checkpoint", &name, "--", "cat", "/opt/marker"];
+    let out = shuru(&args);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(stderr(&out).contains("building recipe some-recipe"), "{}", text(&out));
+    assert!(stdout(&out).contains("named"), "{}", text(&out));
+
+    let out = shuru(&args);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(stderr(&out).contains(&format!("using checkpoint {}", name)), "{}", text(&out));
+
+    let list = stdout(&shuru(&["checkpoint", "list"]));
+    assert!(list.lines().any(|l| l.starts_with(&name)), "{}", list);
+    assert!(!list.lines().any(|l| l.starts_with("some-recipe ")), "{}", list);
+}
+
+#[test]
 #[ignore]
 fn create_builds_under_a_chosen_name_and_refuses_a_command() {
     let name = unique("shuru-test-recipe-named");
