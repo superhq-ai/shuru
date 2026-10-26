@@ -28,7 +28,7 @@ jobs:
               echo "Published $crate"
               echo "Waiting for crates.io to index..."
               sleep 30
-            elif echo "$output" | grep -q "already exists"; then
+            elif echo "$output" | grep -qE "already (exists|uploaded)"; then
               echo "$crate already published, skipping"
             else
               echo "$output" >&2
@@ -60,7 +60,7 @@ jobs:
               echo "Published $crate"
               echo "Waiting for crates.io to index..."
               sleep 30
-            elif echo "$output" | grep -q "already exists"; then
+            elif echo "$output" | grep -qE "already (exists|uploaded)"; then
               echo "$crate already published, skipping"
             else
               echo "$output" >&2
@@ -91,7 +91,7 @@ jobs:
               echo "Published $crate"
               echo "Waiting for crates.io to index..."
               sleep 30
-            elif echo "$output" | grep -q "already exists"; then
+            elif echo "$output" | grep -qE "already (exists|uploaded)"; then
               echo "$crate already published, skipping"
             else
               echo "$output" >&2
