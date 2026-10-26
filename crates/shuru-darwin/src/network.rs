@@ -20,19 +20,25 @@ impl FileHandleNetworkAttachment {
     /// Creates a network attachment from a connected datagram socket fd.
     /// The fd should be one end of `socketpair(AF_UNIX, SOCK_DGRAM)`.
     /// VZ takes ownership of this fd (closes on dealloc).
-    pub fn new(fd: RawFd) -> Self {
+    ///
+    /// `mtu` is the IP-layer MTU (1500..=65535). VZ defaults to 1500 if
+    /// `setMaximumTransmissionUnit:` is never called. Apple requires the
+    /// associated socket's `SO_SNDBUF`/`SO_RCVBUF` to be sized for the
+    /// chosen MTU (`SO_RCVBUF` >= 2× `SO_SNDBUF`, recommended 4×) — see
+    /// `shuru_proxy::create_socketpair`.
+    pub fn new(fd: RawFd, mtu: i64) -> Self {
         unsafe {
             let file_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
                 NSFileHandle::alloc(),
                 fd,
                 true,
             );
-            FileHandleNetworkAttachment {
-                inner: VZFileHandleNetworkDeviceAttachment::initWithFileHandle(
-                    VZFileHandleNetworkDeviceAttachment::alloc(),
-                    &file_handle,
-                ),
-            }
+            let inner = VZFileHandleNetworkDeviceAttachment::initWithFileHandle(
+                VZFileHandleNetworkDeviceAttachment::alloc(),
+                &file_handle,
+            );
+            inner.setMaximumTransmissionUnit(mtu as isize);
+            FileHandleNetworkAttachment { inner }
         }
     }
 }

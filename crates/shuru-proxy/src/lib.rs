@@ -74,9 +74,14 @@ pub fn create_socketpair() -> anyhow::Result<(RawFd, RawFd)> {
     let host_fd = fds[1];
 
     // Apple recommends SO_RCVBUF >= 2x SO_SNDBUF for VZFileHandleNetworkDeviceAttachment
+    // (recommended 4×). With the 65535-byte jumbo IP-MTU set on the attachment
+    // (see `shuru-vm::sandbox.rs`), each datagram can be ~64 KiB, so 8 MiB
+    // rcvbuf holds ~128 in-flight super-frames — enough headroom for the BDP
+    // window before back-pressure trips. macOS `kern.ipc.maxsockbuf` may cap
+    // these silently; setsockopt errors are ignored as best-effort tuning.
     unsafe {
-        let sndbuf: libc::c_int = 1024 * 1024;
-        let rcvbuf: libc::c_int = 4 * 1024 * 1024;
+        let sndbuf: libc::c_int = 2 * 1024 * 1024;
+        let rcvbuf: libc::c_int = 8 * 1024 * 1024;
         libc::setsockopt(
             host_fd,
             libc::SOL_SOCKET,

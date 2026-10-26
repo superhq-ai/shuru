@@ -1,11 +1,45 @@
 use std::collections::VecDeque;
+use std::io;
 use std::os::unix::io::RawFd;
 
 use smoltcp::phy::{self, Checksum, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
-const MTU: usize = 1514; // 14-byte Ethernet header + 1500-byte IP payload
+// 14-byte Ethernet header + 65535-byte IP payload. Must match the IP-MTU
+// passed to `FileHandleNetworkAttachment::new` in `shuru-vm::sandbox.rs`.
+// Jumbo frames collapse the per-frame syscall + checksum + smoltcp TCP
+// processing cost by ~40× vs the 1500-byte default.
+const MTU: usize = 65549;
+// At 65 KiB per frame, this caps transient buffer usage to ~16 MiB
+// (`MAX_PENDING_FRAMES × MTU`), still freed each poll cycle. Real ceiling
+// on RX is the kernel SO_RCVBUF (8 MiB) set in `lib.rs::create_socketpair`,
+// which itself holds ~128 super-frames before back-pressuring the guest.
 const MAX_PENDING_FRAMES: usize = 256;
+
+/// Result of pulling a single frame from the host AF_UNIX socket.
+enum RecvOne {
+    /// A frame was read into the buffer.
+    Frame(Vec<u8>),
+    /// `recv()` returned `EAGAIN`/`EWOULDBLOCK`: the socket is fully drained.
+    WouldBlock,
+    /// `recv()` returned a real error or 0-byte EOF.
+    Error(io::Error),
+}
+
+/// Outcome of [`VZDevice::drain_recv`]. Drives readiness bookkeeping in the
+/// event-driven poll loop: we may only `clear_ready()` on the host FD when
+/// the kernel has actually told us `WouldBlock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainStatus {
+    /// Drained until `recv()` returned `EWOULDBLOCK` — no more frames.
+    WouldBlock,
+    /// Stopped early because `pending_rx` reached `MAX_PENDING_FRAMES`. The
+    /// kernel buffer may still hold data; the loop must re-poll without
+    /// clearing FD readiness.
+    HitCap,
+    /// `recv()` returned an error (other than `EWOULDBLOCK`) or EOF.
+    Error,
+}
 
 /// smoltcp Device backed by a Unix datagram socketpair fd.
 ///
@@ -28,8 +62,20 @@ impl VZDevice {
         }
     }
 
+    /// The host end of the AF_UNIX socketpair. Used by the network stack to
+    /// register readiness with the async runtime.
+    pub fn fd(&self) -> RawFd {
+        self.fd
+    }
+
+    /// Whether any pre-read frames are still queued for smoltcp to consume.
+    pub fn pending_rx_empty(&self) -> bool {
+        self.pending_rx.is_empty()
+    }
+
     /// Non-blocking read of a single frame from the socketpair.
-    fn recv_one_frame(&mut self) -> Option<Vec<u8>> {
+    /// Distinguishes "no data right now" (`WouldBlock`) from real errors.
+    fn recv_one_frame(&mut self) -> RecvOne {
         let n = unsafe {
             libc::recv(
                 self.fd,
@@ -38,10 +84,18 @@ impl VZDevice {
                 libc::MSG_DONTWAIT,
             )
         };
-        if n <= 0 {
-            return None;
+        if n > 0 {
+            return RecvOne::Frame(self.recv_buf[..n as usize].to_vec());
         }
-        Some(self.recv_buf[..n as usize].to_vec())
+        if n == 0 {
+            return RecvOne::Error(io::Error::new(io::ErrorKind::UnexpectedEof, "fd closed"));
+        }
+        let err = io::Error::last_os_error();
+        // On Darwin/Linux EAGAIN == EWOULDBLOCK; match on the value once.
+        match err.raw_os_error() {
+            Some(libc::EAGAIN) => RecvOne::WouldBlock,
+            _ => RecvOne::Error(err),
+        }
     }
 
     /// Drain all available frames from the socketpair (non-blocking).
@@ -51,14 +105,19 @@ impl VZDevice {
     /// DNS (UDP 53). Without this filter, smoltcp auto-replies to ICMP
     /// echo requests for any IP (due to any_ip=true), which leaks a
     /// response channel even though no data actually reaches the internet.
-    pub fn drain_recv(&mut self) {
+    pub fn drain_recv(&mut self) -> DrainStatus {
         while self.pending_rx.len() < MAX_PENDING_FRAMES {
             match self.recv_one_frame() {
-                Some(frame) if Self::is_icmp(&frame) => continue,
-                Some(frame) => self.pending_rx.push_back(frame),
-                None => break,
+                RecvOne::Frame(frame) if Self::is_icmp(&frame) => continue,
+                RecvOne::Frame(frame) => self.pending_rx.push_back(frame),
+                RecvOne::WouldBlock => return DrainStatus::WouldBlock,
+                RecvOne::Error(e) => {
+                    tracing::debug!("host_fd recv error: {e}");
+                    return DrainStatus::Error;
+                }
             }
         }
+        DrainStatus::HitCap
     }
 
     /// Check if a raw Ethernet frame carries an ICMP packet.
@@ -124,10 +183,13 @@ impl Device for VZDevice {
         // socketpair for frames that arrived during poll. Drop ICMP in both
         // paths to match the filter in drain_recv().
         loop {
-            let buffer = self
-                .pending_rx
-                .pop_front()
-                .or_else(|| self.recv_one_frame())?;
+            let buffer = match self.pending_rx.pop_front() {
+                Some(b) => b,
+                None => match self.recv_one_frame() {
+                    RecvOne::Frame(b) => b,
+                    RecvOne::WouldBlock | RecvOne::Error(_) => return None,
+                },
+            };
             if Self::is_icmp(&buffer) {
                 continue;
             }
@@ -202,4 +264,116 @@ mod tests {
         assert!(!VZDevice::is_icmp(&[]));
         assert!(!VZDevice::is_icmp(&[0u8; 23])); // too short to read proto field
     }
+
+    /// RAII socketpair: `(host_fd, peer_fd)` closed on drop. The host_fd is
+    /// the end given to a `VZDevice`; the peer_fd is the test driver's end.
+    struct Pair {
+        host_fd: RawFd,
+        peer_fd: RawFd,
+    }
+
+    impl Pair {
+        fn new() -> Self {
+            let mut fds = [0i32; 2];
+            let r = unsafe {
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr())
+            };
+            assert_eq!(r, 0, "socketpair failed");
+            // Generous buffer so we can queue >MAX_PENDING_FRAMES frames.
+            let bufsize: libc::c_int = 16 * 1024 * 1024;
+            for fd in fds.iter() {
+                unsafe {
+                    libc::setsockopt(
+                        *fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        &bufsize as *const _ as _,
+                        std::mem::size_of::<libc::c_int>() as _,
+                    );
+                    libc::setsockopt(
+                        *fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVBUF,
+                        &bufsize as *const _ as _,
+                        std::mem::size_of::<libc::c_int>() as _,
+                    );
+                }
+            }
+            Pair {
+                host_fd: fds[1],
+                peer_fd: fds[0],
+            }
+        }
+
+        fn send(&self, frame: &[u8]) {
+            let n = unsafe {
+                libc::send(
+                    self.peer_fd,
+                    frame.as_ptr() as *const libc::c_void,
+                    frame.len(),
+                    0,
+                )
+            };
+            assert!(n > 0, "send failed: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    impl Drop for Pair {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.host_fd);
+                libc::close(self.peer_fd);
+            }
+        }
+    }
+
+    #[test]
+    fn drain_recv_returns_wouldblock_on_empty_fd() {
+        let pair = Pair::new();
+        let mut device = VZDevice::new(pair.host_fd);
+        assert_eq!(device.drain_recv(), DrainStatus::WouldBlock);
+        assert!(device.pending_rx_empty());
+    }
+
+    #[test]
+    fn drain_recv_accumulates_non_icmp_frames() {
+        let pair = Pair::new();
+        let frame = make_frame(6); // TCP
+        for _ in 0..3 {
+            pair.send(&frame);
+        }
+        let mut device = VZDevice::new(pair.host_fd);
+        assert_eq!(device.drain_recv(), DrainStatus::WouldBlock);
+        assert_eq!(device.pending_rx.len(), 3);
+    }
+
+    #[test]
+    fn drain_recv_discards_icmp_frames() {
+        let pair = Pair::new();
+        pair.send(&make_frame(1)); // ICMP — should be dropped
+        pair.send(&make_frame(6)); // TCP — should be kept
+        pair.send(&make_frame(1)); // ICMP — should be dropped
+        pair.send(&make_frame(17)); // UDP — should be kept
+        let mut device = VZDevice::new(pair.host_fd);
+        assert_eq!(device.drain_recv(), DrainStatus::WouldBlock);
+        assert_eq!(device.pending_rx.len(), 2);
+    }
+
+    #[test]
+    fn drain_recv_returns_hit_cap_when_pending_rx_fills() {
+        let pair = Pair::new();
+        let frame = make_frame(6); // TCP
+        // Send slightly more than MAX_PENDING_FRAMES so HitCap is unambiguous.
+        for _ in 0..(MAX_PENDING_FRAMES + 16) {
+            pair.send(&frame);
+        }
+        let mut device = VZDevice::new(pair.host_fd);
+        assert_eq!(device.drain_recv(), DrainStatus::HitCap);
+        assert_eq!(device.pending_rx.len(), MAX_PENDING_FRAMES);
+        // A second drain should pick up the rest and end at WouldBlock.
+        device.pending_rx.clear();
+        let status = device.drain_recv();
+        assert!(matches!(status, DrainStatus::WouldBlock | DrainStatus::HitCap));
+    }
+
 }
