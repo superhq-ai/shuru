@@ -129,9 +129,6 @@ pub(crate) enum Commands {
         action: CheckpointCommands,
     },
 
-    /// Remove leftover instance data from crashed VMs
-    Prune,
-
     /// Browse and inspect recipes (RFC 0005)
     Recipe {
         #[command(subcommand)]

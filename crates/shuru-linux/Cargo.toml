@@ -1,6 +1,6 @@
 [package]
 name = "shuru-linux"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "KVM backend for shuru"
 license = "Apache-2.0"

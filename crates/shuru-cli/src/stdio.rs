@@ -647,7 +647,8 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                         }
                     };
                     let mut reader = stream;
-                    while let Ok(Some((frame::WATCH_EVENT, data))) = frame::read_frame(&mut reader) {
+                    while let Ok(Some((frame::WATCH_EVENT, data))) = frame::read_frame(&mut reader)
+                    {
                         if let Some(evt) = WatchEvent::decode(&data) {
                             let _ = tx.send(Event::FileChange {
                                 path: evt.path,
@@ -995,7 +996,7 @@ fn handle_checkpoint(
         );
     }
 
-    if let Err(e) = vm::clone_file(&prepared.work_rootfs, &checkpoint_path) {
+    if let Err(e) = prepared.work_disk.save_to(&checkpoint_path) {
         return send_error_shared(
             out,
             id,

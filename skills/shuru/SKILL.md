@@ -129,9 +129,6 @@ shuru init --force    # re-download even if up to date
 
 # Upgrade CLI + OS image
 shuru upgrade
-
-# Clean up leftover data from crashed VMs
-shuru prune
 ```
 
 ## Common Patterns

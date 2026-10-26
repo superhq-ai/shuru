@@ -3,65 +3,6 @@ use std::io::IsTerminal;
 
 use anyhow::{bail, Context, Result};
 
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn clonefile(
-        src: *const libc::c_char,
-        dst: *const libc::c_char,
-        flags: u32,
-    ) -> libc::c_int;
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn clone_file(src: &str, dst: &str) -> Result<()> {
-    use std::ffi::CString;
-
-    let c_src = CString::new(src).context("invalid source path")?;
-    let c_dst = CString::new(dst).context("invalid destination path")?;
-    let ret = unsafe { clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
-        bail!("clonefile({} -> {}) failed: {}", src, dst, err);
-    }
-    Ok(())
-}
-
-/// Reflink the image when the filesystem supports it (XFS with reflink=1,
-/// btrfs), so a boot or a checkpoint costs no disk and no copy time, the
-/// same as clonefile on APFS. Filesystems without reflinks (ext4, tmpfs)
-/// fall back to a full copy, with a note the first time so an operator
-/// knows why boots are slow and disks fill up.
-#[cfg(target_os = "linux")]
-pub(crate) fn clone_file(src: &str, dst: &str) -> Result<()> {
-    use std::os::unix::io::AsRawFd;
-    use std::sync::Once;
-
-    static COPY_NOTE: Once = Once::new();
-
-    let src_file = std::fs::File::open(src).with_context(|| format!("failed to open {}", src))?;
-    let dst_file = std::fs::File::create(dst).with_context(|| format!("failed to create {}", dst))?;
-    let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), libc::FICLONE as _, src_file.as_raw_fd()) };
-    if ret == 0 {
-        return Ok(());
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::EOPNOTSUPP) | Some(libc::ENOTTY) | Some(libc::EXDEV) | Some(libc::EINVAL) => {
-            drop(dst_file);
-            COPY_NOTE.call_once(|| {
-                let dir = std::path::Path::new(dst).parent().map(|p| p.display().to_string()).unwrap_or_default();
-                eprintln!(
-                    "shuru: note: {} does not support reflinks, copying disk images instead; put the data directory on XFS or btrfs for instant clones",
-                    dir
-                );
-            });
-            std::fs::copy(src, dst).with_context(|| format!("failed to copy {} -> {}", src, dst))?;
-            Ok(())
-        }
-        _ => bail!("reflink({} -> {}) failed: {}", src, dst, err),
-    }
-}
-
 use shuru_vm::{MountConfig, PortMapping, Sandbox};
 
 use crate::assets;
@@ -83,9 +24,10 @@ fn trace_boot(label: &str) {
 }
 
 pub(crate) struct PreparedVm {
-    pub instance_dir: String,
     pub source_rootfs: String,
-    pub work_rootfs: String,
+    /// Anonymous clone of the source, alive for the run and freed by the
+    /// kernel whenever the process ends.
+    pub work_disk: shuru_vm::WorkDisk,
     /// If restoring from a CAS checkpoint, the index path.
     pub cas_index: Option<String>,
     pub kernel_path: String,
@@ -99,11 +41,7 @@ pub(crate) struct PreparedVm {
     pub mounts: Vec<MountConfig>,
 }
 
-pub(crate) fn prepare_vm(
-    vm: &VmArgs,
-    cfg: &ShuruConfig,
-    from: Option<&str>,
-) -> Result<PreparedVm> {
+pub(crate) fn prepare_vm(vm: &VmArgs, cfg: &ShuruConfig, from: Option<&str>) -> Result<PreparedVm> {
     trace_boot("prepare_vm start");
     let cpus = vm.cpus.or(cfg.cpus).unwrap_or(2);
     let memory = vm.memory.or(cfg.memory).unwrap_or(2048);
@@ -121,8 +59,9 @@ pub(crate) fn prepare_vm(
 
         // Merge --secret flags: NAME=ENV_VAR@host1,host2
         for s in &vm.secret {
-            let (name, from, hosts) = parse_secret_flag(s)
-                .with_context(|| format!("invalid --secret: '{}' (expected NAME=ENV@host1,host2)", s))?;
+            let (name, from, hosts) = parse_secret_flag(s).with_context(|| {
+                format!("invalid --secret: '{}' (expected NAME=ENV@host1,host2)", s)
+            })?;
             proxy.secrets.insert(
                 name,
                 shuru_proxy::config::SecretConfig::from_env(from, hosts),
@@ -155,8 +94,8 @@ pub(crate) fn prepare_vm(
     }
     let mut forwards = Vec::new();
     for s in &port_strs {
-        let mapping = parse_port_mapping(s)
-            .with_context(|| format!("invalid port mapping: '{}'", s))?;
+        let mapping =
+            parse_port_mapping(s).with_context(|| format!("invalid port mapping: '{}'", s))?;
         forwards.push(mapping);
     }
 
@@ -169,8 +108,7 @@ pub(crate) fn prepare_vm(
     }
     let mut mounts = Vec::new();
     for s in &mount_strs {
-        let mc = parse_mount_spec(s)
-            .with_context(|| format!("invalid mount spec: '{}'", s))?;
+        let mc = parse_mount_spec(s).with_context(|| format!("invalid mount spec: '{}'", s))?;
         mounts.push(mc);
     }
 
@@ -214,8 +152,7 @@ pub(crate) fn prepare_vm(
     let mut cas_index: Option<String> = None;
     let source = match from {
         Some(name) => {
-            shuru_vm::validate_checkpoint_name(name)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            shuru_vm::validate_checkpoint_name(name).map_err(|e| anyhow::anyhow!(e))?;
             // Check .idx (CAS) first, then .ext4 (legacy)
             let idx_path = format!("{}/{}.idx", checkpoints_dir, name);
             let ext4_path = format!("{}/{}.ext4", checkpoints_dir, name);
@@ -240,44 +177,16 @@ pub(crate) fn prepare_vm(
     };
 
     trace_boot("prepare: config + assets checked");
-    // Create per-instance working copy (clean any stale dir from PID reuse)
-    let instance_dir = format!("{}/instances/{}", data_dir, std::process::id());
-    let _ = std::fs::remove_dir_all(&instance_dir);
-    std::fs::create_dir_all(&instance_dir)?;
-    let work_rootfs = format!("{}/rootfs.ext4", instance_dir);
-    trace_boot("prepare: instance dir ready");
-
-    // CAS checkpoints don't need a file copy — the NBD server reads from the chunk store.
-    // We still need a rootfs file for the VM builder (kernel cmdline root=), but it can be
-    // a dummy for CAS mode since I/O goes through NBD.
-    if cas_index.is_none() {
+    // A CAS checkpoint is served over NBD, so its disk is only a placeholder.
+    let work_disk = if cas_index.is_none() {
         if verbose {
             eprintln!("shuru: creating working copy...");
         }
-        clone_file(&source, &work_rootfs)?;
+        shuru_vm::WorkDisk::clone_from(&source, &data_dir, disk_size)?
     } else {
-        // Create a minimal placeholder so the VM builder doesn't fail
-        std::fs::File::create(&work_rootfs)?;
-    }
+        shuru_vm::WorkDisk::empty(&data_dir)?
+    };
     trace_boot("prepare: rootfs cloned");
-
-    // Extend to requested disk size
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&work_rootfs)?;
-    let target = disk_size * 1024 * 1024;
-    let current = f.metadata()?.len();
-    if target < current {
-        bail!(
-            "--disk-size {}MB is smaller than the base image ({}MB)",
-            disk_size,
-            current / 1024 / 1024
-        );
-    }
-    if target > current {
-        f.set_len(target)?;
-    }
-    drop(f);
 
     let initrd_path = if std::path::Path::new(&initrd_path_str).exists() {
         Some(initrd_path_str)
@@ -291,9 +200,8 @@ pub(crate) fn prepare_vm(
 
     trace_boot("prepare_vm done (disk cloned + extended)");
     Ok(PreparedVm {
-        instance_dir,
         source_rootfs: source,
-        work_rootfs,
+        work_disk,
         cas_index,
         kernel_path,
         initrd_path,
@@ -315,7 +223,7 @@ pub(crate) fn build_sandbox(
 ) -> Result<Sandbox> {
     let mut builder = Sandbox::builder()
         .kernel(&prepared.kernel_path)
-        .rootfs(&prepared.work_rootfs)
+        .rootfs(prepared.work_disk.attach_path())
         .cpus(prepared.cpus)
         .memory_mb(prepared.memory)
         .console(console)
@@ -350,9 +258,15 @@ pub(crate) fn start_nbd(prepared: &PreparedVm) -> Result<Option<shuru_store::Nbd
     if prepared.cas_index.is_none() && !want_cas {
         return Ok(None);
     }
-    let socket_path = format!("{}/nbd.sock", prepared.instance_dir);
     let data_dir = shuru_vm::default_data_dir();
     let cas_dir = format!("{}/cas", data_dir);
+    std::fs::create_dir_all(&cas_dir)?;
+    let socket_path = format!(
+        "{}/nbd-{}-{}.sock",
+        cas_dir,
+        std::process::id(),
+        prepared.work_disk.as_raw_fd()
+    );
     let index_path = if let Some(ref idx) = prepared.cas_index {
         idx.clone()
     } else {
@@ -377,7 +291,11 @@ pub(crate) struct RunResult {
 pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<RunResult> {
     if prepared.verbose {
         eprintln!("shuru: kernel={}", prepared.kernel_path);
-        eprintln!("shuru: rootfs={} (work copy)", prepared.work_rootfs);
+        eprintln!(
+            "shuru: rootfs={} (anonymous clone of {})",
+            prepared.work_disk.attach_path(),
+            prepared.source_rootfs
+        );
     }
     eprintln!(
         "shuru: booting VM ({}cpus, {}MB RAM, {}MB disk)...",
@@ -449,7 +367,12 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<R
     let exit_code = if std::io::stdin().is_terminal() {
         sandbox.shell(command, &env)?
     } else {
-        sandbox.exec_with_env(command, &env, &mut std::io::stdout(), &mut std::io::stderr())?
+        sandbox.exec_with_env(
+            command,
+            &env,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )?
     };
     trace_boot("command done");
 
@@ -473,7 +396,10 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<R
 
     drop(proxy_handle);
     let _ = sandbox.kill();
-    Ok(RunResult { exit_code, nbd_handle })
+    Ok(RunResult {
+        exit_code,
+        nbd_handle,
+    })
 }
 
 /// Pure string validation — no filesystem access. Separated from `parse_mount_spec`
@@ -513,7 +439,8 @@ fn parse_mount_spec(s: &str) -> Result<MountConfig> {
 
 fn validate_mounts(mounts: &[MountConfig], allow_host_writes: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to determine current working directory")?;
-    let cwd = std::fs::canonicalize(&cwd).context("failed to canonicalize current working directory")?;
+    let cwd =
+        std::fs::canonicalize(&cwd).context("failed to canonicalize current working directory")?;
     validate_mounts_with_cwd(mounts, allow_host_writes, &cwd)
 }
 
@@ -666,7 +593,9 @@ mod tests {
             read_only: true,
         }];
         let err = validate_mounts_with_cwd(&mounts, false, cwd).unwrap_err();
-        assert!(err.to_string().contains("outside the current working directory"));
+        assert!(err
+            .to_string()
+            .contains("outside the current working directory"));
     }
 
     #[test]
