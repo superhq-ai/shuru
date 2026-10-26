@@ -181,6 +181,33 @@ pub(crate) enum CheckpointCommands {
         command: Vec<String>,
     },
 
+    /// Rebuild a checkpoint in place: like delete then create, except the
+    /// old one stays until the new build succeeds
+    Update {
+        /// Checkpoint name
+        name: String,
+
+        #[command(flatten)]
+        vm: VmArgs,
+
+        /// Start from an existing checkpoint; NAME itself layers the command on top
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Build from a recipe instead of running a command
+        /// (NAME, OWNER/REPO[/PATH][@REF], or a local directory)
+        #[arg(long, conflicts_with = "from", value_name = "REF")]
+        recipe: Option<String>,
+
+        /// Build a third-party recipe without the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+
+        /// Command and arguments to run inside the VM
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
     /// List all checkpoints
     List,
 

@@ -151,6 +151,10 @@ with the image.
    - Absent: build.
 3. Run the command from that checkpoint with the flags the user gave.
 
+`shuru checkpoint update NAME --recipe REF` forces a rebuild at the current
+revision. It builds under `NAME.update` and swaps the files in only when
+every step succeeds, so the old checkpoint survives a failed build.
+
 The build and the run are separate phases with separate network policy.
 The build uses the recipe allowlist. The run uses whatever `--allow-net`
 and `--allow-host` the user passed, which by default is nothing.

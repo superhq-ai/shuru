@@ -136,6 +136,24 @@ fn main() -> Result<()> {
                 let exit_code = checkpoint::create(name, &vm, from.as_deref(), command)?;
                 process::exit(exit_code);
             }
+            CheckpointCommands::Update {
+                name,
+                vm,
+                from,
+                recipe,
+                yes,
+                command,
+            } => {
+                if let Some(ref reference) = recipe {
+                    if !command.is_empty() {
+                        anyhow::bail!("--recipe builds from the recipe steps; drop the command");
+                    }
+                    recipe::update_checkpoint(&name, reference, &vm, yes)?;
+                    return Ok(());
+                }
+                let exit_code = checkpoint::update(name, &vm, from.as_deref(), command)?;
+                process::exit(exit_code);
+            }
             CheckpointCommands::List => checkpoint::list()?,
             CheckpointCommands::Delete { name } => checkpoint::delete(&name)?,
             CheckpointCommands::Push { name: _ } => {

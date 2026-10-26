@@ -23,6 +23,15 @@ this way record their source and revision, visible in `shuru checkpoint
 list`, and a changed recipe rebuilds on the next run. Third-party recipes
 ask for confirmation or `--yes`. See docs/rfcs/0005-recipes.md.
 
+### checkpoint update
+
+`shuru checkpoint update NAME ...` takes the same arguments as `create` and
+replaces an existing checkpoint, or creates it when missing. The new
+checkpoint is built under a staging name and swapped in only when the
+command exits 0, so a failed update leaves the old one in place.
+`--from NAME` layers the command onto the existing checkpoint and
+`--recipe REF` rebuilds from a recipe. Closes #44.
+
 ### Docker Engine runs inside the VM
 
 The `docker` recipe installs pinned docker-ce 29.9.2 and containerd 2.4.2,

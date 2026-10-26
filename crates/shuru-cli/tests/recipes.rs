@@ -222,6 +222,36 @@ fn create_builds_under_a_chosen_name_and_refuses_a_command() {
 
 #[test]
 #[ignore]
+fn update_rebuilds_a_recipe_checkpoint_at_the_same_revision() {
+    let name = unique("shuru-test-recipe-update");
+    let _cleanup = Cleanup(vec![name.clone(), format!("{}.update", name)]);
+    let recipe = LocalRecipe::new(
+        "irrelevant",
+        r#"{"name": "NAME", "steps": ["build.sh"]}"#,
+        &[("build.sh", "date +%s%N > /opt/built\n")],
+    );
+
+    let out = shuru(&["checkpoint", "create", &name, "--recipe", &recipe.path_str()]);
+    assert!(out.status.success(), "{}", text(&out));
+    let first = stdout(&shuru(&["run", "--from", &name, "--", "cat", "/opt/built"]));
+    assert!(!first.trim().is_empty(), "{}", first);
+
+    let out = shuru(&["checkpoint", "update", &name, "--recipe", &recipe.path_str()]);
+    assert!(out.status.success(), "{}", text(&out));
+    let e = stderr(&out);
+    assert!(e.contains("building recipe"), "{}", e);
+    assert!(e.contains(&format!("checkpoint '{}' updated", name)), "{}", e);
+    let second = stdout(&shuru(&["run", "--from", &name, "--", "cat", "/opt/built"]));
+    assert_ne!(first.trim(), second.trim(), "{}", second);
+
+    let list = stdout(&shuru(&["checkpoint", "list"]));
+    let row = list.lines().find(|l| l.starts_with(&name)).unwrap_or("");
+    assert!(row.contains(&recipe.path_str()), "{}", list);
+    assert!(!list.contains(&format!("{}.update", name)), "{}", list);
+}
+
+#[test]
+#[ignore]
 fn failing_step_keeps_no_final_checkpoint() {
     let name = unique("shuru-test-recipe-fail");
     let _cleanup = Cleanup(vec![name.clone(), format!("{}-step1", name)]);

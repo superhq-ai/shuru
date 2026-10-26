@@ -40,7 +40,10 @@ pub(crate) fn create_with_config(
     let checkpoints_dir = format!("{}/checkpoints", data_dir);
     // Check both formats
     if checkpoint_exists(&checkpoints_dir, &name) {
-        bail!("checkpoint '{}' already exists, delete it first", name);
+        bail!(
+            "checkpoint '{}' already exists; use `shuru checkpoint update` to replace it",
+            name
+        );
     }
 
     let prepared = vm::prepare_vm(vm_args, cfg, from)?;
@@ -61,6 +64,61 @@ pub(crate) fn create_with_config(
     drop(result.nbd_handle);
     let _ = std::fs::remove_dir_all(&prepared.instance_dir);
     Ok(result.exit_code)
+}
+
+/// `shuru checkpoint update NAME`: the new checkpoint is built under a
+/// staging name and swapped in once the command succeeds, so a failed build
+/// leaves the old checkpoint untouched. `--from NAME` layers the command on
+/// top of the existing checkpoint instead of starting from the base image.
+pub(crate) fn update(
+    name: String,
+    vm_args: &VmArgs,
+    from: Option<&str>,
+    command: Vec<String>,
+) -> Result<i32> {
+    shuru_vm::validate_checkpoint_name(&name).map_err(|e| anyhow::anyhow!(e))?;
+    if !exists(&name) {
+        return create(name, vm_args, from, command);
+    }
+    let cfg = load_config(vm_args.config.as_deref())?;
+    let staging = staging_name(&name);
+    if exists(&staging) {
+        delete(&staging)?;
+    }
+    let code = create_with_config(staging.clone(), vm_args, &cfg, from, command)?;
+    if code != 0 {
+        let _ = delete(&staging);
+        bail!(
+            "command exited with status {}, checkpoint '{}' unchanged",
+            code,
+            name
+        );
+    }
+    replace(&name, &staging)?;
+    Ok(0)
+}
+
+/// Where an update builds before it replaces `name`.
+pub(crate) fn staging_name(name: &str) -> String {
+    format!("{}.update", name)
+}
+
+/// Move the files of `staging` over those of `name`, in either format,
+/// including the recipe sidecar.
+pub(crate) fn replace(name: &str, staging: &str) -> Result<()> {
+    let checkpoints_dir = format!("{}/checkpoints", default_data_dir());
+    for ext in ["idx", "ext4", "json"] {
+        let target = format!("{}/{}.{}", checkpoints_dir, name, ext);
+        let source = format!("{}/{}.{}", checkpoints_dir, staging, ext);
+        if std::path::Path::new(&target).exists() {
+            std::fs::remove_file(&target)?;
+        }
+        if std::path::Path::new(&source).exists() {
+            std::fs::rename(&source, &target)?;
+        }
+    }
+    eprintln!("shuru: checkpoint '{}' updated", name);
+    Ok(())
 }
 
 pub(crate) fn list() -> Result<()> {

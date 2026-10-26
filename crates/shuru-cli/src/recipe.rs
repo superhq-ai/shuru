@@ -611,9 +611,28 @@ pub(crate) fn create_checkpoint(name: &str, reference: &str, vm: &VmArgs, yes: b
     let recipe = resolve(reference)?;
     confirm(&recipe, yes)?;
     if checkpoint::exists(name) {
-        bail!("checkpoint {} already exists, delete it first", name);
+        bail!(
+            "checkpoint {} already exists; use `shuru checkpoint update` to replace it",
+            name
+        );
     }
     build(name, &recipe, vm)
+}
+
+/// `shuru checkpoint update NAME --recipe REF`: rebuild even when the
+/// revision matches. The old checkpoint stays until the build succeeds.
+pub(crate) fn update_checkpoint(name: &str, reference: &str, vm: &VmArgs, yes: bool) -> Result<()> {
+    let recipe = resolve(reference)?;
+    confirm(&recipe, yes)?;
+    if !checkpoint::exists(name) {
+        return build(name, &recipe, vm);
+    }
+    let staging = checkpoint::staging_name(name);
+    if checkpoint::exists(&staging) {
+        checkpoint::delete(&staging)?;
+    }
+    build(&staging, &recipe, vm)?;
+    checkpoint::replace(name, &staging)
 }
 
 /// `shuru run --recipe REF`: make sure a checkpoint named after the recipe

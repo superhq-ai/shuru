@@ -105,6 +105,12 @@ shuru run --from myenv -- python3 script.py
 # Branch from an existing checkpoint
 shuru checkpoint create myenv2 --from myenv --allow-net -- sh -c 'pip install numpy'
 
+# Rebuild in place: the old checkpoint stays until the new build succeeds
+shuru checkpoint update myenv --allow-net -- sh -c 'apt-get install -y python3 gcc make'
+
+# Or layer onto the existing one
+shuru checkpoint update myenv --from myenv --allow-net -- sh -c 'pip install numpy'
+
 # List and delete
 shuru checkpoint list
 shuru checkpoint delete myenv
@@ -220,6 +226,7 @@ shuru checkpoint create docker --recipe docker     # build the checkpoint under 
 shuru run --from docker -- docker ps               # and start from it like any other
 shuru run --recipe docker -- docker ps             # or both at once: builds on first use, reuses after
 shuru checkpoint create mydocker --recipe docker   # the same recipe under a name of your own
+shuru checkpoint update docker --recipe docker     # force a rebuild at the current revision
 shuru run --recipe owner/repo/path@v1 --yes -- ... # third-party, pinned to a tag
 shuru run --recipe ./my-recipe -- ...              # local directory while developing
 ```
