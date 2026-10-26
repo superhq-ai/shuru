@@ -33,6 +33,11 @@ const tabs = [
     title: "Port forwarding",
     description: "Expose guest ports to the host. Works without network access.",
   },
+  {
+    id: "docker",
+    title: "Docker inside",
+    description: "Run containers in the sandbox. dockerd starts as a guest service and follows the same network rules.",
+  },
 ];
 ---
 
@@ -108,6 +113,25 @@ const tabs = [
           <p class="text-amber">&lt;!DOCTYPE HTML&gt;...</p>
           <br />
           <p class="text-muted"># No --allow-net needed. Tunneled over vsock.</p>
+        </div>
+
+        <div class="tabbed-panel p-5 font-mono text-xs leading-[1.8] md:p-6 md:text-sm" data-panel="docker">
+          <p class="text-muted"># One-time: scripts/prepare-docker-checkpoint.sh builds a 'docker' checkpoint</p>
+          <p><span class="text-dim">$</span> <span class="text-text">shuru run --from docker -p 8080:8080 -- docker run --rm -p 8080:8080 nginxinc/nginx-unprivileged:1.31.7-alpine-slim</span></p>
+          <p class="text-amber">shuru: forwarding 127.0.0.1:8080 -&gt; guest:8080</p>
+          <br />
+          <p><span class="text-dim">$</span> <span class="text-text">curl -sI http://127.0.0.1:8080/ | head -1</span></p>
+          <p class="text-amber">HTTP/1.1 200 OK</p>
+          <br />
+          <p><span class="text-dim">$</span> <span class="text-text">shuru run --from docker -- cat /etc/shuru/services/docker.json</span></p>
+          <p class="text-amber">{"{"}</p>
+          <p class="text-amber pl-4">"exec": ["dockerd"],</p>
+          <p class="text-amber pl-4">"ready": ["docker", "info"],</p>
+          <p class="text-amber pl-4">"ready_timeout_secs": 60,</p>
+          <p class="text-amber pl-4">"stop_timeout_secs": 30</p>
+          <p class="text-amber">{"}"}</p>
+          <br />
+          <p class="text-muted"># Services start at boot, the command waits until they are ready, and they get SIGTERM before power off.</p>
         </div>
       </TabbedSection>
     </div>
