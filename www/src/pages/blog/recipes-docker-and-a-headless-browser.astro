@@ -1,0 +1,227 @@
+---
+import BlogPost from "../../layouts/BlogPost.astro";
+import CodeBlock from "../../components/CodeBlock.astro";
+
+const serviceCode = `{
+  "exec": ["dockerd"],
+  "ready": ["docker", "info"],
+  "ready_timeout_secs": 60,
+  "stop_timeout_secs": 30
+}`;
+
+const recipeCliCode = `$ shuru recipe list
+NAME     DESCRIPTION
+docker   Docker Engine 29.9 with dockerd as a guest service and nginx-unprivileged pre-pulled
+browser  Headless Chromium as a guest service, unprivileged user, DevTools protocol on port 9222
+
+$ shuru recipe show docker          # metadata, services and every step, before anything boots
+$ shuru run --recipe docker -- docker ps
+shuru: building recipe docker from superhq-ai/recipes/docker@6a88421 (2 steps)
+shuru: step 1/2: install.sh
+shuru: step 2/2: pull.sh
+shuru: checkpoint 'docker' saved
+CONTAINER ID   IMAGE   COMMAND   CREATED   STATUS   PORTS   NAMES
+
+$ shuru run --recipe docker -- docker ps   # same revision: boots the checkpoint, no rebuild`;
+
+const recipeJsonCode = `{
+  "name": "docker",
+  "description": "Docker Engine 29.9 with dockerd as a guest service and nginx-unprivileged pre-pulled",
+  "min_shuru_version": "0.8.0",
+  "disk_size": 4096,
+  "memory": 2048,
+  "network": {
+    "allow": ["deb.debian.org", "security.debian.org", "download.docker.com", "*.docker.io"]
+  },
+  "services": {
+    "docker": {
+      "exec": ["dockerd"],
+      "ready": ["docker", "info"],
+      "ready_timeout_secs": 60,
+      "stop_timeout_secs": 30
+    }
+  },
+  "steps": ["install.sh", "pull.sh"]
+}`;
+
+const referencesCode = `shuru run --recipe docker -- ...                    # the official catalog
+shuru run --recipe owner/repo/path@v1 --yes -- ...  # any GitHub repository, pinned to a tag
+shuru run --recipe ./my-recipe -- ...               # a local directory while you write one
+shuru run --recipe docker --checkpoint ci -- ...    # pick the checkpoint name yourself`;
+
+const dockerCode = `# Serve the pre-pulled image on host port 8080. No --allow-net needed.
+shuru run --from docker -p 8080:8080 -- \\
+  docker run --rm -p 8080:8080 nginxinc/nginx-unprivileged:1.31.7-alpine-slim
+
+# Build an image from a mounted project and run it
+shuru run --from docker --mount .:/app -- \\
+  sh -c 'cd /app && docker build -t app . && docker run --rm app'`;
+
+const browserCode = `# Chromium starts at boot; the command runs once /json/version answers
+shuru run --recipe browser -p 9222:9222 -- sleep infinity
+
+# Any CDP client on the host
+curl -s http://127.0.0.1:9222/json/version
+
+# The browser-use example does exactly this
+OPENAI_API_KEY=... uv run --with browser-use --with openai examples/browser-use.py`;
+
+const updateCode = `# Rebuild in place. The old checkpoint stays until the new build exits 0.
+shuru checkpoint update base --allow-net -- apt-get install -y build-essential git make
+
+# Layer onto the existing one instead of starting over
+shuru checkpoint update base --from base --allow-net -- apt-get install -y jq
+
+# Force a recipe checkpoint to rebuild at the current revision
+shuru checkpoint update docker --recipe docker`;
+
+const upgradeCode = `shuru upgrade                    # CLI and OS image
+brew upgrade shuru               # if you installed through Homebrew`;
+---
+
+<BlogPost slug="recipes-docker-and-a-headless-browser">
+  <div class="prose-section">
+    <p>
+      Until now every sandbox booted as bare Debian. That is the right default for isolation, but the
+      environments agents actually need, a Docker daemon, a browser, a toolchain, were yours to script and
+      checkpoint by hand. 0.8.0 adds the pieces that make those environments one command, without giving up
+      the fresh disk on every run.
+    </p>
+    <p>
+      Four things shipped: guest services, recipes, two official recipes for Docker and a headless browser,
+      and <code>checkpoint update</code>.
+    </p>
+  </div>
+
+  <div class="prose-section">
+    <h2>Guest services</h2>
+    <p>
+      The guest has no systemd. PID 1 is a small init written in Rust, which is a large part of why a VM boots
+      in about a second. Daemons needed a way to exist in that model, so an image can now declare them in
+      <code>/etc/shuru/services/&lt;name&gt;.json</code>.
+    </p>
+    <p>
+      The init starts every service at boot, polls its readiness check, and only then runs your command.
+      On the way down it sends SIGTERM, waits up to the stop timeout, and syncs the disk before the VM
+      powers off. The host now asks the guest to shut down over vsock instead of pulling the plug, so a
+      checkpoint is always cloned from a consistent image, whichever path stopped the VM.
+    </p>
+  </div>
+
+  <div class="code-section">
+    <CodeBlock code={serviceCode} lang="json" title="/etc/shuru/services/docker.json" />
+  </div>
+
+  <div class="prose-section">
+    <h2>Recipes</h2>
+    <p>
+      A recipe is a versioned description of a checkpoint: a <code>recipe.json</code> with metadata and
+      services, plus shell steps. Each step runs in a fresh boot from the previous step, so a service
+      declared in the recipe is already running from step two onwards. The result is a normal checkpoint
+      with one extra file next to it that records where it came from and at which revision.
+    </p>
+    <p>
+      <code>shuru run --recipe</code> builds the checkpoint on first use and boots it on every run after.
+      References to GitHub resolve to a commit SHA, which is printed and recorded. Change the recipe and
+      the next run rebuilds; leave it alone and the next run boots in seconds.
+    </p>
+  </div>
+
+  <div class="code-section">
+    <CodeBlock code={recipeCliCode} lang="bash" title="terminal" />
+  </div>
+
+  <div class="prose-section">
+    <p>
+      The official catalog lives in <a href="https://github.com/superhq-ai/recipes" target="_blank" rel="noopener">superhq-ai/recipes</a>.
+      A bare name always means that catalog. Any GitHub repository works too, and a local directory while you
+      write one. Third-party recipes print their source and ask before building; official and local ones do not.
+      Builds use the network allowlist the recipe declares, never your project <code>shuru.json</code>, and a
+      recipe with no allowlist builds offline.
+    </p>
+  </div>
+
+  <div class="code-section">
+    <div class="grid gap-4 md:grid-cols-2">
+      <CodeBlock code={recipeJsonCode} lang="json" title="recipe.json" />
+      <CodeBlock code={referencesCode} lang="bash" title="references" />
+    </div>
+  </div>
+
+  <div class="prose-section">
+    <h2>Docker inside the VM</h2>
+    <p>
+      The <code>docker</code> recipe installs pinned docker-ce and containerd, declares dockerd as a guest
+      service, and pre-pulls one image so the checkpoint is useful offline. Containers get the same boundary
+      as any guest process: no egress without <code>--allow-net</code>, the host allowlist applied by the
+      proxy, host ports only through <code>-p</code>.
+    </p>
+    <p>
+      To make dockerd happy the guest kernel gained cgroup v2 controllers, cgroup BPF, seccomp filters,
+      veth and the netfilter targets Docker installs, and moved to Linux 6.12.114. The init now mounts
+      cgroup2 and a tmpfs on <code>/run</code>, which also means <code>/run</code> no longer lands in
+      checkpoints. Docker isolation inside the VM stays at its defaults; there is no reason to weaken the
+      inner layer when the outer one is a VM.
+    </p>
+  </div>
+
+  <div class="code-section">
+    <CodeBlock code={dockerCode} lang="bash" title="terminal" />
+  </div>
+
+  <div class="prose-section">
+    <h2>A headless browser for agents</h2>
+    <p>
+      The <code>browser</code> recipe installs Chromium from Debian and runs it headless as an unprivileged
+      user, with the DevTools protocol on port 9222 inside the VM. Forward that port and point Playwright,
+      Puppeteer or browser-use at it. The browser, its profile and everything it downloads stay inside the
+      microVM. Only the CDP port reaches the host, and only when you forward it.
+    </p>
+    <p>
+      The kernel ships user namespaces, so the Chromium sandbox works as designed on top of the VM boundary
+      rather than being switched off. The Browser Use example in the repository now runs on this recipe.
+    </p>
+  </div>
+
+  <div class="code-section">
+    <CodeBlock code={browserCode} lang="bash" title="terminal" />
+  </div>
+
+  <div class="prose-section">
+    <h2>checkpoint update</h2>
+    <p>
+      Replacing a checkpoint used to mean delete then create, with nothing in between if the create failed.
+      <code>shuru checkpoint update</code> takes the same arguments as <code>create</code>, builds under a
+      staging name, and swaps the new disk in only when the command exits 0. A failed update leaves the old
+      checkpoint exactly as it was.
+    </p>
+  </div>
+
+  <div class="code-section">
+    <CodeBlock code={updateCode} lang="bash" title="terminal" />
+  </div>
+
+  <div class="prose-section">
+    <h2>Upgrading</h2>
+    <p>
+      The CLI pulls the new kernel and rootfs with the release. In the Rust SDK, <code>Sandbox::stop()</code>
+      is now the graceful stop that lets services shut down and <code>Sandbox::kill()</code> is the old hard
+      stop. The crates are on crates.io as shuru-proto 0.4.0, shuru-proxy 0.3.0, shuru-vm 0.4.0 and
+      shuru-sdk 0.5.0. The agent skill in the repository knows about all of the above, so agents that use
+      shuru through it pick up recipes without any prompting.
+    </p>
+  </div>
+
+  <div class="code-section">
+    <CodeBlock code={upgradeCode} lang="bash" title="terminal" />
+  </div>
+
+  <div class="prose-section">
+    <p>
+      The catalog has two recipes today. If there is an environment your agents keep rebuilding by hand,
+      a recipe for it is a directory with a <code>recipe.json</code> and a shell script, and
+      <code>shuru run --recipe ./that-directory</code> is the whole test loop. Pull requests to the catalog
+      are open.
+    </p>
+  </div>
+</BlogPost>

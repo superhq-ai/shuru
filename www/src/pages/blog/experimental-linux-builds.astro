@@ -1,118 +1,28 @@
 ---
-import Layout from "../../layouts/Layout.astro";
-import Nav from "../../components/landing/Nav.astro";
-import Footer from "../../components/landing/Footer.astro";
+import BlogPost from "../../layouts/BlogPost.astro";
 ---
 
-<Layout
-  title="Experimental Linux builds for shuru"
-  description="Shuru now publishes experimental Linux ARM64 builds with the KVM backend. Setup details live on the Linux page."
->
-  <div class="dot-grid min-h-screen">
-    <Nav />
-
-    <main class="mx-auto max-w-6xl px-6">
-      <article class="relative border-x border-border pt-36 pb-0 md:pt-48">
-        <span class="section-label article-label">Blog</span>
-
-        <div class="px-8 pt-8 pb-6 md:px-16 md:pt-12 md:pb-8">
-          <div class="font-mono text-[10px] uppercase tracking-widest text-dim">April 15, 2026</div>
-          <h1 class="mt-4 text-3xl font-semibold leading-tight tracking-tight md:text-5xl lg:text-6xl">
-            Shuru on Linux
-            <br />
-            <span class="text-muted">is live for ARM64 hosts.</span>
-          </h1>
-        </div>
-
-        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
-          <p>
-            Shuru now publishes Linux CLI builds in GitHub Releases. They target Linux ARM64 and use a KVM backend
-            in place of Apple's Virtualization.framework. Homebrew remains macOS-only; on Linux, the install
-            script is the path.
-          </p>
-          <p>
-            This is the experimental track. It is useful for evaluating shuru on ARM servers and Linux workstations,
-            but it is not production-ready yet while we keep closing gaps between the macOS and Linux backends.
-          </p>
-        </div>
-
-        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
-          <h2>Setup and prerequisites</h2>
-          <p>
-            Full instructions live on the Linux setup page: prerequisites (ARM64, <code>/dev/kvm</code>,
-            <code>kvm</code> group), install script, first run, and troubleshooting.
-          </p>
-          <p>
-            <a href="/linux" class="text-amber hover:underline">Read the Linux setup guide &rarr;</a>
-          </p>
-        </div>
-
-        <div class="border-t border-dashed border-border px-8 py-8 md:px-16 md:py-10">
-          <div class="flex flex-col items-start gap-3 font-mono text-sm">
-            <a
-              href="https://github.com/superhq-ai/shuru/releases"
-              target="_blank"
-              rel="noopener"
-              class="text-muted transition-colors hover:text-amber"
-            >
-              GitHub Releases &rarr;
-            </a>
-            <a
-              href="https://github.com/superhq-ai/shuru"
-              target="_blank"
-              rel="noopener"
-              class="text-muted transition-colors hover:text-amber"
-            >
-              GitHub repository &rarr;
-            </a>
-          </div>
-        </div>
-
-        <div class="flex items-center gap-2 px-8 py-6 md:px-16">
-          <span class="measure">article</span>
-          <div class="h-px flex-1 border-t border-dashed border-dim"></div>
-        </div>
-      </article>
-    </main>
-
-    <Footer />
-
-    <div class="h-12"></div>
+<BlogPost slug="experimental-linux-builds">
+  <div class="prose-section">
+    <p>
+      Shuru now publishes Linux CLI builds in GitHub Releases. They target Linux ARM64 and use a KVM backend
+      in place of Apple's Virtualization.framework. Homebrew remains macOS-only; on Linux, the install
+      script is the path.
+    </p>
+    <p>
+      This is the experimental track. It is useful for evaluating shuru on ARM servers and Linux workstations,
+      but it is not production-ready yet while we keep closing gaps between the macOS and Linux backends.
+    </p>
   </div>
-</Layout>
 
-<style>
-  .article-label {
-    top: calc(9rem - 8px);
-  }
-  @media (min-width: 768px) {
-    .article-label {
-      top: calc(12rem - 8px);
-    }
-  }
-
-  .prose-section h2 {
-    color: var(--color-text);
-    font-size: 1.1rem;
-    font-weight: 600;
-    letter-spacing: -0.01em;
-    margin-bottom: 1rem;
-  }
-
-  .prose-section p {
-    color: var(--color-muted);
-    font-size: 1rem;
-    line-height: 1.85;
-    max-width: 640px;
-  }
-
-  .prose-section p + p {
-    margin-top: 1.5rem;
-  }
-
-  .prose-section code {
-    font-family: var(--font-mono);
-    font-size: 0.9em;
-    color: var(--color-text);
-  }
-</style>
+  <div class="prose-section">
+    <h2>Setup and prerequisites</h2>
+    <p>
+      Full instructions live on the Linux setup page: prerequisites (ARM64, <code>/dev/kvm</code>,
+      <code>kvm</code> group), install script, first run, and troubleshooting.
+    </p>
+    <p>
+      <a href="/linux">Read the Linux setup guide &rarr;</a>
+    </p>
+  </div>
+</BlogPost>

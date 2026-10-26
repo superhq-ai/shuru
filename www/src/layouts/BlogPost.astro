@@ -1,0 +1,142 @@
+---
+import Layout from "./Layout.astro";
+import Nav from "../components/landing/Nav.astro";
+import Footer from "../components/landing/Footer.astro";
+import { getPost, formatDate } from "../data/posts";
+
+interface Props {
+  slug: string;
+}
+
+const { slug } = Astro.props;
+const post = getPost(slug);
+---
+
+<Layout
+  title={`${post.title} ${post.subtitle} - shuru`}
+  description={post.description}
+  path={`/blog/${post.slug}`}
+  type="article"
+>
+  <div class="dot-grid min-h-screen">
+    <Nav />
+
+    <main class="mx-auto max-w-6xl px-6">
+      <article class="post relative border-x border-border pt-28 pb-0 md:pt-32">
+        <header class="px-8 pt-8 pb-6 md:px-16 md:pt-12 md:pb-8">
+          <div class="flex items-center gap-3 font-mono text-[10px] uppercase tracking-widest text-dim">
+            <a href="/blog" class="transition-colors hover:text-amber">Blog</a>
+            <span aria-hidden="true">/</span>
+            <time datetime={post.date}>{formatDate(post.date)}</time>
+          </div>
+          <h1 class="mt-4 text-3xl font-semibold leading-tight tracking-tight md:text-5xl lg:text-6xl">
+            {post.title}
+            <br />
+            <span class="text-muted">{post.subtitle}</span>
+          </h1>
+        </header>
+
+        <slot />
+
+        <div class="border-t border-dashed border-border px-8 py-8 md:px-16 md:py-10">
+          <div class="flex flex-col items-start gap-3 font-mono text-sm">
+            {
+              post.links.map((link) => (
+                <a
+                  href={link.href}
+                  target="_blank"
+                  rel="noopener"
+                  class="text-muted transition-colors hover:text-amber"
+                >
+                  {link.label} &rarr;
+                </a>
+              ))
+            }
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2 px-8 py-6 md:px-16">
+          <span class="measure">article</span>
+          <div class="h-px flex-1 border-t border-dashed border-dim"></div>
+        </div>
+      </article>
+    </main>
+
+    <Footer />
+
+    <div class="h-12"></div>
+  </div>
+</Layout>
+
+<style is:global>
+  .post .prose-section {
+    border-top: 1px dashed var(--color-border);
+    padding: 2rem 2rem 1rem;
+  }
+
+  .post .code-section {
+    border-top: 1px dashed var(--color-border);
+    padding: 1.5rem 2rem;
+  }
+
+  @media (min-width: 768px) {
+    .post .prose-section {
+      padding: 3rem 4rem 1.5rem;
+    }
+
+    .post .code-section {
+      padding: 2rem 4rem;
+    }
+  }
+
+  .post .prose-section h2 {
+    color: var(--color-text);
+    font-size: 1.1rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin-bottom: 1rem;
+  }
+
+  .post .prose-section p,
+  .post .prose-section ul {
+    color: var(--color-muted);
+    font-size: 1rem;
+    line-height: 1.85;
+    max-width: 640px;
+  }
+
+  .post .prose-section ul {
+    list-style: disc;
+    padding-left: 1.25rem;
+    margin-top: 0.75rem;
+  }
+
+  .post .prose-section li + li {
+    margin-top: 0.4rem;
+  }
+
+  .post .prose-section p + p,
+  .post .prose-section ul + p {
+    margin-top: 1.5rem;
+  }
+
+  .post .prose-section code {
+    font-family: var(--font-mono);
+    font-size: 0.9em;
+    color: var(--color-text);
+  }
+
+  .post .prose-section strong {
+    color: var(--color-text);
+    font-weight: 600;
+  }
+
+  .post .prose-section a {
+    color: var(--color-text);
+    transition: color 150ms;
+  }
+
+  .post .prose-section a:hover {
+    color: var(--color-amber);
+  }
+</style>

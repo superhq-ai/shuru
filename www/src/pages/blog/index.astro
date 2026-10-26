@@ -1,0 +1,68 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import Nav from "../../components/landing/Nav.astro";
+import Footer from "../../components/landing/Footer.astro";
+import { posts, formatDate } from "../../data/posts";
+
+const sorted = [...posts].sort((a, b) => (a.date < b.date ? 1 : -1));
+---
+
+<Layout
+  title="Blog - shuru"
+  description="Release notes and design notes for shuru, the local-first microVM sandbox for AI agents."
+  path="/blog"
+>
+  <div class="dot-grid min-h-screen">
+    <Nav />
+
+    <main class="mx-auto max-w-6xl px-6">
+      <section class="relative border-x border-border pt-28 pb-0 md:pt-32">
+        <header class="px-8 pt-8 pb-6 md:px-16 md:pt-12 md:pb-8">
+          <div class="flex items-center gap-3 font-mono text-[10px] uppercase tracking-widest text-dim">
+            <span>Blog</span>
+            <span aria-hidden="true">/</span>
+            <a href="/rss.xml" class="transition-colors hover:text-amber">RSS</a>
+          </div>
+          <h1 class="mt-4 text-3xl font-semibold leading-tight tracking-tight md:text-5xl lg:text-6xl">
+            Release notes
+            <br />
+            <span class="text-muted">and design notes.</span>
+          </h1>
+        </header>
+
+        <ol>
+          {
+            sorted.map((post) => (
+              <li class="border-t border-dashed border-border">
+                <a
+                  href={`/blog/${post.slug}`}
+                  class="group block px-8 py-8 transition-colors hover:bg-surface md:px-16 md:py-10"
+                >
+                  <time datetime={post.date} class="font-mono text-[10px] uppercase tracking-widest text-dim">
+                    {formatDate(post.date)}
+                  </time>
+                  <h2 class="mt-3 max-w-2xl text-xl font-semibold leading-snug tracking-tight md:text-2xl">
+                    {post.title} <span class="text-muted">{post.subtitle}</span>
+                  </h2>
+                  <p class="mt-3 max-w-2xl text-sm leading-relaxed text-muted md:text-base">{post.description}</p>
+                  <span class="mt-4 inline-block font-mono text-xs text-dim transition-colors group-hover:text-amber">
+                    Read &rarr;
+                  </span>
+                </a>
+              </li>
+            ))
+          }
+        </ol>
+
+        <div class="flex items-center gap-2 border-t border-dashed border-border px-8 py-6 md:px-16">
+          <span class="measure">{sorted.length} posts</span>
+          <div class="h-px flex-1 border-t border-dashed border-dim"></div>
+        </div>
+      </section>
+    </main>
+
+    <Footer />
+
+    <div class="h-12"></div>
+  </div>
+</Layout>

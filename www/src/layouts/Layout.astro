@@ -4,12 +4,18 @@ import "../styles/global.css";
 interface Props {
   title: string;
   description?: string;
+  path?: string;
+  type?: "website" | "article";
 }
 
 const {
   title,
   description = "Local-first microVM sandbox for AI agents on macOS, with experimental Linux ARM64 support",
+  path = "/",
+  type = "website",
 } = Astro.props;
+
+const url = new URL(path, "https://shuru.run").toString();
 ---
 
 <!doctype html>
@@ -26,12 +32,14 @@ const {
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
+    <link rel="canonical" href={url} />
+    <link rel="alternate" type="application/rss+xml" title="shuru blog" href="/rss.xml" />
     <!-- Open Graph -->
-    <meta property="og:type" content="website" />
+    <meta property="og:type" content={type} />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:image" content="https://shuru.run/og.png" />
-    <meta property="og:url" content="https://shuru.run" />
+    <meta property="og:url" content={url} />
 
     <!-- Twitter -->
     <meta name="twitter:card" content="summary_large_image" />

@@ -1,7 +1,5 @@
 ---
-import Layout from "../../layouts/Layout.astro";
-import Nav from "../../components/landing/Nav.astro";
-import Footer from "../../components/landing/Footer.astro";
+import BlogPost from "../../layouts/BlogPost.astro";
 import CodeBlock from "../../components/CodeBlock.astro";
 
 const primitivesCode = `import { Sandbox } from "@superhq/shuru"
@@ -141,182 +139,100 @@ const results = await Promise.all(issues.map(async ({ branch, task }) => {
 }))`;
 ---
 
-<Layout
-  title="Local sandbox and execution layer for autonomous agents on macOS - shuru"
-  description="Shuru is a local execution layer for AI agent orchestrators. Ephemeral Linux VMs, secret isolation, and checkpoints for multi-agent workflows."
->
-  <div class="dot-grid min-h-screen">
-    <Nav />
+<BlogPost slug="local-sandbox-and-execution-layer-for-autonomous-agents">
+  <div class="prose-section">
+    <p>
+      Autonomous coding agents need somewhere to run generated code safely. Whether it's an orchestrator like
+      <a href="https://air.dev" target="_blank" rel="noopener">JetBrains Air</a> or
+      <a href="https://conductor.build" target="_blank" rel="noopener">Conductor</a> dispatching tasks, or your own agent harness calling an LLM in a loop,
+      the agent needs to execute commands, read output, and iterate without risking the host machine.
+    </p>
 
-    <main class="mx-auto max-w-6xl px-6">
-      <article class="relative border-x border-border pt-36 pb-0 md:pt-48">
-        <span class="section-label article-label">Blog</span>
-
-        <!-- Header -->
-        <div class="px-8 pt-8 pb-6 md:px-16 md:pt-12 md:pb-8">
-          <div class="font-mono text-[10px] uppercase tracking-widest text-dim">March 12, 2026</div>
-          <h1 class="mt-4 text-3xl font-semibold leading-tight tracking-tight md:text-5xl lg:text-6xl">
-            Local sandbox and execution layer
-            <br />
-            <span class="text-muted">for autonomous agents on macOS.</span>
-          </h1>
-        </div>
-
-        <!-- Intro + Execution -->
-        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
-          <p>
-            Autonomous coding agents need somewhere to run generated code safely. Whether it's an orchestrator like
-            <a href="https://air.dev" target="_blank" rel="noopener" class="text-text hover:text-amber transition-colors">JetBrains Air</a> or
-            <a href="https://conductor.build" target="_blank" rel="noopener" class="text-text hover:text-amber transition-colors">Conductor</a> dispatching tasks, or your own agent harness calling an LLM in a loop,
-            the agent needs to execute commands, read output, and iterate without risking the host machine.
-          </p>
-
-          <p>
-            Shuru is a local execution layer for this. It spins up ephemeral Linux VMs using Apple's
-            <a href="https://developer.apple.com/documentation/virtualization" target="_blank" rel="noopener" class="text-text hover:text-amber transition-colors">Virtualization.framework</a> and boots in about a second. Your agent harness calls the SDK from the host
-            to exec commands, write files, stream process output, and watch for changes inside the VM. The agent's
-            state stays on your machine. The sandbox is disposable.
-          </p>
-        </div>
-
-        <div class="border-t border-dashed border-border px-8 py-6 md:px-16 md:py-8">
-          <CodeBlock code={primitivesCode} lang="typescript" title="primitives.ts" />
-        </div>
-
-        <!-- Execution layer -->
-        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
-          <p>
-            There are two ways agents use sandboxes. The first is running the agent itself inside the VM, like
-            launching Claude Code in a container. The second is using the sandbox as a tool: the agent runs on
-            the host, generates code or commands, sends them to the sandbox for execution, reads the output, and
-            decides what to do next. This is how most agent harnesses actually work.
-          </p>
-
-          <p>
-            With the second pattern, agent state (conversation history, tool results, memory) never enters the VM.
-            If execution fails, the agent can retry or start a fresh sandbox without losing context. Your API keys
-            stay on the host. The sandbox is just the agent's hands.
-          </p>
-        </div>
-
-        <div class="border-t border-dashed border-border px-8 py-6 md:px-16 md:py-8">
-          <CodeBlock code={harnessCode} lang="typescript" title="harness.ts" />
-        </div>
-
-        <!-- Secret isolation -->
-        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
-          <p>
-            Beyond isolation, one of the biggest risks with giving agents API access is credential theft via prompt
-            injection. An agent reads a poisoned file and gets tricked into exfiltrating your keys, and you don't even
-            notice. The usual advice is to limit what the agent can access. The better answer is that the agent never has
-            the real keys in the first place. Sandboxes are offline by default, and when you do enable networking, all
-            traffic goes through a userspace proxy on the host. Secrets stay on the host and get injected at the proxy
-            layer only on HTTPS requests to domains you've explicitly allowed. The guest only ever sees a placeholder
-            token. Even if the agent is fully compromised, there's nothing to steal.
-          </p>
-        </div>
-
-        <div class="border-t border-dashed border-border px-8 py-6 md:px-16 md:py-8">
-          <div class="grid gap-4 md:grid-cols-2">
-            <CodeBlock code={configCode} lang="json" title="shuru.json" />
-            <CodeBlock code={sandboxCode} lang="bash" title="inside the sandbox" />
-          </div>
-        </div>
-
-        <!-- Checkpoints -->
-        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
-          <p>
-            The part that ties this together for multi-agent workflows is checkpoints. Think of them like git commits for
-            your environment. You set up a base with your dependencies, save it, and any number of agents can fork from
-            that checkpoint independently. Each gets its own isolated copy without rebuilding anything.
-          </p>
-
-          <p>
-            Sandboxes start as bare Debian. You install what you need (runtimes, tools, project dependencies) and
-            checkpoint the result. That one-time cost pays for every subsequent fork.
-          </p>
-        </div>
-
-        <div class="border-t border-dashed border-border px-8 py-6 md:px-16 md:py-8">
-          <CodeBlock code={checkpointCode} lang="typescript" title="checkpoint.ts" />
-        </div>
-
-        <!-- Multi-agent fanout -->
-        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
-          <p>
-            Once you have a checkpoint, you can fan out. Each task gets its own VM forked from the saved state. Node,
-            Claude Code, and your project dependencies are already installed. The VM boots in about a second and the
-            agent can start working immediately. Run Claude Code headless inside each sandbox and collect the diffs
-            when they're done.
-          </p>
-        </div>
-
-        <div class="border-t border-dashed border-border px-8 py-6 md:px-16 md:py-8">
-          <CodeBlock code={fanoutCode} lang="typescript" title="orchestrator.ts" />
-        </div>
-
-        <!-- Closing -->
-        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
-          <p>
-            We now have experimental Linux ARM64 builds using the KVM backend. They're useful for early testing on
-            servers, but they're not ready for production use yet. If you're building an orchestrator or an agent
-            harness that needs a local execution layer, we'd love to hear what's still missing.
-          </p>
-        </div>
-
-        <!-- Links -->
-        <div class="border-t border-dashed border-border px-8 py-8 md:px-16 md:py-10">
-          <div class="flex flex-col items-start gap-3 font-mono text-sm">
-            <a
-              href="https://www.npmjs.com/package/@superhq/shuru"
-              target="_blank"
-              rel="noopener"
-              class="text-muted transition-colors hover:text-amber"
-            >
-              CLI and TypeScript SDK &rarr;
-            </a>
-            <a
-              href="https://github.com/superhq-ai/shuru"
-              target="_blank"
-              rel="noopener"
-              class="text-muted transition-colors hover:text-amber"
-            >
-              GitHub &rarr;
-            </a>
-          </div>
-        </div>
-
-        <div class="flex items-center gap-2 px-8 py-6 md:px-16">
-          <span class="measure">article</span>
-          <div class="h-px flex-1 border-t border-dashed border-dim"></div>
-        </div>
-      </article>
-    </main>
-
-    <Footer />
-
-    <div class="h-12"></div>
+    <p>
+      Shuru is a local execution layer for this. It spins up ephemeral Linux VMs using Apple's
+      <a href="https://developer.apple.com/documentation/virtualization" target="_blank" rel="noopener">Virtualization.framework</a> and boots in about a second. Your agent harness calls the SDK from the host
+      to exec commands, write files, stream process output, and watch for changes inside the VM. The agent's
+      state stays on your machine. The sandbox is disposable.
+    </p>
   </div>
-</Layout>
 
-<style>
-  .article-label {
-    top: calc(9rem - 8px);
-  }
-  @media (min-width: 768px) {
-    .article-label {
-      top: calc(12rem - 8px);
-    }
-  }
+  <div class="code-section">
+    <CodeBlock code={primitivesCode} lang="typescript" title="primitives.ts" />
+  </div>
 
-  .prose-section p {
-    color: var(--color-muted);
-    font-size: 1rem;
-    line-height: 1.85;
-    max-width: 640px;
-  }
+  <div class="prose-section">
+    <p>
+      There are two ways agents use sandboxes. The first is running the agent itself inside the VM, like
+      launching Claude Code in a container. The second is using the sandbox as a tool: the agent runs on
+      the host, generates code or commands, sends them to the sandbox for execution, reads the output, and
+      decides what to do next. This is how most agent harnesses actually work.
+    </p>
 
-  .prose-section p + p {
-    margin-top: 1.5rem;
-  }
-</style>
+    <p>
+      With the second pattern, agent state (conversation history, tool results, memory) never enters the VM.
+      If execution fails, the agent can retry or start a fresh sandbox without losing context. Your API keys
+      stay on the host. The sandbox is just the agent's hands.
+    </p>
+  </div>
+
+  <div class="code-section">
+    <CodeBlock code={harnessCode} lang="typescript" title="harness.ts" />
+  </div>
+
+  <div class="prose-section">
+    <p>
+      Beyond isolation, one of the biggest risks with giving agents API access is credential theft via prompt
+      injection. An agent reads a poisoned file and gets tricked into exfiltrating your keys, and you don't even
+      notice. The usual advice is to limit what the agent can access. The better answer is that the agent never has
+      the real keys in the first place. Sandboxes are offline by default, and when you do enable networking, all
+      traffic goes through a userspace proxy on the host. Secrets stay on the host and get injected at the proxy
+      layer only on HTTPS requests to domains you've explicitly allowed. The guest only ever sees a placeholder
+      token. Even if the agent is fully compromised, there's nothing to steal.
+    </p>
+  </div>
+
+  <div class="code-section">
+    <div class="grid gap-4 md:grid-cols-2">
+      <CodeBlock code={configCode} lang="json" title="shuru.json" />
+      <CodeBlock code={sandboxCode} lang="bash" title="inside the sandbox" />
+    </div>
+  </div>
+
+  <div class="prose-section">
+    <p>
+      The part that ties this together for multi-agent workflows is checkpoints. Think of them like git commits for
+      your environment. You set up a base with your dependencies, save it, and any number of agents can fork from
+      that checkpoint independently. Each gets its own isolated copy without rebuilding anything.
+    </p>
+
+    <p>
+      Sandboxes start as bare Debian. You install what you need (runtimes, tools, project dependencies) and
+      checkpoint the result. That one-time cost pays for every subsequent fork.
+    </p>
+  </div>
+
+  <div class="code-section">
+    <CodeBlock code={checkpointCode} lang="typescript" title="checkpoint.ts" />
+  </div>
+
+  <div class="prose-section">
+    <p>
+      Once you have a checkpoint, you can fan out. Each task gets its own VM forked from the saved state. Node,
+      Claude Code, and your project dependencies are already installed. The VM boots in about a second and the
+      agent can start working immediately. Run Claude Code headless inside each sandbox and collect the diffs
+      when they're done.
+    </p>
+  </div>
+
+  <div class="code-section">
+    <CodeBlock code={fanoutCode} lang="typescript" title="orchestrator.ts" />
+  </div>
+
+  <div class="prose-section">
+    <p>
+      We now have experimental Linux ARM64 builds using the KVM backend. They're useful for early testing on
+      servers, but they're not ready for production use yet. If you're building an orchestrator or an agent
+      harness that needs a local execution layer, we'd love to hear what's still missing.
+    </p>
+  </div>
+</BlogPost>
