@@ -1,4 +1,8 @@
-"""Run a Browser Use agent against Chromium isolated inside Shuru."""
+"""Run a Browser Use agent against Chromium isolated inside Shuru.
+
+The browser recipe runs headless Chromium as a guest service, so the VM is
+ready when the command starts and the only thing to do is keep it alive.
+"""
 
 import asyncio
 import os
@@ -19,7 +23,9 @@ def free_port() -> int:
 
 
 def wait_for_cdp(url: str, process: subprocess.Popen[bytes]) -> None:
-    deadline = time.monotonic() + 15
+    # The first run builds the browser checkpoint from the recipe, which
+    # takes a few minutes; later runs answer within seconds.
+    deadline = time.monotonic() + 600
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(f"Shuru exited with code {process.returncode}")
@@ -58,22 +64,16 @@ def main() -> None:
         [
             "shuru",
             "run",
-            "--from",
-            os.getenv("SHURU_BROWSER_CHECKPOINT", "browser-use"),
+            "--recipe",
+            os.getenv("SHURU_BROWSER_RECIPE", "browser"),
             "--allow-net",
             "--port",
             f"{host_port}:9222",
             "--memory",
             "4096",
             "--",
-            "/usr/bin/chromium",
-            "--headless",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--remote-debugging-address=0.0.0.0",
-            "--remote-debugging-port=9222",
-            "--user-data-dir=/tmp/browser-use-profile",
-            "about:blank",
+            "sleep",
+            "infinity",
         ]
     )
 

@@ -10,6 +10,9 @@
 //!   SHURU_DOCKER_RECIPE   path to the docker recipe directory from a checkout
 //!                         of superhq-ai/recipes; with SHURU_TEST_NET=1 it is
 //!                         built for real and runs a container
+//!   SHURU_BROWSER_RECIPE  same for the browser recipe; built for real, then
+//!                         the DevTools endpoint is checked inside the VM and
+//!                         through a forwarded port
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -335,6 +338,65 @@ fn failing_step_keeps_no_final_checkpoint() {
     assert!(e.contains(&format!("intermediate checkpoint {}-step1 kept", name)), "{}", e);
     let list = stdout(&shuru(&["checkpoint", "list"]));
     assert!(!list.lines().any(|l| l.starts_with(&format!("{} ", name))), "{}", list);
+}
+
+#[test]
+#[ignore]
+fn browser_recipe_serves_cdp_inside_and_through_a_forwarded_port() {
+    use std::io::{Read, Write};
+
+    let Ok(dir) = std::env::var("SHURU_BROWSER_RECIPE") else {
+        eprintln!("skipped: set SHURU_BROWSER_RECIPE to the browser recipe directory");
+        return;
+    };
+    if !std::env::var("SHURU_TEST_NET").map(|v| v == "1").unwrap_or(false) {
+        eprintln!("skipped: set SHURU_TEST_NET=1");
+        return;
+    }
+    let name = unique("shuru-test-recipe-browser");
+    let _cleanup = Cleanup(vec![name.clone()]);
+
+    let out = shuru(&["checkpoint", "create", &name, "--recipe", &dir]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(stderr(&out).contains("step 2/2: check.sh"), "{}", text(&out));
+    assert!(stdout(&out).contains("screenshot ok"), "{}", text(&out));
+
+    // Inside the VM the service is ready before the command runs.
+    let out = shuru(&["run", "--from", &name, "--", "sh", "-c", "id -un; curl -sf http://127.0.0.1:9222/json/version"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let s = stdout(&out);
+    assert!(s.contains("Chrome/"), "{}", s);
+    assert!(s.contains("webSocketDebuggerUrl"), "{}", s);
+
+    // Through -p the host reaches the same endpoint, which is how CDP clients attach.
+    let port = 19000 + (std::process::id() % 1000) as u16;
+    let mut child = Command::new(shuru_bin())
+        .args(["run", "--from", &name, "-p", &format!("{}:9222", port), "--", "sleep", "30"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn shuru");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut body = String::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            // The DevTools server ignores HTTP/1.0 requests.
+            let _ = stream.write_all(
+                b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream.read_to_string(&mut body);
+            if body.contains("Chrome/") {
+                break;
+            }
+            body.clear();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(body.contains("Chrome/"), "no CDP answer on host port {}: {:?}", port, body);
 }
 
 #[test]
