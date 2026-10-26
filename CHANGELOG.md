@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Linux: reflink clones instead of copies
+
+The Linux backend copied the full disk image for every boot and every
+checkpoint, where macOS has always used an APFS clonefile. The clone now
+goes through the FICLONE ioctl, so on XFS with `reflink=1` or btrfs a boot
+and a checkpoint are copy-on-write and cost no disk. Measured on an
+a1.metal host against the same 0.8.0 image: boot 1.3s instead of 9s,
+`checkpoint create` 1.3s instead of 51s, `run --from` 1.0s instead of 35s,
+and a checkpoint allocates 0 bytes instead of 4 GB. Filesystems without
+reflinks still work through the old copy, with a one-time note naming the
+directory so the fix is obvious.
+
 ## 0.8.0
 
 ### Guest services

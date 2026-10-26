@@ -12,6 +12,8 @@ Shuru boots lightweight Linux VMs for AI agents. On macOS it uses Apple's Virtua
 - macOS 14 (Sonoma) or later on Apple Silicon
 - Linux ARM64 with KVM access (`/dev/kvm`) for experimental testing only
 
+On Linux, keep the data directory (`~/.local/share/shuru` or `SHURU_DATA_DIR`) on a filesystem with reflinks, XFS with `reflink=1` or btrfs. Every boot and every checkpoint is then a copy-on-write clone that costs no disk and no time, as on APFS. On ext4 shuru falls back to copying the disk image, which turns a one second boot into ten and makes each checkpoint a full copy.
+
 ## Install
 
 ```sh
