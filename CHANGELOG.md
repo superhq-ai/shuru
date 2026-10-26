@@ -12,14 +12,26 @@ down over vsock, which also syncs the disk, so checkpoints are cloned from
 a consistent image on every stop path. `Sandbox::stop()` is graceful and
 `Sandbox::kill()` is the old hard stop. See docs/rfcs/0004-guest-services.md.
 
+### Recipes
+
+`shuru run --recipe REF` and `shuru checkpoint create NAME --recipe REF`
+build a checkpoint from a recipe: a directory with `recipe.json` and shell
+steps, fetched from GitHub at an exact commit or read from a local path.
+`shuru recipe list` shows the official catalog in superhq-ai/recipes and
+`shuru recipe show REF` prints a recipe before it is built. Checkpoints built
+this way record their source and revision, visible in `shuru checkpoint
+list`, and a changed recipe rebuilds on the next run. Third-party recipes
+ask for confirmation or `--yes`. See docs/rfcs/0005-recipes.md.
+
 ### Docker Engine runs inside the VM
 
-`scripts/prepare-docker-checkpoint.sh` builds a checkpoint with pinned
-docker-ce 29.9.2 and containerd 2.4.2 and one pre-pulled image, with dockerd
-declared as a guest service so `shuru run --from docker -- docker run ...`
-just works. Containers get the same boundary as any guest process: no egress
-without `--allow-net`, the host allowlist applied by the proxy, host ports
-only through `-p`.
+The `docker` recipe installs pinned docker-ce 29.9.2 and containerd 2.4.2,
+declares dockerd as a guest service, and pre-pulls one image, so
+`shuru checkpoint create docker --recipe docker` followed by
+`shuru run --from docker -- docker run ...` just works, as does
+`shuru run --recipe docker` on its own. Containers get the same boundary as
+any guest process: no egress without `--allow-net`, the host allowlist
+applied by the proxy, host ports only through `-p`.
 
 To support it, the guest kernel gains cgroup v2 controllers, cgroup BPF,
 seccomp filters, veth, and the netfilter targets dockerd installs, and moves

@@ -207,20 +207,46 @@ uv run --with browser-use --with openai examples/browser-use.py
 The example keeps Chromium inside the microVM and exposes only its CDP port to
 the host.
 
-## Docker
+## Recipes
 
-Docker Engine runs inside the VM. Install it into a checkpoint once, then run
-containers from that checkpoint with networking disabled:
+A recipe is a versioned description of a checkpoint: a `recipe.json` with
+metadata and services, plus shell steps that run in fresh boots. The official
+catalog lives in [superhq-ai/recipes](https://github.com/superhq-ai/recipes).
 
 ```sh
-# One-time: pinned docker-ce + containerd, with one image pre-pulled
-./scripts/prepare-docker-checkpoint.sh
+shuru recipe list                                  # the official catalog
+shuru recipe show docker                           # metadata, services and every step
+shuru checkpoint create docker --recipe docker     # build the checkpoint under that name
+shuru run --from docker -- docker ps               # and start from it like any other
+shuru run --recipe docker -- docker ps             # or both at once: builds on first use, reuses after
+shuru checkpoint create mydocker --recipe docker   # the same recipe under a name of your own
+shuru run --recipe owner/repo/path@v1 --yes -- ... # third-party, pinned to a tag
+shuru run --recipe ./my-recipe -- ...              # local directory while developing
+```
+
+References resolve to an exact commit, which is printed and recorded next to
+the checkpoint. `shuru checkpoint list` shows where each one came from, and a
+changed recipe rebuilds on the next `shuru run --recipe`. Builds use the
+network allowlist the recipe declares, never the project `shuru.json`. See
+docs/rfcs/0005-recipes.md.
+
+## Docker
+
+Docker Engine runs inside the VM through the `docker` recipe. Build the
+checkpoint once, then start from it; after that containers run with
+networking disabled:
+
+```sh
+shuru checkpoint create docker --recipe docker
 
 # Serve the pre-pulled nginx-unprivileged image on host port 8080
 shuru run --from docker -p 8080:8080 -- \
   docker run --rm -p 8080:8080 nginxinc/nginx-unprivileged:1.31.7-alpine-slim
 curl http://127.0.0.1:8080/
 ```
+
+`shuru run --recipe docker -- ...` does both: it builds the checkpoint on
+first use and reuses it afterwards.
 
 dockerd is a guest service: it starts when the VM boots, the command waits
 until `docker info` answers, and the daemon is stopped and the disk synced

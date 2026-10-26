@@ -132,12 +132,11 @@ share one path, and the SDK gets the same shutdown through its existing
 
 ### Docker checkpoint
 
-`scripts/prepare-docker-checkpoint.sh` installs Docker, writes
-`/etc/shuru/services/docker.json`, and saves that as an intermediate
-checkpoint. It then boots from it, where the service model has already
-started dockerd, runs `docker pull` for the pinned image, and saves the
-final checkpoint. The intermediate one is deleted. The build itself is the
-first consumer of the feature.
+The Docker recipe in `superhq-ai/recipes` (RFC 0005) installs Docker and
+declares `/etc/shuru/services/docker.json` in its first step. Its second
+step boots from that result, where the service model has already started
+dockerd, and runs `docker pull` for the pinned image. The build itself is
+the first consumer of the feature.
 
 The `daemon.json` from RFC 0003 is unchanged. The `with-dockerd` helper is
 no longer installed.
@@ -232,23 +231,25 @@ got-term
 shuru: services ignored SIGTERM and were killed: stubborn
 ```
 
-Docker checkpoint build with the two step script, with dockerd started by
-the service model in step two:
+Docker checkpoint build from the docker recipe (RFC 0005). The service
+file is written in step one, so dockerd is already up when step two pulls:
 
 ```
-==> Step 2/2: pulling the image into 'docker' with dockerd running as a service
-shuru-guest: service docker ready
+shuru: building recipe docker from <recipes-checkout>/docker@dcbbf2c (2 steps)
+shuru: step 1/2: install.sh
+shuru: checkpoint 'docker-step1' saved
+shuru: step 2/2: pull.sh
 Digest: sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7
-shuru: stopped services: docker
-==> Checkpoint 'docker' ready
-real    2m6.213s
+shuru: checkpoint 'docker' saved
+shuru: checkpoint 'docker-step1' deleted
+real    2m3.869s
 ```
 
 RFC 0003 Docker suite, nine tests, against that checkpoint with no
 `with-dockerd` anywhere:
 
 ```
-test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 78.78s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 78.79s
 ```
 
 The same nine tests took 125.51s with the wrapper, because every script

@@ -1,6 +1,7 @@
 //! Docker Engine inside a Shuru VM (RFC 0003). Boots real VMs from the
-//! checkpoint built by scripts/prepare-docker-checkpoint.sh, so every test
-//! is #[ignore]d. Run with:
+//! checkpoint built by the docker recipe (`shuru checkpoint create docker
+//! --recipe docker`, or `--recipe <checkout>/docker` from a local clone of
+//! superhq-ai/recipes), so every test is #[ignore]d. Run with:
 //!
 //!   SHURU_BIN=target/debug/shuru cargo test -p shuru-cli --test docker -- --ignored
 //!

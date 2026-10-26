@@ -85,8 +85,9 @@ checkpoints.
 
 ### Docker checkpoint
 
-`scripts/prepare-docker-checkpoint.sh` creates a checkpoint (default name
-`docker`) by running, inside a VM with a strict host allowlist:
+The `docker` recipe in `superhq-ai/recipes` (RFC 0005; originally a script
+in this repository) creates the checkpoint by running, inside a VM with a
+strict host allowlist:
 
 1. Enable the trixie-security and trixie-updates archives (debootstrap only
    lists main) and `apt-get upgrade`.
@@ -210,7 +211,7 @@ SELinux, AppArmor, btrfs, macvlan, ipvlan, ftp conntrack helpers.
 
 ### Checkpoint
 
-`scripts/prepare-docker-checkpoint.sh` ran inside a VM allowed to reach only
+The Docker checkpoint build ran inside a VM allowed to reach only
 deb.debian.org, security.debian.org, download.docker.com, `*.docker.io`,
 `*.docker.com`, `*.cloudflarestorage.com`:
 
@@ -233,7 +234,7 @@ the rebuilt checkpoint:
 
 Rerun after RFC 0004 moved dockerd to a guest service, same nine tests:
 
-    test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 78.78s
+    test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 78.79s
 
 Raw output of the rerun is in `docs/rfcs/0003-docker-on-shuru-evidence.log`.
 Excerpts, identical between the two runs:
@@ -296,8 +297,8 @@ Image, Trivy 0.76 with the 2026-10-25 database, `linux/arm64`:
 
 Both fixes landed in Alpine after the 2026-10-19 image build. There is no
 newer `nginx-unprivileged` build yet. Residual: a medium zlib issue in a
-process that runs as uid 101 under seccomp inside a VM. Re-run
-`prepare-docker-checkpoint.sh` with a newer digest when the image rebuilds.
+process that runs as uid 101 under seccomp inside a VM. Update the digest in
+the recipe when the image rebuilds.
 
 Guest Debian layer, `debsecan --suite trixie --only-fixed` inside the VM:
 36 fixable package entries (openssl, curl, expat, pcre2, brotli, xz) before
@@ -333,6 +334,6 @@ the kernel against per-CVE data (LTS point release is the mitigation).
 
     export SHURU_KERNEL=$SHURU_DATA_DIR/Image SHURU_INITRD=$SHURU_DATA_DIR/initramfs.cpio.gz
     export SHURU_ROOTFS=~/.local/share/shuru/rootfs.ext4
-    SHURU_BIN=/tmp/shuru-signed ./scripts/prepare-docker-checkpoint.sh
+    /tmp/shuru-signed checkpoint create docker --recipe docker
     SHURU_BIN=/tmp/shuru-signed SHURU_TEST_NET=1 \
       cargo test -p shuru-cli --test docker -- --ignored --test-threads=1

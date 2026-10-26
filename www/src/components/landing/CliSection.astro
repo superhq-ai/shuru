@@ -35,8 +35,8 @@ const tabs = [
   },
   {
     id: "docker",
-    title: "Docker inside",
-    description: "Run containers in the sandbox. dockerd starts as a guest service and follows the same network rules.",
+    title: "Recipes & Docker",
+    description: "Build checkpoints from versioned recipes. The docker recipe runs containers in the sandbox under the same network rules.",
   },
 ];
 ---
@@ -116,9 +116,13 @@ const tabs = [
         </div>
 
         <div class="tabbed-panel p-5 font-mono text-xs leading-[1.8] md:p-6 md:text-sm" data-panel="docker">
-          <p class="text-muted"># One-time: scripts/prepare-docker-checkpoint.sh builds a 'docker' checkpoint</p>
+          <p><span class="text-dim">$</span> <span class="text-text">shuru checkpoint create docker --recipe docker</span></p>
+          <p class="text-amber">shuru: building recipe docker from superhq-ai/recipes/docker@2a5c726 (2 steps)</p>
+          <p class="text-amber">shuru: checkpoint 'docker' saved</p>
+          <br />
           <p><span class="text-dim">$</span> <span class="text-text">shuru run --from docker -p 8080:8080 -- docker run --rm -p 8080:8080 nginxinc/nginx-unprivileged:1.31.7-alpine-slim</span></p>
           <p class="text-amber">shuru: forwarding 127.0.0.1:8080 -&gt; guest:8080</p>
+          <p class="text-muted"># Or skip the create: shuru run --recipe docker builds it on first use.</p>
           <br />
           <p><span class="text-dim">$</span> <span class="text-text">curl -sI http://127.0.0.1:8080/ | head -1</span></p>
           <p class="text-amber">HTTP/1.1 200 OK</p>
