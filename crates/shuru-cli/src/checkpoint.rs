@@ -31,8 +31,7 @@ pub(crate) fn create(
         bail!("checkpoint '{}' already exists, delete it first", name);
     }
 
-    let mut prepared = vm::prepare_vm(vm_args, &cfg, from)?;
-    prepared.sync_before_stop = true;
+    let prepared = vm::prepare_vm(vm_args, &cfg, from)?;
     let result = vm::run_command(&prepared, &command)?;
 
     std::fs::create_dir_all(&checkpoints_dir)?;

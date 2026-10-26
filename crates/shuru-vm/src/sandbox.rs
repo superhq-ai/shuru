@@ -26,7 +26,8 @@ use shuru_linux::*;
 use shuru_proto::{
     frame, ChmodRequest, CopyRequest, DiscardRequest, ExecRequest, ForwardRequest, ForwardResponse,
     FsOkResponse, MkdirRequest, MountRequest, MountResponse, PortMapping, ReadDirRequest,
-    ReadDirResponse, ReadFileRequest, RemoveRequest, RenameRequest, StatRequest, StatResponse,
+    ReadDirResponse, ReadFileRequest, RemoveRequest, RenameRequest, ShutdownResponse, StatRequest,
+    StatResponse,
     WatchRequest, WriteFileRequest, WriteFileResponse, VSOCK_PORT, VSOCK_PORT_FORWARD,
 };
 
@@ -245,7 +246,37 @@ impl Sandbox {
             .map_err(|e| anyhow::anyhow!("Failed to start VM: {}", e))
     }
 
+    /// Ask the guest to stop its services and sync the disk (RFC 0004).
+    /// Returns what the guest stopped, or an error if it did not answer
+    /// within the shutdown timeout.
+    pub fn shutdown(&self) -> Result<ShutdownResponse> {
+        let stream = self.connect_vsock()?;
+        let _ = stream.set_read_timeout(Some(SHUTDOWN_TIMEOUT));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(shutdown_handshake(stream));
+        });
+        match rx.recv_timeout(SHUTDOWN_TIMEOUT + Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(_) => bail!(
+                "guest did not answer the shutdown request within {}s",
+                SHUTDOWN_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
+    /// Graceful stop: shutdown handshake, then power off. Falls back to a
+    /// plain power off when the guest does not answer.
     pub fn stop(&self) -> Result<()> {
+        if let Err(e) = self.shutdown() {
+            tracing::warn!("guest shutdown failed, powering off: {}", e);
+        }
+        self.kill()
+    }
+
+    /// Power off without asking the guest. Services get no SIGTERM and the
+    /// disk is not synced.
+    pub fn kill(&self) -> Result<()> {
         self.vm
             .stop()
             .map_err(|e| anyhow::anyhow!("Failed to stop VM: {}", e))
@@ -921,6 +952,28 @@ impl Sandbox {
             }
         }
         unreachable!()
+    }
+}
+
+/// Upper bound on a graceful shutdown. Covers the slowest service stop
+/// timeout an image can reasonably declare, plus the sync.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn shutdown_handshake(stream: TcpStream) -> Result<ShutdownResponse> {
+    let mut writer = stream.try_clone()?;
+    let mut reader = stream;
+    frame::write_frame(&mut writer, frame::SHUTDOWN_REQ, &[])?;
+    loop {
+        match frame::read_frame(&mut reader).context("waiting for guest shutdown")? {
+            Some((frame::SHUTDOWN_RESP, payload)) => {
+                return serde_json::from_slice(&payload).context("parsing shutdown response");
+            }
+            Some((frame::ERROR, payload)) => {
+                bail!("guest refused shutdown: {}", String::from_utf8_lossy(&payload))
+            }
+            Some(_) => {}
+            None => bail!("guest closed the connection before answering shutdown"),
+        }
     }
 }
 

@@ -1,0 +1,265 @@
+
+running 4 tests
+test service_ignoring_sigterm_is_killed_after_its_stop_timeout ... $ shuru checkpoint create shuru-test-svc-kill-87504 --verbose
+--- stdout ---
+
+--- stderr ---
+shuru: creating working copy...
+shuru: kernel=<data-dir>/Image
+shuru: rootfs=<data-dir>/instances/87505/rootfs.ext4 (work copy)
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+shuru: VM created and validated successfully
+shuru: VM started, waiting for guest...
+random: crng init done
+virtio_blk virtio1: 1/0/0 default/read/poll queues
+virtio_blk virtio1: [vda] 8388608 512-byte logical blocks (4.29 GB/4.00 GiB)
+rtc-pl031 20050000.pl031: registered as rtc0
+rtc-pl031 20050000.pl031: setting system clock to 2026-10-26T00:57:55 UTC (1792976275)
+NET: Registered PF_INET6 protocol family
+Segment Routing with IPv6
+In-situ OAM (IOAM) with IPv6
+sit: IPv6, IPv4 and MPLS over IPv4 tunneling driver
+NET: Registered PF_PACKET protocol family
+Bridge firewalling registered
+NET: Registered PF_VSOCK protocol family
+clk: Disabling unused clocks
+Freeing unused kernel memory: 896K
+Run /init as init process
+EXT4-fs (vda): mounted filesystem 728de991-e6e3-4e1a-873d-bc29aeff5c07 r/w with ordered data mode. Quota mode: disabled.
+shuru-guest[  147.2ms]: starting as PID 1
+shuru-guest[  147.5ms]: filesystems mounted
+shuru-guest: no network device (sandbox mode)
+shuru-guest[  147.7ms]: networking ready
+shuru-guest[  147.8ms]: vsock listening on port 1024
+shuru-guest[  147.8ms]: port forward listener on port 1025
+shuru-guest: accepted vsock connection
+shuru-guest: accepted vsock connection
+shuru: saving checkpoint 'shuru-test-svc-kill-87504'...
+shuru: checkpoint 'shuru-test-svc-kill-87504' saved
+
+$ shuru run --from shuru-test-svc-kill-87504
+--- stdout ---
+RAN
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+shuru: services ignored SIGTERM and were killed: stubborn
+
+ok
+test service_that_fails_blocks_the_command_with_its_log ... $ shuru checkpoint create shuru-test-svc-fail-87504 --verbose
+--- stdout ---
+
+--- stderr ---
+shuru: creating working copy...
+shuru: kernel=<data-dir>/Image
+shuru: rootfs=<data-dir>/instances/87512/rootfs.ext4 (work copy)
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+shuru: VM created and validated successfully
+shuru: VM started, waiting for guest...
+random: crng init done
+virtio_blk virtio1: 1/0/0 default/read/poll queues
+virtio_blk virtio1: [vda] 8388608 512-byte logical blocks (4.29 GB/4.00 GiB)
+rtc-pl031 20050000.pl031: registered as rtc0
+rtc-pl031 20050000.pl031: setting system clock to 2026-10-26T00:57:58 UTC (1792976278)
+NET: Registered PF_INET6 protocol family
+Segment Routing with IPv6
+In-situ OAM (IOAM) with IPv6
+sit: IPv6, IPv4 and MPLS over IPv4 tunneling driver
+NET: Registered PF_PACKET protocol family
+Bridge firewalling registered
+NET: Registered PF_VSOCK protocol family
+clk: Disabling unused clocks
+Freeing unused kernel memory: 896K
+Run /init as init process
+EXT4-fs (vda): mounted filesystem 728de991-e6e3-4e1a-873d-bc29aeff5c07 r/w with ordered data mode. Quota mode: disabled.
+shuru-guest[  134.2ms]: starting as PID 1
+shuru-guest[  134.6ms]: filesystems mounted
+shuru-guest: no network device (sandbox mode)
+shuru-guest[  134.7ms]: networking ready
+shuru-guest[  134.8ms]: vsock listening on port 1024
+shuru-guest[  134.8ms]: port forward listener on port 1025
+shuru-guest: accepted vsock connection
+shuru-guest: accepted vsock connection
+shuru: saving checkpoint 'shuru-test-svc-fail-87504'...
+shuru: checkpoint 'shuru-test-svc-fail-87504' saved
+
+$ shuru run --from shuru-test-svc-fail-87504
+--- stdout ---
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+guest error: service bad exited with status 3
+--- /run/shuru/log/bad.log ---
+booting bad service
+giving up
+
+ok
+test service_with_delayed_ready_check_gates_the_command ... $ shuru checkpoint create shuru-test-svc-gate-87504 --verbose
+--- stdout ---
+
+--- stderr ---
+shuru: creating working copy...
+shuru: kernel=<data-dir>/Image
+shuru: rootfs=<data-dir>/instances/87519/rootfs.ext4 (work copy)
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+shuru: VM created and validated successfully
+shuru: VM started, waiting for guest...
+random: crng init done
+virtio_blk virtio1: 1/0/0 default/read/poll queues
+virtio_blk virtio1: [vda] 8388608 512-byte logical blocks (4.29 GB/4.00 GiB)
+rtc-pl031 20050000.pl031: registered as rtc0
+rtc-pl031 20050000.pl031: setting system clock to 2026-10-26T00:57:59 UTC (1792976279)
+NET: Registered PF_INET6 protocol family
+Segment Routing with IPv6
+In-situ OAM (IOAM) with IPv6
+sit: IPv6, IPv4 and MPLS over IPv4 tunneling driver
+NET: Registered PF_PACKET protocol family
+Bridge firewalling registered
+NET: Registered PF_VSOCK protocol family
+clk: Disabling unused clocks
+Freeing unused kernel memory: 896K
+Run /init as init process
+EXT4-fs (vda): mounted filesystem 728de991-e6e3-4e1a-873d-bc29aeff5c07 r/w with ordered data mode. Quota mode: disabled.
+shuru-guest[  134.4ms]: starting as PID 1
+shuru-guest[  134.8ms]: filesystems mounted
+shuru-guest: no network device (sandbox mode)
+shuru-guest[  134.9ms]: networking ready
+shuru-guest[  135.0ms]: vsock listening on port 1024
+shuru-guest[  135.0ms]: port forward listener on port 1025
+shuru-guest: accepted vsock connection
+shuru-guest: accepted vsock connection
+shuru: saving checkpoint 'shuru-test-svc-gate-87504'...
+shuru: checkpoint 'shuru-test-svc-gate-87504' saved
+
+$ shuru run --from shuru-test-svc-gate-87504 --verbose
+--- stdout ---
+GATED_OK
+fast-log=fast-started
+slow-alive=2
+
+--- stderr ---
+shuru: creating working copy...
+shuru: kernel=<data-dir>/Image
+shuru: rootfs=<data-dir>/instances/87521/rootfs.ext4 (work copy)
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+shuru: VM created and validated successfully
+shuru: VM started, waiting for guest...
+random: crng init done
+virtio_blk virtio1: 1/0/0 default/read/poll queues
+virtio_blk virtio1: [vda] 8388608 512-byte logical blocks (4.29 GB/4.00 GiB)
+rtc-pl031 20050000.pl031: registered as rtc0
+rtc-pl031 20050000.pl031: setting system clock to 2026-10-26T00:58:00 UTC (1792976280)
+NET: Registered PF_INET6 protocol family
+Segment Routing with IPv6
+In-situ OAM (IOAM) with IPv6
+sit: IPv6, IPv4 and MPLS over IPv4 tunneling driver
+NET: Registered PF_PACKET protocol family
+Bridge firewalling registered
+NET: Registered PF_VSOCK protocol family
+clk: Disabling unused clocks
+Freeing unused kernel memory: 896K
+Run /init as init process
+EXT4-fs (vda): mounted filesystem 728de991-e6e3-4e1a-873d-bc29aeff5c07 r/w with ordered data mode. Quota mode: disabled.
+shuru-guest[  130.3ms]: starting as PID 1
+shuru-guest[  130.7ms]: filesystems mounted
+shuru-guest: no network device (sandbox mode)
+shuru-guest[  130.8ms]: networking ready
+shuru-guest[  133.4ms]: 2 service(s) starting
+shuru-guest[  133.4ms]: vsock listening on port 1024
+shuru-guest[  133.4ms]: port forward listener on port 1025
+shuru-guest: accepted vsock connection
+shuru-guest: service slow ready
+shuru-guest: accepted vsock connection
+shuru-guest: services stopped in 0.1s (stopped: ["fast", "slow"], killed: [])
+shuru: stopped services: fast, slow
+
+ok
+test shutdown_delivers_sigterm_and_syncs_before_the_checkpoint_is_cloned ... $ shuru checkpoint create shuru-test-svc-term-87504 --verbose
+--- stdout ---
+
+--- stderr ---
+shuru: creating working copy...
+shuru: kernel=<data-dir>/Image
+shuru: rootfs=<data-dir>/instances/87526/rootfs.ext4 (work copy)
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+shuru: VM created and validated successfully
+shuru: VM started, waiting for guest...
+random: crng init done
+virtio_blk virtio1: 1/0/0 default/read/poll queues
+virtio_blk virtio1: [vda] 8388608 512-byte logical blocks (4.29 GB/4.00 GiB)
+rtc-pl031 20050000.pl031: registered as rtc0
+rtc-pl031 20050000.pl031: setting system clock to 2026-10-26T00:58:02 UTC (1792976282)
+NET: Registered PF_INET6 protocol family
+Segment Routing with IPv6
+In-situ OAM (IOAM) with IPv6
+sit: IPv6, IPv4 and MPLS over IPv4 tunneling driver
+NET: Registered PF_PACKET protocol family
+Bridge firewalling registered
+NET: Registered PF_VSOCK protocol family
+clk: Disabling unused clocks
+Freeing unused kernel memory: 896K
+Run /init as init process
+EXT4-fs (vda): mounted filesystem 728de991-e6e3-4e1a-873d-bc29aeff5c07 r/w with ordered data mode. Quota mode: disabled.
+shuru-guest[  136.4ms]: starting as PID 1
+shuru-guest[  136.8ms]: filesystems mounted
+shuru-guest: no network device (sandbox mode)
+shuru-guest[  136.8ms]: networking ready
+shuru-guest[  136.9ms]: vsock listening on port 1024
+shuru-guest[  137.0ms]: port forward listener on port 1025
+shuru-guest: accepted vsock connection
+shuru-guest: accepted vsock connection
+shuru: saving checkpoint 'shuru-test-svc-term-87504'...
+shuru: checkpoint 'shuru-test-svc-term-87504' saved
+
+$ shuru checkpoint create shuru-test-svc-term-derived-87504 --verbose --from shuru-test-svc-term-87504
+--- stdout ---
+RAN_IN_BASE
+
+--- stderr ---
+shuru: creating working copy...
+shuru: kernel=<data-dir>/Image
+shuru: rootfs=<data-dir>/instances/87528/rootfs.ext4 (work copy)
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+shuru: VM created and validated successfully
+shuru: VM started, waiting for guest...
+random: crng init done
+virtio_blk virtio1: 1/0/0 default/read/poll queues
+virtio_blk virtio1: [vda] 8388608 512-byte logical blocks (4.29 GB/4.00 GiB)
+rtc-pl031 20050000.pl031: registered as rtc0
+rtc-pl031 20050000.pl031: setting system clock to 2026-10-26T00:58:02 UTC (1792976282)
+NET: Registered PF_INET6 protocol family
+Segment Routing with IPv6
+In-situ OAM (IOAM) with IPv6
+sit: IPv6, IPv4 and MPLS over IPv4 tunneling driver
+NET: Registered PF_PACKET protocol family
+Bridge firewalling registered
+NET: Registered PF_VSOCK protocol family
+clk: Disabling unused clocks
+Freeing unused kernel memory: 896K
+Run /init as init process
+EXT4-fs (vda): mounted filesystem 728de991-e6e3-4e1a-873d-bc29aeff5c07 r/w with ordered data mode. Quota mode: disabled.
+shuru-guest[  130.2ms]: starting as PID 1
+shuru-guest[  130.5ms]: filesystems mounted
+shuru-guest: no network device (sandbox mode)
+shuru-guest[  130.6ms]: networking ready
+shuru-guest[  133.3ms]: 1 service(s) starting
+shuru-guest[  133.4ms]: vsock listening on port 1024
+shuru-guest[  133.4ms]: port forward listener on port 1025
+shuru-guest: accepted vsock connection
+shuru-guest: accepted vsock connection
+shuru-guest: services stopped in 1.0s (stopped: ["trap"], killed: [])
+shuru: stopped services: trap
+shuru: saving checkpoint 'shuru-test-svc-term-derived-87504'...
+shuru: checkpoint 'shuru-test-svc-term-derived-87504' saved
+
+$ shuru run --from shuru-test-svc-term-derived-87504
+--- stdout ---
+got-term
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.49s
+

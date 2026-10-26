@@ -53,6 +53,10 @@ pub const DISCARD_RESP: u8 = 0x4F;
 pub const DOWNLOAD_REQ: u8 = 0x50;
 pub const DOWNLOAD_PROGRESS: u8 = 0x51;
 
+// Shutdown: host asks the guest to stop its services and sync the disk
+pub const SHUTDOWN_REQ: u8 = 0x60;
+pub const SHUTDOWN_RESP: u8 = 0x61;
+
 const MAX_FRAME: u32 = 1 << 20; // 1 MB
 
 /// Write a binary frame: `[u32 BE length][u8 type][payload]`.

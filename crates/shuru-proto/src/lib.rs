@@ -25,6 +25,19 @@ pub struct ExecRequest {
     pub cwd: Option<String>,
 }
 
+// --- Shutdown protocol ---
+
+/// Reply to SHUTDOWN_REQ, sent once every guest service has exited and the
+/// disk is synced. `killed` lists services that ignored SIGTERM and were
+/// killed after their stop timeout.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ShutdownResponse {
+    #[serde(default)]
+    pub stopped: Vec<String>,
+    #[serde(default)]
+    pub killed: Vec<String>,
+}
+
 // --- Port forwarding protocol ---
 
 /// A host:guest port mapping for port forwarding over vsock.

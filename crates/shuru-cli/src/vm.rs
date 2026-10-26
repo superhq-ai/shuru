@@ -64,10 +64,6 @@ pub(crate) struct PreparedVm {
     pub memory: u64,
     pub disk_size: u64,
     pub proxy_config: Option<shuru_proxy::config::ProxyConfig>,
-    /// Flush guest page cache to disk before stopping. Set for checkpoint
-    /// creation, where the disk is cloned after the hard stop and unsynced
-    /// writes would silently vanish from the saved image.
-    pub sync_before_stop: bool,
     pub verbose: bool,
     pub forwards: Vec<PortMapping>,
     pub mounts: Vec<MountConfig>,
@@ -275,7 +271,6 @@ pub(crate) fn prepare_vm(
         memory,
         disk_size,
         proxy_config,
-        sync_before_stop: false,
         verbose,
         forwards,
         mounts,
@@ -428,12 +423,26 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<R
     };
     trace_boot("command done");
 
-    if prepared.sync_before_stop {
-        let _ = sandbox.exec(&["sync"], &mut std::io::sink(), &mut std::io::sink());
+    // Graceful shutdown: guest services get SIGTERM and the disk is synced
+    // before power off, so a checkpoint clone sees a consistent image.
+    match sandbox.shutdown() {
+        Ok(report) => {
+            if prepared.verbose && !report.stopped.is_empty() {
+                eprintln!("shuru: stopped services: {}", report.stopped.join(", "));
+            }
+            if !report.killed.is_empty() {
+                eprintln!(
+                    "shuru: services ignored SIGTERM and were killed: {}",
+                    report.killed.join(", ")
+                );
+            }
+        }
+        Err(e) => eprintln!("shuru: guest shutdown failed, powering off: {}", e),
     }
+    trace_boot("guest shut down");
 
     drop(proxy_handle);
-    let _ = sandbox.stop();
+    let _ = sandbox.kill();
     Ok(RunResult { exit_code, nbd_handle })
 }
 

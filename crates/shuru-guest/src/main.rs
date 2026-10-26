@@ -1,4 +1,7 @@
 #[cfg(target_os = "linux")]
+mod services;
+
+#[cfg(target_os = "linux")]
 mod guest {
     use std::io::{Read, Write};
     use std::os::unix::io::FromRawFd;
@@ -294,10 +297,12 @@ mod guest {
 
     fn reap_zombies() {
         loop {
-            let ret = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            let mut status: libc::c_int = 0;
+            let ret = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
             if ret <= 0 {
                 break;
             }
+            crate::services::reaped(ret, status);
         }
     }
 
@@ -418,6 +423,13 @@ mod guest {
 
                     if req.argv.is_empty() {
                         let _ = frame::write_frame(&mut writer, frame::ERROR, b"empty argv");
+                        continue;
+                    }
+
+                    // Services declared by the image must be ready before a
+                    // command runs against them (RFC 0004).
+                    if let Err(msg) = crate::services::wait_ready() {
+                        let _ = frame::write_frame(&mut writer, frame::ERROR, msg.as_bytes());
                         continue;
                     }
 
@@ -567,6 +579,10 @@ mod guest {
                         }
                     };
                     handle_download(&req, &mut writer);
+                }
+                frame::SHUTDOWN_REQ => {
+                    let resp = crate::services::shutdown();
+                    let _ = frame::send_json(&mut writer, frame::SHUTDOWN_RESP, &resp);
                 }
                 _ => {} // unknown type, skip
             }
@@ -1674,6 +1690,11 @@ mod guest {
 
         setup_networking();
         stage("networking ready");
+
+        let started = crate::services::start_all();
+        if started > 0 {
+            stage(&format!("{} service(s) starting", started));
+        }
 
         // Register signal handlers (PID 1 has no default signal dispositions)
         unsafe {
