@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DEBIAN_RELEASE="trixie"
-DATA_DIR="${HOME}/.local/share/shuru"
+DATA_DIR="${SHURU_DATA_DIR:-${HOME}/.local/share/shuru}"
 ROOTFS_IMG="${DATA_DIR}/rootfs.ext4"
 KERNEL_PATH="${DATA_DIR}/Image"
 INITRAMFS_PATH="${DATA_DIR}/initramfs.cpio.gz"
