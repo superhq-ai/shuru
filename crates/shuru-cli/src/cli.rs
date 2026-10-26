@@ -87,6 +87,15 @@ pub(crate) enum Commands {
         #[arg(long)]
         from: Option<String>,
 
+        /// Build a checkpoint from a recipe on first use and start from it
+        /// (NAME, OWNER/REPO[/PATH][@REF], or a local directory)
+        #[arg(long, conflicts_with = "from", value_name = "REF")]
+        recipe: Option<String>,
+
+        /// Build a third-party recipe without the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+
         /// Attach to raw serial console instead of running a command
         #[arg(long)]
         console: bool,
@@ -118,8 +127,32 @@ pub(crate) enum Commands {
 
     /// Remove leftover instance data from crashed VMs
     Prune,
+
+    /// Browse and inspect recipes (RFC 0005)
+    Recipe {
+        #[command(subcommand)]
+        action: RecipeCommands,
+    },
 }
 
+#[derive(clap::Subcommand)]
+pub(crate) enum RecipeCommands {
+    /// List the official recipes from github.com/superhq-ai/recipes
+    List {
+        /// Ignore the cached index
+        #[arg(long)]
+        refresh: bool,
+    },
+
+    /// Print a recipe, its services and every build step
+    Show {
+        /// NAME, OWNER/REPO[/PATH][@REF], or a local directory
+        recipe: String,
+    },
+}
+
+// Parsed once; the flattened VmArgs in Create dwarfs the other variants.
+#[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand)]
 pub(crate) enum CheckpointCommands {
     /// Run a command and save the resulting disk state as a checkpoint
@@ -133,6 +166,15 @@ pub(crate) enum CheckpointCommands {
         /// Start from an existing checkpoint instead of the base image
         #[arg(long)]
         from: Option<String>,
+
+        /// Build from a recipe instead of running a command
+        /// (NAME, OWNER/REPO[/PATH][@REF], or a local directory)
+        #[arg(long, conflicts_with = "from", value_name = "REF")]
+        recipe: Option<String>,
+
+        /// Build a third-party recipe without the confirmation prompt
+        #[arg(long)]
+        yes: bool,
 
         /// Command and arguments to run inside the VM
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

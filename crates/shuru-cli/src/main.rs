@@ -2,6 +2,7 @@ mod assets;
 mod checkpoint;
 mod cli;
 mod config;
+mod recipe;
 mod stdio;
 mod vm;
 
@@ -12,7 +13,7 @@ use clap::Parser;
 
 use shuru_vm::{default_data_dir, VmState};
 
-use cli::{CheckpointCommands, Cli, Commands};
+use cli::{CheckpointCommands, Cli, Commands, RecipeCommands};
 use config::load_config;
 
 fn main() -> Result<()> {
@@ -29,11 +30,19 @@ fn main() -> Result<()> {
         Commands::Run {
             vm,
             from,
+            recipe,
+            yes,
             console,
             stdio,
             command,
         } => {
             let cfg = load_config(vm.config.as_deref())?;
+
+            // A recipe is built (once) before the run, with its own policy.
+            let from = match recipe {
+                Some(ref reference) => Some(recipe::ensure_checkpoint(reference, &vm, yes)?),
+                None => from,
+            };
 
             // Command resolution: CLI args > config > default /bin/sh
             let command = if !command.is_empty() {
@@ -113,8 +122,17 @@ fn main() -> Result<()> {
                 name,
                 vm,
                 from,
+                recipe,
+                yes,
                 command,
             } => {
+                if let Some(ref reference) = recipe {
+                    if !command.is_empty() {
+                        anyhow::bail!("--recipe builds from the recipe steps; drop the command");
+                    }
+                    recipe::create_checkpoint(&name, reference, &vm, yes)?;
+                    return Ok(());
+                }
                 let exit_code = checkpoint::create(name, &vm, from.as_deref(), command)?;
                 process::exit(exit_code);
             }
@@ -126,6 +144,10 @@ fn main() -> Result<()> {
             CheckpointCommands::Pull { name: _ } => {
                 anyhow::bail!("checkpoint pull is not yet implemented")
             }
+        },
+        Commands::Recipe { action } => match action {
+            RecipeCommands::List { refresh } => recipe::list(refresh)?,
+            RecipeCommands::Show { recipe: reference } => recipe::show(&reference)?,
         },
     }
 

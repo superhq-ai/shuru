@@ -5,7 +5,8 @@ use anyhow::{bail, Result};
 use shuru_vm::default_data_dir;
 
 use crate::cli::VmArgs;
-use crate::config::load_config;
+use crate::config::{load_config, ShuruConfig};
+use crate::recipe;
 use crate::vm;
 
 pub(crate) fn create(
@@ -15,7 +16,18 @@ pub(crate) fn create(
     command: Vec<String>,
 ) -> Result<i32> {
     let cfg = load_config(vm_args.config.as_deref())?;
+    create_with_config(name, vm_args, &cfg, from, command)
+}
 
+/// Create a checkpoint with an explicit config. Recipe builds pass an empty
+/// one so the project shuru.json never reaches a build.
+pub(crate) fn create_with_config(
+    name: String,
+    vm_args: &VmArgs,
+    cfg: &ShuruConfig,
+    from: Option<&str>,
+    command: Vec<String>,
+) -> Result<i32> {
     let command = if !command.is_empty() {
         command
     } else {
@@ -31,7 +43,7 @@ pub(crate) fn create(
         bail!("checkpoint '{}' already exists, delete it first", name);
     }
 
-    let prepared = vm::prepare_vm(vm_args, &cfg, from)?;
+    let prepared = vm::prepare_vm(vm_args, cfg, from)?;
     let result = vm::run_command(&prepared, &command)?;
 
     std::fs::create_dir_all(&checkpoints_dir)?;
@@ -100,8 +112,17 @@ pub(crate) fn list() -> Result<()> {
 
     checkpoints.sort_by_key(|(_, _, t, _)| *t);
 
-    println!("NAME                       SIZE CREATED");
+    println!("NAME                       SIZE CREATED      RECIPE");
     for (name, size, mtime, is_cas) in &checkpoints {
+        let origin = recipe::read_meta(name)
+            .map(|m| {
+                format!(
+                    "{}@{}",
+                    m.recipe.source,
+                    &m.recipe.revision[..m.recipe.revision.len().min(7)]
+                )
+            })
+            .unwrap_or_default();
         let size_str = if *is_cas {
             if *size >= 1024 * 1024 {
                 format!("{} MB (cas)", size / (1024 * 1024))
@@ -126,10 +147,16 @@ pub(crate) fn list() -> Result<()> {
         } else {
             format!("{}d ago", elapsed / 86400)
         };
-        println!("{:<20} {:>10} {}", name, size_str, age);
+        println!("{:<20} {:>10} {:<12} {}", name, size_str, age, origin);
     }
 
     Ok(())
+}
+
+/// Whether a checkpoint exists in either format.
+pub(crate) fn exists(name: &str) -> bool {
+    let checkpoints_dir = format!("{}/checkpoints", default_data_dir());
+    checkpoint_exists(&checkpoints_dir, name)
 }
 
 pub(crate) fn delete(name: &str) -> Result<()> {
@@ -149,6 +176,7 @@ pub(crate) fn delete(name: &str) -> Result<()> {
     } else {
         bail!("Checkpoint '{}' not found", name);
     }
+    recipe::remove_meta(name);
 
     eprintln!("shuru: checkpoint '{}' deleted", name);
     Ok(())

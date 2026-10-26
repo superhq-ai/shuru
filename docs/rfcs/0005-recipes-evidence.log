@@ -1,0 +1,799 @@
+=== recipes suite (local recipes and the gated docker recipe)
+
+running 6 tests
+test create_builds_under_a_chosen_name_and_refuses_a_command ... $ shuru checkpoint create shuru-test-recipe-named-4199 --recipe <tmp>/.tmpjsyqiE -- echo no
+--- stdout ---
+
+--- stderr ---
+Error: --recipe builds from the recipe steps; drop the command
+
+$ shuru checkpoint create shuru-test-recipe-named-4199 --recipe <tmp>/.tmpjsyqiE
+--- stdout ---
+
+--- stderr ---
+shuru: building recipe irrelevant from <tmp>/.tmpjsyqiE@5cf1c28 (1 step)
+shuru: step 1/1: build.sh
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+shuru: saving checkpoint 'shuru-test-recipe-named-4199'...
+shuru: checkpoint 'shuru-test-recipe-named-4199' saved
+
+$ shuru run --from shuru-test-recipe-named-4199 -- cat /opt/marker
+--- stdout ---
+built-by-recipe
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+
+$ shuru checkpoint create shuru-test-recipe-named-4199 --recipe <tmp>/.tmpjsyqiE
+--- stdout ---
+
+--- stderr ---
+Error: checkpoint shuru-test-recipe-named-4199 already exists, delete it first
+
+ok
+test docker_recipe_builds_and_runs_a_container ... $ shuru checkpoint create shuru-test-recipe-docker-4199 --recipe <recipes-checkout>/docker
+--- stdout ---
+==> Upgrading Debian base (main, security and updates archives)
+Preconfiguring packages ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9863 files and directories currently installed.)
+Preparing to unpack .../libc6_2.41-12+deb13u4_arm64.deb ...
+Unpacking libc6:arm64 (2.41-12+deb13u4) over (2.41-12+deb13u3) ...
+Setting up libc6:arm64 (2.41-12+deb13u4) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9863 files and directories currently installed.)
+Preparing to unpack .../base-files_13.8+deb13u7_arm64.deb ...
+Unpacking base-files (13.8+deb13u7) over (13.8+deb13u6) ...
+Setting up base-files (13.8+deb13u7) ...
+Installing new version of config file /etc/debian_version ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../bash_5.2.37-2+b10_arm64.deb ...
+update-alternatives: warning: alternative /usr/share/man/man7/bash-builtins.7.gz (part of link group builtins.7.gz) doesn't exist; removing from list of alternatives
+update-alternatives: warning: /etc/alternatives/builtins.7.gz is dangling; it will be updated with best choice
+Unpacking bash (5.2.37-2+b10) over (5.2.37-2+b9) ...
+Setting up bash (5.2.37-2+b10) ...
+update-alternatives: error: alternative path /usr/share/man/man7/bash-builtins.7.gz doesn't exist
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../bsdutils_1%3a2.41.5-0+deb13u1_arm64.deb ...
+Unpacking bsdutils (1:2.41.5-0+deb13u1) over (1:2.41-5) ...
+Setting up bsdutils (1:2.41.5-0+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../gzip_1.13-1+deb13u1_arm64.deb ...
+Unpacking gzip (1.13-1+deb13u1) over (1.13-1) ...
+Setting up gzip (1.13-1+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../libperl5.40_5.40.1-6+deb13u1_arm64.deb ...
+Unpacking libperl5.40:arm64 (5.40.1-6+deb13u1) over (5.40.1-6) ...
+Preparing to unpack .../perl_5.40.1-6+deb13u1_arm64.deb ...
+Unpacking perl (5.40.1-6+deb13u1) over (5.40.1-6) ...
+Preparing to unpack .../perl-base_5.40.1-6+deb13u1_arm64.deb ...
+Unpacking perl-base (5.40.1-6+deb13u1) over (5.40.1-6) ...
+Setting up perl-base (5.40.1-6+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../perl-modules-5.40_5.40.1-6+deb13u1_all.deb ...
+Unpacking perl-modules-5.40 (5.40.1-6+deb13u1) over (5.40.1-6) ...
+Preparing to unpack .../liblastlog2-2_2.41.5-0+deb13u1_arm64.deb ...
+Unpacking liblastlog2-2:arm64 (2.41.5-0+deb13u1) over (2.41-5) ...
+Setting up liblastlog2-2:arm64 (2.41.5-0+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../libuuid1_2.41.5-0+deb13u1_arm64.deb ...
+Unpacking libuuid1:arm64 (2.41.5-0+deb13u1) over (2.41-5) ...
+Setting up libuuid1:arm64 (2.41.5-0+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../libblkid1_2.41.5-0+deb13u1_arm64.deb ...
+Unpacking libblkid1:arm64 (2.41.5-0+deb13u1) over (2.41-5) ...
+Setting up libblkid1:arm64 (2.41.5-0+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../libmount1_2.41.5-0+deb13u1_arm64.deb ...
+Unpacking libmount1:arm64 (2.41.5-0+deb13u1) over (2.41-5) ...
+Setting up libmount1:arm64 (2.41.5-0+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../libsmartcols1_2.41.5-0+deb13u1_arm64.deb ...
+Unpacking libsmartcols1:arm64 (2.41.5-0+deb13u1) over (2.41-5) ...
+Setting up libsmartcols1:arm64 (2.41.5-0+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../util-linux_2.41.5-0+deb13u1_arm64.deb ...
+Unpacking util-linux (2.41.5-0+deb13u1) over (2.41-5) ...
+Setting up util-linux (2.41.5-0+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9877 files and directories currently installed.)
+Preparing to unpack .../mount_2.41.5-0+deb13u1_arm64.deb ...
+Unpacking mount (2.41.5-0+deb13u1) over (2.41-5) ...
+Preparing to unpack .../libsqlite3-0_3.46.1-7+deb13u2_arm64.deb ...
+Unpacking libsqlite3-0:arm64 (3.46.1-7+deb13u2) over (3.46.1-7+deb13u1) ...
+Setting up libsqlite3-0:arm64 (3.46.1-7+deb13u2) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9877 files and directories currently installed.)
+Preparing to unpack .../libc-bin_2.41-12+deb13u4_arm64.deb ...
+Unpacking libc-bin (2.41-12+deb13u4) over (2.41-12+deb13u3) ...
+Setting up libc-bin (2.41-12+deb13u4) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9877 files and directories currently installed.)
+Preparing to unpack .../libaudit-common_1%3a4.0.2-2+deb13u1_all.deb ...
+Unpacking libaudit-common (1:4.0.2-2+deb13u1) over (1:4.0.2-2) ...
+Setting up libaudit-common (1:4.0.2-2+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9877 files and directories currently installed.)
+Preparing to unpack .../libaudit1_1%3a4.0.2-2+deb13u1_arm64.deb ...
+Unpacking libaudit1:arm64 (1:4.0.2-2+deb13u1) over (1:4.0.2-2+b2) ...
+Setting up libaudit1:arm64 (1:4.0.2-2+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9876 files and directories currently installed.)
+Preparing to unpack .../login_1%3a4.16.0-2+really2.41.5-0+deb13u1_arm64.deb ...
+Unpacking login (1:4.16.0-2+really2.41.5-0+deb13u1) over (1:4.16.0-2+really2.41-5) ...
+Preparing to unpack .../libexpat1_2.9.0-1~deb13u1_arm64.deb ...
+Unpacking libexpat1:arm64 (2.9.0-1~deb13u1) over (2.7.1-2) ...
+Preparing to unpack .../libcap2_1%3a2.75-10+deb13u1+b3_arm64.deb ...
+Unpacking libcap2:arm64 (1:2.75-10+deb13u1+b3) over (1:2.75-10+deb13u1+b1) ...
+Setting up libcap2:arm64 (1:2.75-10+deb13u1+b3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9878 files and directories currently installed.)
+Preparing to unpack .../liblzma5_5.8.1-1+deb13u2_arm64.deb ...
+Unpacking liblzma5:arm64 (5.8.1-1+deb13u2) over (5.8.1-1+deb13u1) ...
+Setting up liblzma5:arm64 (5.8.1-1+deb13u2) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9878 files and directories currently installed.)
+Preparing to unpack .../libpcre2-8-0_10.46-1~deb13u3_arm64.deb ...
+Unpacking libpcre2-8-0:arm64 (10.46-1~deb13u3) over (10.46-1~deb13u1) ...
+Setting up libpcre2-8-0:arm64 (10.46-1~deb13u3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9878 files and directories currently installed.)
+Preparing to unpack .../openssl-provider-legacy_3.5.7-1~deb13u3_arm64.deb ...
+Unpacking openssl-provider-legacy (3.5.7-1~deb13u3) over (3.5.6-1~deb13u2) ...
+Setting up openssl-provider-legacy (3.5.7-1~deb13u3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9878 files and directories currently installed.)
+Preparing to unpack .../libssl3t64_3.5.7-1~deb13u3_arm64.deb ...
+Unpacking libssl3t64:arm64 (3.5.7-1~deb13u3) over (3.5.6-1~deb13u2) ...
+Setting up libssl3t64:arm64 (3.5.7-1~deb13u3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9878 files and directories currently installed.)
+Preparing to unpack .../00-tzdata_2026e-0+deb13u1_all.deb ...
+Unpacking tzdata (2026e-0+deb13u1) over (2026b-0+deb13u1) ...
+Preparing to unpack .../01-openssl_3.5.7-1~deb13u3_arm64.deb ...
+Unpacking openssl (3.5.7-1~deb13u3) over (3.5.6-1~deb13u2) ...
+Preparing to unpack .../02-ca-certificates_20250419+deb13u1_all.deb ...
+Unpacking ca-certificates (20250419+deb13u1) over (20250419) ...
+Preparing to unpack .../03-xz-utils_5.8.1-1+deb13u2_arm64.deb ...
+Unpacking xz-utils (5.8.1-1+deb13u2) over (5.8.1-1+deb13u1) ...
+Preparing to unpack .../04-libbrotli1_1.1.0-2+deb13u1_arm64.deb ...
+Unpacking libbrotli1:arm64 (1.1.0-2+deb13u1) over (1.1.0-2+b7) ...
+Preparing to unpack .../05-libssh2-1t64_1.11.1-1+deb13u2_arm64.deb ...
+Unpacking libssh2-1t64:arm64 (1.11.1-1+deb13u2) over (1.11.1-1+deb13u1) ...
+Preparing to unpack .../06-curl_8.14.1-2+deb13u7_arm64.deb ...
+Unpacking curl (8.14.1-2+deb13u7) over (8.14.1-2+deb13u4) ...
+Preparing to unpack .../07-libcurl4t64_8.14.1-2+deb13u7_arm64.deb ...
+Unpacking libcurl4t64:arm64 (8.14.1-2+deb13u7) over (8.14.1-2+deb13u4) ...
+Preparing to unpack .../08-jq_1.7.1-6+deb13u4_arm64.deb ...
+Unpacking jq (1.7.1-6+deb13u4) over (1.7.1-6+deb13u2) ...
+Preparing to unpack .../09-libjq1_1.7.1-6+deb13u4_arm64.deb ...
+Unpacking libjq1:arm64 (1.7.1-6+deb13u4) over (1.7.1-6+deb13u2) ...
+Preparing to unpack .../10-libcap2-bin_1%3a2.75-10+deb13u1+b3_arm64.deb ...
+Unpacking libcap2-bin (1:2.75-10+deb13u1+b3) over (1:2.75-10+deb13u1+b1) ...
+Preparing to unpack .../11-libcom-err2_1.47.2-3+b12_arm64.deb ...
+Unpacking libcom-err2:arm64 (1.47.2-3+b12) over (1.47.2-3+b11) ...
+Preparing to unpack .../12-libcurl3t64-gnutls_8.14.1-2+deb13u7_arm64.deb ...
+Unpacking libcurl3t64-gnutls:arm64 (8.14.1-2+deb13u7) over (8.14.1-2+deb13u4) ...
+Setting up libexpat1:arm64 (2.9.0-1~deb13u1) ...
+Setting up libjq1:arm64 (1.7.1-6+deb13u4) ...
+Setting up libbrotli1:arm64 (1.1.0-2+deb13u1) ...
+Setting up libcom-err2:arm64 (1.47.2-3+b12) ...
+Setting up tzdata (2026e-0+deb13u1) ...
+
+Current default time zone: 'Etc/UTC'
+Local time is now:      Mon Oct 26 01:54:54 UTC 2026.
+Universal Time is now:  Mon Oct 26 01:54:54 UTC 2026.
+Run 'dpkg-reconfigure tzdata' if you wish to change it.
+
+Setting up libcap2-bin (1:2.75-10+deb13u1+b3) ...
+Setting up xz-utils (5.8.1-1+deb13u2) ...
+Setting up mount (2.41.5-0+deb13u1) ...
+Setting up perl-modules-5.40 (5.40.1-6+deb13u1) ...
+Setting up jq (1.7.1-6+deb13u4) ...
+Setting up libssh2-1t64:arm64 (1.11.1-1+deb13u2) ...
+Setting up openssl (3.5.7-1~deb13u3) ...
+Setting up login (1:4.16.0-2+really2.41.5-0+deb13u1) ...
+Setting up libcurl4t64:arm64 (8.14.1-2+deb13u7) ...
+Setting up libcurl3t64-gnutls:arm64 (8.14.1-2+deb13u7) ...
+Setting up libperl5.40:arm64 (5.40.1-6+deb13u1) ...
+Setting up ca-certificates (20250419+deb13u1) ...
+Updating certificates in /etc/ssl/certs...
+rehash: warning: skipping ca-certificates.crt, it does not contain exactly one certificate or CRL
+0 added, 2 removed; done.
+Setting up perl (5.40.1-6+deb13u1) ...
+Setting up curl (8.14.1-2+deb13u7) ...
+Processing triggers for debianutils (5.23.2) ...
+Processing triggers for libc-bin (2.41-12+deb13u4) ...
+Processing triggers for ca-certificates (20250419+deb13u1) ...
+Updating certificates in /etc/ssl/certs...
+0 added, 0 removed; done.
+Running hooks in /etc/ca-certificates/update.d...
+done.
+==> Adding Docker apt repository (key pinned by SHA-256)
+/etc/apt/keyrings/docker.asc: OK
+==> Installing docker-ce 5:29.9.2-1~debian.13~trixie, containerd.io 2.4.2-3~debian.13~trixie
+Selecting previously unselected package containerd.io.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9875 files and directories currently installed.)
+Preparing to unpack .../00-containerd.io_2.4.2-3~debian.13~trixie_arm64.deb ...
+Unpacking containerd.io (2.4.2-3~debian.13~trixie) ...
+Selecting previously unselected package docker-ce-cli.
+Preparing to unpack .../01-docker-ce-cli_5%3a29.9.2-1~debian.13~trixie_arm64.deb ...
+Unpacking docker-ce-cli (5:29.9.2-1~debian.13~trixie) ...
+Selecting previously unselected package libip4tc2:arm64.
+Preparing to unpack .../02-libip4tc2_1.8.11-2_arm64.deb ...
+Unpacking libip4tc2:arm64 (1.8.11-2) ...
+Selecting previously unselected package libip6tc2:arm64.
+Preparing to unpack .../03-libip6tc2_1.8.11-2_arm64.deb ...
+Unpacking libip6tc2:arm64 (1.8.11-2) ...
+Selecting previously unselected package netbase.
+Preparing to unpack .../04-netbase_6.5_all.deb ...
+Unpacking netbase (6.5) ...
+Selecting previously unselected package libnfnetlink0:arm64.
+Preparing to unpack .../05-libnfnetlink0_1.0.2-3_arm64.deb ...
+Unpacking libnfnetlink0:arm64 (1.0.2-3) ...
+Selecting previously unselected package libnetfilter-conntrack3:arm64.
+Preparing to unpack .../06-libnetfilter-conntrack3_1.1.0-1_arm64.deb ...
+Unpacking libnetfilter-conntrack3:arm64 (1.1.0-1) ...
+Selecting previously unselected package libnftnl11:arm64.
+Preparing to unpack .../07-libnftnl11_1.2.9-1_arm64.deb ...
+Unpacking libnftnl11:arm64 (1.2.9-1) ...
+Selecting previously unselected package iptables.
+Preparing to unpack .../08-iptables_1.8.11-2_arm64.deb ...
+Unpacking iptables (1.8.11-2) ...
+Selecting previously unselected package libjansson4:arm64.
+Preparing to unpack .../09-libjansson4_2.14-2+b3_arm64.deb ...
+Unpacking libjansson4:arm64 (2.14-2+b3) ...
+Selecting previously unselected package libnftables1:arm64.
+Preparing to unpack .../10-libnftables1_1.1.3-1_arm64.deb ...
+Unpacking libnftables1:arm64 (1.1.3-1) ...
+Selecting previously unselected package nftables.
+Preparing to unpack .../11-nftables_1.1.3-1_arm64.deb ...
+Unpacking nftables (1.1.3-1) ...
+Selecting previously unselected package docker-ce.
+Preparing to unpack .../12-docker-ce_5%3a29.9.2-1~debian.13~trixie_arm64.deb ...
+Unpacking docker-ce (5:29.9.2-1~debian.13~trixie) ...
+Setting up libip4tc2:arm64 (1.8.11-2) ...
+Setting up libip6tc2:arm64 (1.8.11-2) ...
+Setting up libnftnl11:arm64 (1.2.9-1) ...
+Setting up libjansson4:arm64 (2.14-2+b3) ...
+Setting up containerd.io (2.4.2-3~debian.13~trixie) ...
+Setting up docker-ce-cli (5:29.9.2-1~debian.13~trixie) ...
+Setting up libnfnetlink0:arm64 (1.0.2-3) ...
+Setting up netbase (6.5) ...
+Setting up libnftables1:arm64 (1.1.3-1) ...
+Setting up nftables (1.1.3-1) ...
+Setting up libnetfilter-conntrack3:arm64 (1.1.0-1) ...
+Setting up iptables (1.8.11-2) ...
+update-alternatives: using /usr/sbin/iptables-legacy to provide /usr/sbin/iptables (iptables) in auto mode
+update-alternatives: using /usr/sbin/ip6tables-legacy to provide /usr/sbin/ip6tables (ip6tables) in auto mode
+update-alternatives: using /usr/sbin/iptables-nft to provide /usr/sbin/iptables (iptables) in auto mode
+update-alternatives: using /usr/sbin/ip6tables-nft to provide /usr/sbin/ip6tables (ip6tables) in auto mode
+update-alternatives: using /usr/sbin/arptables-nft to provide /usr/sbin/arptables (arptables) in auto mode
+update-alternatives: using /usr/sbin/ebtables-nft to provide /usr/sbin/ebtables (ebtables) in auto mode
+Setting up docker-ce (5:29.9.2-1~debian.13~trixie) ...
+invoke-rc.d: could not determine current runlevel
+invoke-rc.d: WARNING: No init system and policy-rc.d missing! Defaulting to block.
+Processing triggers for libc-bin (2.41-12+deb13u4) ...
+==> Installed versions
+Docker version 29.9.2, build a82e528
+containerd containerd v2.4.2 b7a25261e029d68978bbf290df0a62fc819b3c51
+runc version 1.5.2
+==> Pulling nginxinc/nginx-unprivileged:1.31.7-alpine-slim@sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7
+docker.io/nginxinc/nginx-unprivileged@sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7: Pulling from nginxinc/nginx-unprivileged
+4b40f23576bc: Pulling fs layer
+a9986cd6f37d: Pulling fs layer
+d74d0cecaf1a: Pulling fs layer
+115972ae778a: Pulling fs layer
+98f56d1336e8: Pulling fs layer
+581a829fa84a: Pulling fs layer
+4bc482c4f270: Pulling fs layer
+2fe8f2a34241: Pulling fs layer
+44136fa355b3: Download complete
+115972ae778a: Download complete
+2fe8f2a34241: Download complete
+98f56d1336e8: Download complete
+4b40f23576bc: Download complete
+581a829fa84a: Download complete
+4bc482c4f270: Download complete
+e437ba1f09a3: Download complete
+d74d0cecaf1a: Download complete
+a9986cd6f37d: Download complete
+a9986cd6f37d: Pull complete
+115972ae778a: Pull complete
+2fe8f2a34241: Pull complete
+98f56d1336e8: Pull complete
+4b40f23576bc: Pull complete
+581a829fa84a: Pull complete
+4bc482c4f270: Pull complete
+d74d0cecaf1a: Pull complete
+Digest: sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7
+Status: Downloaded newer image for nginxinc/nginx-unprivileged@sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7
+docker.io/nginxinc/nginx-unprivileged:1.31.7-alpine-slim@sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7
+REPOSITORY                    TAG                  DIGEST                                                                    IMAGE ID       CREATED      SIZE
+nginxinc/nginx-unprivileged   1.31.7-alpine-slim   sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7   a8cb0f33d51f   7 days ago   30.3MB
+
+--- stderr ---
+shuru: building recipe docker from <recipes-checkout>/docker@1b30f3d (2 steps)
+shuru: step 1/2: install.sh
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+shuru: saving checkpoint 'shuru-test-recipe-docker-4199-step1'...
+shuru: checkpoint 'shuru-test-recipe-docker-4199-step1' saved
+shuru: step 2/2: pull.sh
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+shuru: saving checkpoint 'shuru-test-recipe-docker-4199'...
+shuru: checkpoint 'shuru-test-recipe-docker-4199' saved
+shuru: checkpoint 'shuru-test-recipe-docker-4199-step1' deleted
+
+$ shuru run --from shuru-test-recipe-docker-4199 -- sh -c docker info --format '{{.ServerVersion}}' && docker run --rm nginxinc/nginx-unprivileged:1.31.7-alpine-slim id -u
+--- stdout ---
+29.9.2
+101
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+
+ok
+test failing_step_keeps_no_final_checkpoint ... $ shuru run --recipe <tmp>/.tmpOh1uVw -- true
+--- stdout ---
+fine
+
+--- stderr ---
+shuru: building recipe shuru-test-recipe-fail-4199 from <tmp>/.tmpOh1uVw@6590f2b (2 steps)
+shuru: step 1/2: ok.sh
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+shuru: saving checkpoint 'shuru-test-recipe-fail-4199-step1'...
+shuru: checkpoint 'shuru-test-recipe-fail-4199-step1' saved
+shuru: step 2/2: bad.sh
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+boom
+shuru: saving checkpoint 'shuru-test-recipe-fail-4199'...
+shuru: checkpoint 'shuru-test-recipe-fail-4199' saved
+shuru: checkpoint 'shuru-test-recipe-fail-4199' deleted
+shuru: intermediate checkpoint shuru-test-recipe-fail-4199-step1 kept for debugging; delete it with `shuru checkpoint delete shuru-test-recipe-fail-4199-step1`
+Error: recipe step bad.sh exited with status 7
+
+$ shuru checkpoint list
+--- stdout ---
+NAME                       SIZE CREATED      RECIPE
+docker                   1.3 GB 4m ago       <recipes-checkout>/docker@dcbbf2c
+shuru-test-recipe-fail-4199-step1    1008 MB just now     
+
+--- stderr ---
+
+ok
+test run_builds_once_reuses_and_rebuilds_when_the_recipe_changes ... $ shuru run --recipe <tmp>/.tmpEZbp9s -- sh -c cat /opt/recipe/log; test -f /run/hello-ran && echo RUN_SAW_SERVICE
+--- stdout ---
+step1
+service-file-present
+step2
+step2-saw-service
+RUN_SAW_SERVICE
+
+--- stderr ---
+shuru: building recipe shuru-test-recipe-4199 from <tmp>/.tmpEZbp9s@48ff0ed (2 steps)
+shuru: step 1/2: first.sh
+shuru: booting VM (2cpus, 2048MB RAM, 2048MB disk)...
+shuru: saving checkpoint 'shuru-test-recipe-4199-step1'...
+shuru: checkpoint 'shuru-test-recipe-4199-step1' saved
+shuru: step 2/2: second.sh
+shuru: booting VM (2cpus, 2048MB RAM, 2048MB disk)...
+shuru: saving checkpoint 'shuru-test-recipe-4199'...
+shuru: checkpoint 'shuru-test-recipe-4199' saved
+shuru: checkpoint 'shuru-test-recipe-4199-step1' deleted
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+
+$ shuru run --recipe <tmp>/.tmpEZbp9s -- sh -c cat /opt/recipe/log; test -f /run/hello-ran && echo RUN_SAW_SERVICE
+--- stdout ---
+step1
+service-file-present
+step2
+step2-saw-service
+RUN_SAW_SERVICE
+
+--- stderr ---
+shuru: using checkpoint shuru-test-recipe-4199 (<tmp>/.tmpEZbp9s@48ff0ed)
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+
+$ shuru checkpoint list
+--- stdout ---
+NAME                       SIZE CREATED      RECIPE
+docker                   1.3 GB 4m ago       <recipes-checkout>/docker@dcbbf2c
+shuru-test-recipe-4199    1008 MB just now     <tmp>/.tmpEZbp9s@48ff0ed
+
+--- stderr ---
+
+$ shuru run --recipe <tmp>/.tmpEZbp9s -- sh -c cat /opt/recipe/log; test -f /run/hello-ran && echo RUN_SAW_SERVICE
+--- stdout ---
+step1
+service-file-present
+step2
+step2-saw-service
+step2-v2
+RUN_SAW_SERVICE
+
+--- stderr ---
+shuru: recipe changed (<tmp>/.tmpEZbp9s@48ff0ed -> <tmp>/.tmpEZbp9s@ae89e3d), rebuilding checkpoint shuru-test-recipe-4199
+shuru: checkpoint 'shuru-test-recipe-4199' deleted
+shuru: building recipe shuru-test-recipe-4199 from <tmp>/.tmpEZbp9s@ae89e3d (2 steps)
+shuru: step 1/2: first.sh
+shuru: booting VM (2cpus, 2048MB RAM, 2048MB disk)...
+shuru: saving checkpoint 'shuru-test-recipe-4199-step1'...
+shuru: checkpoint 'shuru-test-recipe-4199-step1' saved
+shuru: step 2/2: second.sh
+shuru: booting VM (2cpus, 2048MB RAM, 2048MB disk)...
+shuru: saving checkpoint 'shuru-test-recipe-4199'...
+shuru: checkpoint 'shuru-test-recipe-4199' saved
+shuru: checkpoint 'shuru-test-recipe-4199-step1' deleted
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+
+$ shuru checkpoint list
+--- stdout ---
+NAME                       SIZE CREATED      RECIPE
+docker                   1.3 GB 4m ago       <recipes-checkout>/docker@dcbbf2c
+shuru-test-recipe-4199    1008 MB just now     <tmp>/.tmpEZbp9s@ae89e3d
+
+--- stderr ---
+
+ok
+test show_prints_metadata_and_steps_without_booting ... $ shuru recipe show <tmp>/.tmp0W2qfk
+--- stdout ---
+name:        show-test
+description: two steps and a service
+source:      <tmp>/.tmp0W2qfk@d559800
+network:     offline during build
+services:    hello
+steps:       first.sh (138 bytes), second.sh (98 bytes)
+
+--- /etc/shuru/services/hello.json ---
+{
+  "exec": [
+    "sh",
+    "-c",
+    "touch /run/hello-ran; exec sleep infinity"
+  ],
+  "ready": [
+    "test",
+    "-f",
+    "/run/hello-ran"
+  ]
+}
+
+--- first.sh ---
+mkdir -p /opt/recipe
+echo step1 >> /opt/recipe/log
+test -f /etc/shuru/services/hello.json && echo service-file-present >> /opt/recipe/log
+
+--- second.sh ---
+echo step2 >> /opt/recipe/log
+test -f /run/hello-ran && echo step2-saw-service >> /opt/recipe/log
+
+--- stderr ---
+
+ok
+test show_rejects_bad_recipes ... $ shuru recipe show <tmp>/.tmpkH5s9O
+--- stdout ---
+
+--- stderr ---
+Error: <tmp>/.tmpkH5s9O: recipe name "Bad Name" must match [a-z0-9][a-z0-9._-]*
+
+$ shuru recipe show <tmp>/.tmpqu4jAZ
+--- stdout ---
+
+--- stderr ---
+Error: reading step second.sh in <tmp>/.tmpqu4jAZ
+
+Caused by:
+    No such file or directory (os error 2)
+
+$ shuru recipe show <tmp>/.tmpk4H0o8
+--- stdout ---
+
+--- stderr ---
+Error: <tmp>/.tmpk4H0o8: recipe needs shuru 99.0.0 or newer, this is 0.8.0. Run `shuru upgrade`.
+
+ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 130.08s
+
+recipes-exit=0
+=== shuru recipe list (github.com/superhq-ai/recipes)
+NAME    DESCRIPTION
+docker  Docker Engine 29.9 with dockerd as a guest service and nginx-unprivileged pre-pulled
+
+Source: github.com/superhq-ai/recipes. Build one with `shuru run --recipe NAME` or `shuru checkpoint create NAME --recipe NAME`.
+list-exit=0
+=== shuru run --recipe docker (first use rebuilds: existing checkpoint came from a local path)
+shuru: recipe changed (<recipes-checkout>/docker@dcbbf2c -> superhq-ai/recipes/docker@2a5c726), rebuilding checkpoint docker
+shuru: checkpoint 'docker' deleted
+shuru: building recipe docker from superhq-ai/recipes/docker@2a5c726 (2 steps)
+shuru: step 1/2: install.sh
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+==> Upgrading Debian base (main, security and updates archives)
+Preconfiguring packages ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9863 files and directories currently installed.)
+Preparing to unpack .../libc6_2.41-12+deb13u4_arm64.deb ...
+Unpacking libc6:arm64 (2.41-12+deb13u4) over (2.41-12+deb13u3) ...
+Setting up libc6:arm64 (2.41-12+deb13u4) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9863 files and directories currently installed.)
+Preparing to unpack .../base-files_13.8+deb13u7_arm64.deb ...
+Unpacking base-files (13.8+deb13u7) over (13.8+deb13u6) ...
+Setting up base-files (13.8+deb13u7) ...
+Installing new version of config file /etc/debian_version ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../bash_5.2.37-2+b10_arm64.deb ...
+update-alternatives: warning: alternative /usr/share/man/man7/bash-builtins.7.gz (part of link group builtins.7.gz) doesn't exist; removing from list of alternatives
+update-alternatives: warning: /etc/alternatives/builtins.7.gz is dangling; it will be updated with best choice
+Unpacking bash (5.2.37-2+b10) over (5.2.37-2+b9) ...
+Setting up bash (5.2.37-2+b10) ...
+update-alternatives: error: alternative path /usr/share/man/man7/bash-builtins.7.gz doesn't exist
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../bsdutils_1%3a2.41.5-0+deb13u1_arm64.deb ...
+Unpacking bsdutils (1:2.41.5-0+deb13u1) over (1:2.41-5) ...
+Setting up bsdutils (1:2.41.5-0+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../gzip_1.13-1+deb13u1_arm64.deb ...
+Unpacking gzip (1.13-1+deb13u1) over (1.13-1) ...
+Setting up gzip (1.13-1+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../libperl5.40_5.40.1-6+deb13u1_arm64.deb ...
+Unpacking libperl5.40:arm64 (5.40.1-6+deb13u1) over (5.40.1-6) ...
+Preparing to unpack .../perl_5.40.1-6+deb13u1_arm64.deb ...
+Unpacking perl (5.40.1-6+deb13u1) over (5.40.1-6) ...
+Preparing to unpack .../perl-base_5.40.1-6+deb13u1_arm64.deb ...
+Unpacking perl-base (5.40.1-6+deb13u1) over (5.40.1-6) ...
+Setting up perl-base (5.40.1-6+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../perl-modules-5.40_5.40.1-6+deb13u1_all.deb ...
+Unpacking perl-modules-5.40 (5.40.1-6+deb13u1) over (5.40.1-6) ...
+Preparing to unpack .../liblastlog2-2_2.41.5-0+deb13u1_arm64.deb ...
+Unpacking liblastlog2-2:arm64 (2.41.5-0+deb13u1) over (2.41-5) ...
+Setting up liblastlog2-2:arm64 (2.41.5-0+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../libuuid1_2.41.5-0+deb13u1_arm64.deb ...
+Unpacking libuuid1:arm64 (2.41.5-0+deb13u1) over (2.41-5) ...
+Setting up libuuid1:arm64 (2.41.5-0+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../libblkid1_2.41.5-0+deb13u1_arm64.deb ...
+Unpacking libblkid1:arm64 (2.41.5-0+deb13u1) over (2.41-5) ...
+Setting up libblkid1:arm64 (2.41.5-0+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../libmount1_2.41.5-0+deb13u1_arm64.deb ...
+Unpacking libmount1:arm64 (2.41.5-0+deb13u1) over (2.41-5) ...
+Setting up libmount1:arm64 (2.41.5-0+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../libsmartcols1_2.41.5-0+deb13u1_arm64.deb ...
+Unpacking libsmartcols1:arm64 (2.41.5-0+deb13u1) over (2.41-5) ...
+Setting up libsmartcols1:arm64 (2.41.5-0+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9872 files and directories currently installed.)
+Preparing to unpack .../util-linux_2.41.5-0+deb13u1_arm64.deb ...
+Unpacking util-linux (2.41.5-0+deb13u1) over (2.41-5) ...
+Setting up util-linux (2.41.5-0+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9877 files and directories currently installed.)
+Preparing to unpack .../mount_2.41.5-0+deb13u1_arm64.deb ...
+Unpacking mount (2.41.5-0+deb13u1) over (2.41-5) ...
+Preparing to unpack .../libsqlite3-0_3.46.1-7+deb13u2_arm64.deb ...
+Unpacking libsqlite3-0:arm64 (3.46.1-7+deb13u2) over (3.46.1-7+deb13u1) ...
+Setting up libsqlite3-0:arm64 (3.46.1-7+deb13u2) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9877 files and directories currently installed.)
+Preparing to unpack .../libc-bin_2.41-12+deb13u4_arm64.deb ...
+Unpacking libc-bin (2.41-12+deb13u4) over (2.41-12+deb13u3) ...
+Setting up libc-bin (2.41-12+deb13u4) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9877 files and directories currently installed.)
+Preparing to unpack .../libaudit-common_1%3a4.0.2-2+deb13u1_all.deb ...
+Unpacking libaudit-common (1:4.0.2-2+deb13u1) over (1:4.0.2-2) ...
+Setting up libaudit-common (1:4.0.2-2+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9877 files and directories currently installed.)
+Preparing to unpack .../libaudit1_1%3a4.0.2-2+deb13u1_arm64.deb ...
+Unpacking libaudit1:arm64 (1:4.0.2-2+deb13u1) over (1:4.0.2-2+b2) ...
+Setting up libaudit1:arm64 (1:4.0.2-2+deb13u1) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9876 files and directories currently installed.)
+Preparing to unpack .../login_1%3a4.16.0-2+really2.41.5-0+deb13u1_arm64.deb ...
+Unpacking login (1:4.16.0-2+really2.41.5-0+deb13u1) over (1:4.16.0-2+really2.41-5) ...
+Preparing to unpack .../libexpat1_2.9.0-1~deb13u1_arm64.deb ...
+Unpacking libexpat1:arm64 (2.9.0-1~deb13u1) over (2.7.1-2) ...
+Preparing to unpack .../libcap2_1%3a2.75-10+deb13u1+b3_arm64.deb ...
+Unpacking libcap2:arm64 (1:2.75-10+deb13u1+b3) over (1:2.75-10+deb13u1+b1) ...
+Setting up libcap2:arm64 (1:2.75-10+deb13u1+b3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9878 files and directories currently installed.)
+Preparing to unpack .../liblzma5_5.8.1-1+deb13u2_arm64.deb ...
+Unpacking liblzma5:arm64 (5.8.1-1+deb13u2) over (5.8.1-1+deb13u1) ...
+Setting up liblzma5:arm64 (5.8.1-1+deb13u2) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9878 files and directories currently installed.)
+Preparing to unpack .../libpcre2-8-0_10.46-1~deb13u3_arm64.deb ...
+Unpacking libpcre2-8-0:arm64 (10.46-1~deb13u3) over (10.46-1~deb13u1) ...
+Setting up libpcre2-8-0:arm64 (10.46-1~deb13u3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9878 files and directories currently installed.)
+Preparing to unpack .../openssl-provider-legacy_3.5.7-1~deb13u3_arm64.deb ...
+Unpacking openssl-provider-legacy (3.5.7-1~deb13u3) over (3.5.6-1~deb13u2) ...
+Setting up openssl-provider-legacy (3.5.7-1~deb13u3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9878 files and directories currently installed.)
+Preparing to unpack .../libssl3t64_3.5.7-1~deb13u3_arm64.deb ...
+Unpacking libssl3t64:arm64 (3.5.7-1~deb13u3) over (3.5.6-1~deb13u2) ...
+Setting up libssl3t64:arm64 (3.5.7-1~deb13u3) ...
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9878 files and directories currently installed.)
+Preparing to unpack .../00-tzdata_2026e-0+deb13u1_all.deb ...
+Unpacking tzdata (2026e-0+deb13u1) over (2026b-0+deb13u1) ...
+Preparing to unpack .../01-openssl_3.5.7-1~deb13u3_arm64.deb ...
+Unpacking openssl (3.5.7-1~deb13u3) over (3.5.6-1~deb13u2) ...
+Preparing to unpack .../02-ca-certificates_20250419+deb13u1_all.deb ...
+Unpacking ca-certificates (20250419+deb13u1) over (20250419) ...
+Preparing to unpack .../03-xz-utils_5.8.1-1+deb13u2_arm64.deb ...
+Unpacking xz-utils (5.8.1-1+deb13u2) over (5.8.1-1+deb13u1) ...
+Preparing to unpack .../04-libbrotli1_1.1.0-2+deb13u1_arm64.deb ...
+Unpacking libbrotli1:arm64 (1.1.0-2+deb13u1) over (1.1.0-2+b7) ...
+Preparing to unpack .../05-libssh2-1t64_1.11.1-1+deb13u2_arm64.deb ...
+Unpacking libssh2-1t64:arm64 (1.11.1-1+deb13u2) over (1.11.1-1+deb13u1) ...
+Preparing to unpack .../06-curl_8.14.1-2+deb13u7_arm64.deb ...
+Unpacking curl (8.14.1-2+deb13u7) over (8.14.1-2+deb13u4) ...
+Preparing to unpack .../07-libcurl4t64_8.14.1-2+deb13u7_arm64.deb ...
+Unpacking libcurl4t64:arm64 (8.14.1-2+deb13u7) over (8.14.1-2+deb13u4) ...
+Preparing to unpack .../08-jq_1.7.1-6+deb13u4_arm64.deb ...
+Unpacking jq (1.7.1-6+deb13u4) over (1.7.1-6+deb13u2) ...
+Preparing to unpack .../09-libjq1_1.7.1-6+deb13u4_arm64.deb ...
+Unpacking libjq1:arm64 (1.7.1-6+deb13u4) over (1.7.1-6+deb13u2) ...
+Preparing to unpack .../10-libcap2-bin_1%3a2.75-10+deb13u1+b3_arm64.deb ...
+Unpacking libcap2-bin (1:2.75-10+deb13u1+b3) over (1:2.75-10+deb13u1+b1) ...
+Preparing to unpack .../11-libcom-err2_1.47.2-3+b12_arm64.deb ...
+Unpacking libcom-err2:arm64 (1.47.2-3+b12) over (1.47.2-3+b11) ...
+Preparing to unpack .../12-libcurl3t64-gnutls_8.14.1-2+deb13u7_arm64.deb ...
+Unpacking libcurl3t64-gnutls:arm64 (8.14.1-2+deb13u7) over (8.14.1-2+deb13u4) ...
+Setting up libexpat1:arm64 (2.9.0-1~deb13u1) ...
+Setting up libjq1:arm64 (1.7.1-6+deb13u4) ...
+Setting up libbrotli1:arm64 (1.1.0-2+deb13u1) ...
+Setting up libcom-err2:arm64 (1.47.2-3+b12) ...
+Setting up tzdata (2026e-0+deb13u1) ...
+
+Current default time zone: 'Etc/UTC'
+Local time is now:      Mon Oct 26 01:57:04 UTC 2026.
+Universal Time is now:  Mon Oct 26 01:57:04 UTC 2026.
+Run 'dpkg-reconfigure tzdata' if you wish to change it.
+
+Setting up libcap2-bin (1:2.75-10+deb13u1+b3) ...
+Setting up xz-utils (5.8.1-1+deb13u2) ...
+Setting up mount (2.41.5-0+deb13u1) ...
+Setting up perl-modules-5.40 (5.40.1-6+deb13u1) ...
+Setting up jq (1.7.1-6+deb13u4) ...
+Setting up libssh2-1t64:arm64 (1.11.1-1+deb13u2) ...
+Setting up openssl (3.5.7-1~deb13u3) ...
+Setting up login (1:4.16.0-2+really2.41.5-0+deb13u1) ...
+Setting up libcurl4t64:arm64 (8.14.1-2+deb13u7) ...
+Setting up libcurl3t64-gnutls:arm64 (8.14.1-2+deb13u7) ...
+Setting up libperl5.40:arm64 (5.40.1-6+deb13u1) ...
+Setting up ca-certificates (20250419+deb13u1) ...
+Updating certificates in /etc/ssl/certs...
+rehash: warning: skipping ca-certificates.crt, it does not contain exactly one certificate or CRL
+0 added, 2 removed; done.
+Setting up perl (5.40.1-6+deb13u1) ...
+Setting up curl (8.14.1-2+deb13u7) ...
+Processing triggers for debianutils (5.23.2) ...
+Processing triggers for libc-bin (2.41-12+deb13u4) ...
+Processing triggers for ca-certificates (20250419+deb13u1) ...
+Updating certificates in /etc/ssl/certs...
+0 added, 0 removed; done.
+Running hooks in /etc/ca-certificates/update.d...
+done.
+==> Adding Docker apt repository (key pinned by SHA-256)
+/etc/apt/keyrings/docker.asc: OK
+==> Installing docker-ce 5:29.9.2-1~debian.13~trixie, containerd.io 2.4.2-3~debian.13~trixie
+Selecting previously unselected package containerd.io.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 9875 files and directories currently installed.)
+Preparing to unpack .../00-containerd.io_2.4.2-3~debian.13~trixie_arm64.deb ...
+Unpacking containerd.io (2.4.2-3~debian.13~trixie) ...
+Selecting previously unselected package docker-ce-cli.
+Preparing to unpack .../01-docker-ce-cli_5%3a29.9.2-1~debian.13~trixie_arm64.deb ...
+Unpacking docker-ce-cli (5:29.9.2-1~debian.13~trixie) ...
+Selecting previously unselected package libip4tc2:arm64.
+Preparing to unpack .../02-libip4tc2_1.8.11-2_arm64.deb ...
+Unpacking libip4tc2:arm64 (1.8.11-2) ...
+Selecting previously unselected package libip6tc2:arm64.
+Preparing to unpack .../03-libip6tc2_1.8.11-2_arm64.deb ...
+Unpacking libip6tc2:arm64 (1.8.11-2) ...
+Selecting previously unselected package netbase.
+Preparing to unpack .../04-netbase_6.5_all.deb ...
+Unpacking netbase (6.5) ...
+Selecting previously unselected package libnfnetlink0:arm64.
+Preparing to unpack .../05-libnfnetlink0_1.0.2-3_arm64.deb ...
+Unpacking libnfnetlink0:arm64 (1.0.2-3) ...
+Selecting previously unselected package libnetfilter-conntrack3:arm64.
+Preparing to unpack .../06-libnetfilter-conntrack3_1.1.0-1_arm64.deb ...
+Unpacking libnetfilter-conntrack3:arm64 (1.1.0-1) ...
+Selecting previously unselected package libnftnl11:arm64.
+Preparing to unpack .../07-libnftnl11_1.2.9-1_arm64.deb ...
+Unpacking libnftnl11:arm64 (1.2.9-1) ...
+Selecting previously unselected package iptables.
+Preparing to unpack .../08-iptables_1.8.11-2_arm64.deb ...
+Unpacking iptables (1.8.11-2) ...
+Selecting previously unselected package libjansson4:arm64.
+Preparing to unpack .../09-libjansson4_2.14-2+b3_arm64.deb ...
+Unpacking libjansson4:arm64 (2.14-2+b3) ...
+Selecting previously unselected package libnftables1:arm64.
+Preparing to unpack .../10-libnftables1_1.1.3-1_arm64.deb ...
+Unpacking libnftables1:arm64 (1.1.3-1) ...
+Selecting previously unselected package nftables.
+Preparing to unpack .../11-nftables_1.1.3-1_arm64.deb ...
+Unpacking nftables (1.1.3-1) ...
+Selecting previously unselected package docker-ce.
+Preparing to unpack .../12-docker-ce_5%3a29.9.2-1~debian.13~trixie_arm64.deb ...
+Unpacking docker-ce (5:29.9.2-1~debian.13~trixie) ...
+Setting up libip4tc2:arm64 (1.8.11-2) ...
+Setting up libip6tc2:arm64 (1.8.11-2) ...
+Setting up libnftnl11:arm64 (1.2.9-1) ...
+Setting up libjansson4:arm64 (2.14-2+b3) ...
+Setting up containerd.io (2.4.2-3~debian.13~trixie) ...
+Setting up docker-ce-cli (5:29.9.2-1~debian.13~trixie) ...
+Setting up libnfnetlink0:arm64 (1.0.2-3) ...
+Setting up netbase (6.5) ...
+Setting up libnftables1:arm64 (1.1.3-1) ...
+Setting up nftables (1.1.3-1) ...
+Setting up libnetfilter-conntrack3:arm64 (1.1.0-1) ...
+Setting up iptables (1.8.11-2) ...
+update-alternatives: using /usr/sbin/iptables-legacy to provide /usr/sbin/iptables (iptables) in auto mode
+update-alternatives: using /usr/sbin/ip6tables-legacy to provide /usr/sbin/ip6tables (ip6tables) in auto mode
+update-alternatives: using /usr/sbin/iptables-nft to provide /usr/sbin/iptables (iptables) in auto mode
+update-alternatives: using /usr/sbin/ip6tables-nft to provide /usr/sbin/ip6tables (ip6tables) in auto mode
+update-alternatives: using /usr/sbin/arptables-nft to provide /usr/sbin/arptables (arptables) in auto mode
+update-alternatives: using /usr/sbin/ebtables-nft to provide /usr/sbin/ebtables (ebtables) in auto mode
+Setting up docker-ce (5:29.9.2-1~debian.13~trixie) ...
+invoke-rc.d: could not determine current runlevel
+invoke-rc.d: WARNING: No init system and policy-rc.d missing! Defaulting to block.
+Processing triggers for libc-bin (2.41-12+deb13u4) ...
+==> Installed versions
+Docker version 29.9.2, build a82e528
+containerd containerd v2.4.2 b7a25261e029d68978bbf290df0a62fc819b3c51
+runc version 1.5.2
+shuru: saving checkpoint 'docker-step1'...
+shuru: checkpoint 'docker-step1' saved
+shuru: step 2/2: pull.sh
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+==> Pulling nginxinc/nginx-unprivileged:1.31.7-alpine-slim@sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7
+docker.io/nginxinc/nginx-unprivileged@sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7: Pulling from nginxinc/nginx-unprivileged
+4b40f23576bc: Pulling fs layer
+115972ae778a: Pulling fs layer
+98f56d1336e8: Pulling fs layer
+d74d0cecaf1a: Pulling fs layer
+581a829fa84a: Pulling fs layer
+a9986cd6f37d: Pulling fs layer
+2fe8f2a34241: Pulling fs layer
+4bc482c4f270: Pulling fs layer
+44136fa355b3: Download complete
+115972ae778a: Download complete
+98f56d1336e8: Download complete
+4bc482c4f270: Download complete
+581a829fa84a: Download complete
+2fe8f2a34241: Download complete
+4b40f23576bc: Download complete
+e437ba1f09a3: Download complete
+a9986cd6f37d: Download complete
+a9986cd6f37d: Pull complete
+d74d0cecaf1a: Download complete
+115972ae778a: Pull complete
+98f56d1336e8: Pull complete
+4bc482c4f270: Pull complete
+581a829fa84a: Pull complete
+2fe8f2a34241: Pull complete
+4b40f23576bc: Pull complete
+d74d0cecaf1a: Pull complete
+Digest: sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7
+Status: Downloaded newer image for nginxinc/nginx-unprivileged@sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7
+docker.io/nginxinc/nginx-unprivileged:1.31.7-alpine-slim@sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7
+REPOSITORY                    TAG                  DIGEST                                                                    IMAGE ID       CREATED      SIZE
+nginxinc/nginx-unprivileged   1.31.7-alpine-slim   sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7   a8cb0f33d51f   7 days ago   30.3MB
+shuru: saving checkpoint 'docker'...
+shuru: checkpoint 'docker' saved
+shuru: checkpoint 'docker-step1' deleted
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+29.9.2
+101
+
+real	2m3.632s
+user	0m20.139s
+sys	0m3.259s
+run-recipe-exit=0
+=== shuru run --recipe docker (second use reuses the checkpoint)
+shuru: using checkpoint docker (superhq-ai/recipes/docker@2a5c726)
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+REPOSITORY                    TAG                  DIGEST                                                                    IMAGE ID       CREATED      SIZE
+nginxinc/nginx-unprivileged   1.31.7-alpine-slim   sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7   a8cb0f33d51f   7 days ago   30.3MB
+
+real	0m3.910s
+user	0m0.068s
+sys	0m0.017s
+run-recipe-reuse-exit=0
+=== checkpoint list and sidecar
+NAME                       SIZE CREATED      RECIPE
+docker                   1.3 GB just now     superhq-ai/recipes/docker@2a5c726
+{
+  "recipe": {
+    "name": "docker",
+    "source": "superhq-ai/recipes/docker",
+    "revision": "2a5c726ee5fa4812b5315fa4b8b81650118b5305"
+  }
+}
