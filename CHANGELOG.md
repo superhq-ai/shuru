@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Docker Engine runs inside the VM
+
+`scripts/prepare-docker-checkpoint.sh` builds a checkpoint with pinned
+docker-ce 29.9.2 and containerd 2.4.2 and one pre-pulled image, and
+`with-dockerd CMD` runs a command with the daemon up. Containers get the
+same boundary as any guest process: no egress without `--allow-net`, the
+host allowlist applied by the proxy, host ports only through `-p`.
+
+To support it, the guest kernel gains cgroup v2 controllers, cgroup BPF,
+seccomp filters, veth, and the netfilter targets dockerd installs, and moves
+to Linux 6.12.114. The guest init now mounts cgroup2 on /sys/fs/cgroup and
+tmpfs on /run and /dev/shm. `/run` is therefore no longer persisted into
+checkpoints.
+
+`SHURU_DATA_DIR` overrides the data directory so builds and tests can use
+their own kernel, initramfs and checkpoints. `scripts/build-kernel-hf.sh`
+builds the kernel on a Hugging Face CPU job.
+
+See docs/rfcs/0003-docker-on-shuru.md.
+
 ## 0.7.0
 
 ### Secrets can be refreshed while the VM runs

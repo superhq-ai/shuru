@@ -207,6 +207,33 @@ uv run --with browser-use --with openai examples/browser-use.py
 The example keeps Chromium inside the microVM and exposes only its CDP port to
 the host.
 
+## Docker
+
+Docker Engine runs inside the VM. Install it into a checkpoint once, then run
+containers from that checkpoint with networking disabled:
+
+```sh
+# One-time: pinned docker-ce + containerd, with one image pre-pulled
+./scripts/prepare-docker-checkpoint.sh
+
+# Serve the pre-pulled nginx-unprivileged image on host port 8080
+shuru run --from docker -p 8080:8080 -- with-dockerd sh -c \
+  'docker run -d -p 8080:8080 nginxinc/nginx-unprivileged:1.31.7-alpine-slim && sleep 300'
+curl http://127.0.0.1:8080/
+```
+
+`with-dockerd CMD` starts dockerd, runs `CMD`, then stops dockerd so the disk
+is consistent for checkpointing. Pulling other images needs `--allow-net`,
+and the usual `--allow-host` allowlist applies to container traffic too:
+containers reach the internet only through the Shuru proxy, and nothing at
+all without `--allow-net`.
+
+Docker isolation inside the VM stays at its defaults (seccomp, no new
+privileges). Do not use `--privileged` or mount the Docker socket into a
+container; neither crosses the VM boundary, but there is no reason to weaken
+the inner layer. See docs/rfcs/0003-docker-on-shuru.md for the full design,
+limits, and verification evidence.
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes and breaking changes.

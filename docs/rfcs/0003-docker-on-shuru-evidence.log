@@ -1,0 +1,136 @@
+
+running 9 tests
+test container_cannot_reach_host_loopback_services ... $ shuru run --from docker 
+--- stdout ---
+GATEWAY_BLOCKED
+HOSTNAME_BLOCKED
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+
+$ shuru run --from docker --allow-net
+--- stdout ---
+GATEWAY_BLOCKED
+HOSTNAME_BLOCKED
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+
+ok
+test container_cannot_write_to_host_through_default_mount ... $ shuru run --from docker --mount <crate-dir>/.tmpAWI21I:/workspace
+--- stdout ---
+from-host
+WROTE_IN_GUEST
+HOST_FS_ABSENT
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+
+ok
+test container_egress_follows_host_allowlist ... $ shuru run --from docker --allow-net --allow-host example.com
+--- stdout ---
+<title>Example Domain</title>
+ALLOWED_OK
+DOMAIN_BLOCKED
+IP_BLOCKED
+DNS_BLOCKED
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+
+ok
+test container_has_no_egress_without_allow_net ... $ shuru run --from docker 
+--- stdout ---
+guest-eth0=Device "eth0" does not exist.
+EGRESS_BLOCKED
+
+IP_BLOCKED
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+wget: bad address 'example.com'
+wget: can't connect to remote host (93.184.215.14): Network unreachable
+
+ok
+test dockerd_runs_pinned_image_as_non_root_with_default_isolation ... $ shuru run --from docker 
+--- stdout ---
+cgroupfs cgroup-v2 storage=overlayfs kernel=6.12.114 security=[name=seccomp,profile=builtin name=cgroupns name=no-new-privileges]
+docker=29.9.2 containerd=v2.4.2 runc=1.5.2
+digest=nginxinc/nginx-unprivileged@sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7 user=101
+uid=101
+nginx-master-Uid: 101 101 101 101
+privileged=false
+seccomp=[]
+no-new-privs=NoNewPrivs:	1
+seccomp-mode=Seccomp:	2
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+
+ok
+test http_through_port_forward_reaches_container ... $ shuru run --from docker -p 61346:8080
+--- stdout ---
+READY
+STOPPED
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+shuru: forwarding 127.0.0.1:61346 -> guest:8080
+
+$ GET http://127.0.0.1:61346/
+HTTP/1.1 200 OK
+Server: nginx/1.31.7
+Date: Mon, 26 Oct 2026 00:21:17 GMT
+Content-Type: text/html
+Content-Length: 19
+Last-Modified: Mon, 26 Oct 2026 00:21:15 GMT
+Connection: close
+ETag: "6ade9cfb-13"
+Accept-Ranges: bytes
+
+shuru-docker-72816
+
+ok
+test named_volume_persists_across_container_and_daemon_restart ... $ shuru run --from docker 
+--- stdout ---
+after-container-restart=persisted-72816
+after-daemon-restart=persisted-72816
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+
+ok
+test named_volume_persists_across_vm_stop_start_via_checkpoint ... $ shuru checkpoint create shuru-test-docker-data-72816 --from docker
+--- stdout ---
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+shuru: saving checkpoint 'shuru-test-docker-data-72816'...
+shuru: checkpoint 'shuru-test-docker-data-72816' saved
+
+$ shuru run --from shuru-test-docker-data-72816
+--- stdout ---
+after-vm-restart=vm-persisted-72816
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+
+ok
+test resource_limits_apply_inside_containers ... $ shuru run --from docker 
+--- stdout ---
+memory.max=67108864
+cpu.max=50000 100000
+pids.max=20
+oom-exit=137
+sh: can't fork: Resource temporarily unavailable
+
+--- stderr ---
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+WARNING: Your kernel does not support swap limit capabilities or the cgroup is not mounted. Memory limited without swap.
+WARNING: Your kernel does not support swap limit capabilities or the cgroup is not mounted. Memory limited without swap.
+
+ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 123.84s
+
+exit=0
