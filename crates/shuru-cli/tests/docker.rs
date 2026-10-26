@@ -15,6 +15,10 @@
 //!
 //! SHURU_DATA_DIR, SHURU_KERNEL and SHURU_INITRD are inherited by the CLI,
 //! so a run can use an isolated kernel and checkpoint directory.
+//!
+//! dockerd runs as a guest service (RFC 0004): it is up before the command
+//! starts and is stopped cleanly before the VM powers off, so the scripts
+//! below call `docker` directly.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -112,7 +116,6 @@ fn dockerd_runs_pinned_image_as_non_root_with_default_isolation() {
         &[],
         r#"
 set -e
-with-dockerd sh -c '
 docker info --format "{{.CgroupDriver}} cgroup-v{{.CgroupVersion}} storage={{.Driver}} kernel={{.KernelVersion}} security={{.SecurityOptions}}"
 docker version --format "docker={{.Server.Version}} containerd={{(index .Server.Components 1).Version}} runc={{(index .Server.Components 2).Version}}"
 docker image inspect --format "digest={{index .RepoDigests 0}} user={{.Config.User}}" IMAGE
@@ -126,7 +129,6 @@ echo "seccomp=$(docker inspect --format "{{.HostConfig.SecurityOpt}}" web)"
 echo "no-new-privs=$(docker exec web grep NoNewPrivs /proc/1/status)"
 echo "seccomp-mode=$(docker exec web grep Seccomp: /proc/1/status)"
 docker rm -f web > /dev/null
-'
 "#,
     );
     assert!(out.status.success(), "{}", text(&out));
@@ -155,7 +157,6 @@ fn http_through_port_forward_reaches_container() {
 set -e
 mkdir -p /srv/www
 echo "{token}" > /srv/www/index.html
-with-dockerd sh -c '
 docker run -d --name web -p 8080:8080 -v /srv/www:/usr/share/nginx/html:ro IMAGE > /dev/null
 echo READY
 i=0
@@ -166,7 +167,6 @@ until docker logs web 2>&1 | grep -q "GET /done"; do
 done
 docker rm -f web > /dev/null
 echo STOPPED
-'
 "#
     );
 
@@ -210,11 +210,9 @@ fn container_has_no_egress_without_allow_net() {
     let out = shuru_run(
         &[],
         r#"
-with-dockerd sh -c '
 echo "guest-eth0=$(ip -o link show eth0 2>&1 | head -c 40)"
 docker run --rm IMAGE sh -c "wget -T 5 -qO- http://example.com && echo EGRESS_OK || echo EGRESS_BLOCKED"
 docker run --rm IMAGE sh -c "nslookup example.com 2>&1 | tail -n 1; wget -T 5 -qO- http://93.184.215.14 && echo IP_OK || echo IP_BLOCKED"
-'
 "#,
     );
     let s = stdout(&out);
@@ -234,12 +232,10 @@ fn container_egress_follows_host_allowlist() {
     let out = shuru_run(
         &["--allow-net", "--allow-host", "example.com"],
         r#"
-with-dockerd sh -c '
 docker run --rm IMAGE sh -c "wget -T 15 -qO- http://example.com | grep -o \"<title>[^<]*</title>\" && echo ALLOWED_OK || echo ALLOWED_FAIL"
 docker run --rm IMAGE sh -c "wget -T 5 -qO- http://www.iana.org/ > /dev/null 2>&1 && echo DOMAIN_LEAK || echo DOMAIN_BLOCKED"
 docker run --rm IMAGE sh -c "wget -T 5 -qO- http://1.1.1.1/ > /dev/null 2>&1 && echo IP_LEAK || echo IP_BLOCKED"
 docker run --rm --dns 8.8.8.8 IMAGE sh -c "wget -T 5 -qO- http://example.com > /dev/null 2>&1 && echo DNS_LEAK || echo DNS_BLOCKED"
-'
 "#,
     );
     let s = stdout(&out);
@@ -263,10 +259,8 @@ fn container_cannot_reach_host_loopback_services() {
 
     let script = format!(
         r#"
-with-dockerd sh -c '
 docker run --rm IMAGE sh -c "wget -T 5 -qO- http://10.0.0.1:{port}/ > /dev/null 2>&1 && echo GATEWAY_REACHED || echo GATEWAY_BLOCKED"
 docker run --rm IMAGE sh -c "wget -T 5 -qO- http://host.shuru.internal:{port}/ > /dev/null 2>&1 && echo HOSTNAME_REACHED || echo HOSTNAME_BLOCKED"
-'
 "#
     );
 
@@ -295,10 +289,8 @@ fn container_cannot_write_to_host_through_default_mount() {
     let out = shuru_run(
         &["--mount", &spec],
         r#"
-with-dockerd sh -c '
 docker run --rm --user 0 -v /workspace:/w IMAGE sh -c "cat /w/host.txt; echo escaped > /w/escaped.txt && echo WROTE_IN_GUEST"
 docker run --rm -v /:/vmroot IMAGE sh -c "ls /vmroot/Users > /dev/null 2>&1 && echo HOST_FS_VISIBLE || echo HOST_FS_ABSENT"
-'
 "#,
     );
     let s = stdout(&out);
@@ -317,12 +309,10 @@ fn resource_limits_apply_inside_containers() {
     let out = shuru_run(
         &[],
         r#"
-with-dockerd sh -c '
 docker run --rm --memory 64m --cpus 0.5 --pids-limit 20 IMAGE sh -c "echo memory.max=\$(cat /sys/fs/cgroup/memory.max); echo cpu.max=\$(cat /sys/fs/cgroup/cpu.max); echo pids.max=\$(cat /sys/fs/cgroup/pids.max)"
 docker run --rm --memory 32m IMAGE sh -c "a=\$(head -c 200m /dev/zero | tr \"\\0\" a); echo survived"
 echo "oom-exit=$?"
 docker run --rm --pids-limit 5 IMAGE sh -c "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 3 & done; wait; echo forked-all" 2>&1 | tail -n 1
-'
 "#,
     );
     let s = stdout(&out);
@@ -336,12 +326,11 @@ docker run --rm --pids-limit 5 IMAGE sh -c "for i in 1 2 3 4 5 6 7 8 9 10; do sl
 
 #[test]
 #[ignore]
-fn named_volume_persists_across_container_and_daemon_restart() {
+fn named_volume_persists_across_container_restart() {
     let token = format!("persisted-{}", std::process::id());
     let script = format!(
         r#"
 set -e
-with-dockerd sh -c '
 docker volume create vdata > /dev/null
 docker create --name keeper -v vdata:/tmp IMAGE sleep 120 > /dev/null
 docker start keeper > /dev/null
@@ -350,22 +339,21 @@ docker stop -t 1 keeper > /dev/null
 docker start keeper > /dev/null
 echo "after-container-restart=$(docker exec keeper cat /tmp/marker)"
 docker rm -f keeper > /dev/null
-'
-with-dockerd sh -c '
-echo "after-daemon-restart=$(docker run --rm -v vdata:/tmp IMAGE cat /tmp/marker)"
-'
+echo "after-new-container=$(docker run --rm -v vdata:/tmp IMAGE cat /tmp/marker)"
 "#
     );
     let out = shuru_run(&[], &script);
     assert!(out.status.success(), "{}", text(&out));
     let s = stdout(&out);
     assert!(s.contains(&format!("after-container-restart={}", token)), "{}", s);
-    assert!(s.contains(&format!("after-daemon-restart={}", token)), "{}", s);
+    assert!(s.contains(&format!("after-new-container={}", token)), "{}", s);
 }
 
 /// Shuru resets the disk on every run, so persistence across a VM stop and
-/// start goes through a checkpoint. with-dockerd stops dockerd before the
-/// checkpoint is taken, so the volume store is consistent on disk.
+/// start goes through a checkpoint. The guest stops dockerd and syncs the
+/// disk during the shutdown handshake, before the checkpoint is cloned, so
+/// the volume store is consistent and the daemon restarts cleanly on the
+/// next boot.
 #[test]
 #[ignore]
 fn named_volume_persists_across_vm_stop_start_via_checkpoint() {
@@ -375,14 +363,12 @@ fn named_volume_persists_across_vm_stop_start_via_checkpoint() {
     let write = format!(
         r#"
 set -e
-with-dockerd sh -c '
 docker volume create vdata > /dev/null
 docker run --rm -v vdata:/tmp IMAGE sh -c "echo {token} > /tmp/marker"
-'
 "#
     );
     let create = Command::new(shuru_bin())
-        .args(["checkpoint", "create", &name, "--from", &checkpoint(), "--"])
+        .args(["checkpoint", "create", &name, "--verbose", "--from", &checkpoint(), "--"])
         .args(guest_cmd(&write))
         .stdin(Stdio::null())
         .output()
@@ -392,7 +378,7 @@ docker run --rm -v vdata:/tmp IMAGE sh -c "echo {token} > /tmp/marker"
     let read = Command::new(shuru_bin())
         .args(["run", "--from", &name, "--"])
         .args(guest_cmd(
-            r#"with-dockerd sh -c 'echo "after-vm-restart=$(docker run --rm -v vdata:/tmp IMAGE cat /tmp/marker)"'"#,
+            r#"echo "after-vm-restart=$(docker run --rm -v vdata:/tmp IMAGE cat /tmp/marker)""#,
         ))
         .stdin(Stdio::null())
         .output()
@@ -401,9 +387,14 @@ docker run --rm -v vdata:/tmp IMAGE sh -c "echo {token} > /tmp/marker"
     let _ = Command::new(shuru_bin())
         .args(["checkpoint", "delete", &name])
         .output();
-    eprintln!("$ shuru checkpoint create {} --from {}\n{}", name, checkpoint(), text(&create));
+    eprintln!("$ shuru checkpoint create {} --verbose --from {}\n{}", name, checkpoint(), text(&create));
     eprintln!("$ shuru run --from {}\n{}", name, text(&read));
 
+    assert!(
+        String::from_utf8_lossy(&create.stderr).contains("stopped services: docker"),
+        "{}",
+        text(&create)
+    );
     assert!(read.status.success(), "{}", text(&read));
     assert!(
         stdout(&read).contains(&format!("after-vm-restart={}", token)),

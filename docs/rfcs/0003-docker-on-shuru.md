@@ -96,13 +96,16 @@ checkpoints.
 3. Write `/etc/docker/daemon.json` with `no-new-privileges: true`. Everything
    else stays at Docker defaults (iptables on, userland proxy on, seccomp
    default profile, overlay2, json-file logs).
-4. Install `/usr/local/bin/with-dockerd`, which starts containerd and dockerd,
-   waits for the socket, runs the given command, then stops dockerd cleanly so
-   the disk is consistent for checkpointing.
-5. `docker pull` the pinned image so the checkpoint runs it without network.
+4. Declare dockerd as a guest service in `/etc/shuru/services/docker.json`
+   (RFC 0004), with `docker info` as the readiness check and a 30 second
+   stop timeout. The guest init starts it at boot and stops it before power
+   off. An earlier revision of this RFC used a `with-dockerd` wrapper
+   script for the same job; RFC 0004 replaced it.
+5. Boot from that intermediate checkpoint and `docker pull` the pinned image
+   so the final checkpoint runs it without network.
 
 The checkpoint is the unit users reuse: `shuru run --from docker -p 8080:8080
--- with-dockerd docker run ...`.
+-- docker run ...`.
 
 ### Data dir isolation
 
@@ -223,11 +226,17 @@ Image config read from the registry before pulling: `User: 101`,
 
 ### Runtime checks from the integration suite
 
-Final run, each test booting one VM from the rebuilt checkpoint:
+Final run with the `with-dockerd` wrapper, each test booting one VM from
+the rebuilt checkpoint:
 
     test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 125.51s
 
-Raw output is in `docs/rfcs/0003-docker-on-shuru-evidence.log`. Excerpts:
+Rerun after RFC 0004 moved dockerd to a guest service, same nine tests:
+
+    test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 78.78s
+
+Raw output of the rerun is in `docs/rfcs/0003-docker-on-shuru-evidence.log`.
+Excerpts, identical between the two runs:
 
     cgroupfs cgroup-v2 storage=overlayfs kernel=6.12.114 security=[name=seccomp,profile=builtin name=cgroupns name=no-new-privileges]
     docker=29.9.2 containerd=v2.4.2 runc=1.5.2

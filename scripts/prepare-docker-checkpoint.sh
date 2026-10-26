@@ -1,11 +1,16 @@
 #!/bin/bash
-# Create a Shuru checkpoint with Docker Engine installed and one pinned image
-# pulled, so `shuru run --from docker -- with-dockerd docker run ...` works
-# with networking disabled.
+# Create a Shuru checkpoint with Docker Engine installed as a guest service
+# (RFC 0004) and one pinned image pulled, so
+# `shuru run --from docker -- docker run ...` works with networking disabled.
 #
 # Everything is pinned: Docker apt packages by exact version, the apt signing
 # key by SHA-256, the image by manifest digest. The VM that performs the
 # install only reaches the hosts listed below.
+#
+# The build has two steps. The first installs Docker and declares the
+# dockerd service, saved as an intermediate checkpoint. The second boots from
+# it, which starts dockerd through the service model, pulls the image, and
+# saves the final checkpoint. The intermediate checkpoint is then deleted.
 #
 # Needs a kernel and guest init with container support (RFC 0003). Until a
 # release ships them, point SHURU_KERNEL and SHURU_INITRD at a local build.
@@ -25,53 +30,9 @@ DOCKER_GPG_SHA256="${DOCKER_GPG_SHA256:-1500c1f56fa9e26b9b8f42452a553675796ade08
 # runs as uid 101 and listens on 8080.
 DOCKER_IMAGE="${DOCKER_IMAGE:-nginxinc/nginx-unprivileged:1.31.7-alpine-slim@sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7}"
 
-WITH_DOCKERD_B64="$(base64 << 'HELPER' | tr -d '\n'
-#!/bin/sh
-# Start dockerd, run a command, then stop dockerd so the disk is consistent.
-# usage: with-dockerd CMD [ARGS...]
-set -eu
-if [ "$#" -eq 0 ]; then
-    echo "usage: with-dockerd CMD [ARGS...]" >&2
-    exit 64
-fi
-LOG=/var/log/dockerd.log
-if docker info > /dev/null 2>&1; then
-    exec "$@"
-fi
-dockerd > "$LOG" 2>&1 &
-DOCKERD_PID=$!
-i=0
-until docker info > /dev/null 2>&1; do
-    i=$((i + 1))
-    if ! kill -0 "$DOCKERD_PID" 2> /dev/null; then
-        echo "with-dockerd: dockerd exited during startup" >&2
-        tail -n 30 "$LOG" >&2
-        exit 1
-    fi
-    if [ "$i" -ge 300 ]; then
-        echo "with-dockerd: dockerd not ready after 60s" >&2
-        tail -n 30 "$LOG" >&2
-        kill "$DOCKERD_PID" 2> /dev/null || true
-        exit 1
-    fi
-    sleep 0.2
-done
-set +e
-"$@"
-STATUS=$?
-set -e
-kill -TERM "$DOCKERD_PID" 2> /dev/null || true
-j=0
-while kill -0 "$DOCKERD_PID" 2> /dev/null && [ "$j" -lt 150 ]; do
-    sleep 0.2
-    j=$((j + 1))
-done
-sync
-exit "$STATUS"
-HELPER
-)"
+BASE_NAME="${CHECKPOINT_NAME}-base"
 
-GUEST_SCRIPT="$(cat << EOF
+INSTALL_SCRIPT="$(cat << EOF
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 echo "==> Upgrading Debian base (main, security and updates archives)"
@@ -106,19 +67,33 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 mkdir -p /etc/docker
 printf '{\n  "no-new-privileges": true\n}\n' > /etc/docker/daemon.json
-echo "${WITH_DOCKERD_B64}" | base64 -d > /usr/local/bin/with-dockerd
-chmod 755 /usr/local/bin/with-dockerd
-echo "==> Pulling ${DOCKER_IMAGE}"
-with-dockerd sh -c 'docker pull "${DOCKER_IMAGE}" && docker image ls --digests'
+echo "==> Declaring the dockerd service"
+mkdir -p /etc/shuru/services
+cat > /etc/shuru/services/docker.json << SVCEOF
+{
+  "exec": ["dockerd"],
+  "ready": ["docker", "info"],
+  "ready_timeout_secs": 60,
+  "stop_timeout_secs": 30
+}
+SVCEOF
+cat /etc/shuru/services/docker.json
 echo "==> Installed versions"
 docker --version
 containerd --version
 runc --version | head -n 1
 EOF
 )"
-GUEST_SCRIPT_B64="$(printf '%s\n' "$GUEST_SCRIPT" | base64 | tr -d '\n')"
 
-ARGS=(checkpoint create "$CHECKPOINT_NAME"
+PULL_SCRIPT="$(cat << EOF
+set -eu
+echo "==> Pulling ${DOCKER_IMAGE}"
+docker pull "${DOCKER_IMAGE}"
+docker image ls --digests
+EOF
+)"
+
+ALLOW_ARGS=(
     --allow-net
     --disk-size "$DISK_SIZE_MB"
     --memory "$MEMORY_MB"
@@ -128,12 +103,29 @@ ARGS=(checkpoint create "$CHECKPOINT_NAME"
     --allow-host "*.docker.io"
     --allow-host "*.docker.com"
     --allow-host "*.cloudflarestorage.com")
-if [ -n "$FROM_CHECKPOINT" ]; then
-    ARGS+=(--from "$FROM_CHECKPOINT")
-fi
 if [ -n "${VERBOSE:-}" ]; then
-    ARGS+=(--verbose)
+    ALLOW_ARGS+=(--verbose)
 fi
 
-echo "==> Creating checkpoint '${CHECKPOINT_NAME}' with Docker ${DOCKER_VERSION}"
-exec "$SHURU_BIN" "${ARGS[@]}" -- sh -c "echo ${GUEST_SCRIPT_B64} | base64 -d | sh"
+run_checkpoint() {
+    local name="$1" from="$2" script="$3"
+    local args=(checkpoint create "$name" "${ALLOW_ARGS[@]}")
+    if [ -n "$from" ]; then
+        args+=(--from "$from")
+    fi
+    local b64
+    b64="$(printf '%s\n' "$script" | base64 | tr -d '\n')"
+    "$SHURU_BIN" "${args[@]}" -- sh -c "echo ${b64} | base64 -d | sh"
+}
+
+echo "==> Step 1/2: installing Docker ${DOCKER_VERSION} into '${BASE_NAME}'"
+run_checkpoint "$BASE_NAME" "$FROM_CHECKPOINT" "$INSTALL_SCRIPT"
+
+echo "==> Step 2/2: pulling the image into '${CHECKPOINT_NAME}' with dockerd running as a service"
+if run_checkpoint "$CHECKPOINT_NAME" "$BASE_NAME" "$PULL_SCRIPT"; then
+    "$SHURU_BIN" checkpoint delete "$BASE_NAME"
+    echo "==> Checkpoint '${CHECKPOINT_NAME}' ready"
+else
+    echo "==> Pull failed; intermediate checkpoint '${BASE_NAME}' left in place for debugging" >&2
+    exit 1
+fi

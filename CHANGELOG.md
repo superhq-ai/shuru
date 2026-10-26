@@ -2,13 +2,24 @@
 
 ## Unreleased
 
+### Guest services
+
+An image can declare long running processes in
+`/etc/shuru/services/<name>.json`. The guest init starts them at boot,
+waits for their readiness check before running the command, and stops them
+with SIGTERM before the VM powers off. The host now asks the guest to shut
+down over vsock, which also syncs the disk, so checkpoints are cloned from
+a consistent image on every stop path. `Sandbox::stop()` is graceful and
+`Sandbox::kill()` is the old hard stop. See docs/rfcs/0004-guest-services.md.
+
 ### Docker Engine runs inside the VM
 
 `scripts/prepare-docker-checkpoint.sh` builds a checkpoint with pinned
-docker-ce 29.9.2 and containerd 2.4.2 and one pre-pulled image, and
-`with-dockerd CMD` runs a command with the daemon up. Containers get the
-same boundary as any guest process: no egress without `--allow-net`, the
-host allowlist applied by the proxy, host ports only through `-p`.
+docker-ce 29.9.2 and containerd 2.4.2 and one pre-pulled image, with dockerd
+declared as a guest service so `shuru run --from docker -- docker run ...`
+just works. Containers get the same boundary as any guest process: no egress
+without `--allow-net`, the host allowlist applied by the proxy, host ports
+only through `-p`.
 
 To support it, the guest kernel gains cgroup v2 controllers, cgroup BPF,
 seccomp filters, veth, and the netfilter targets dockerd installs, and moves

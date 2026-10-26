@@ -17,7 +17,7 @@ HOSTNAME_BLOCKED
 shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
 
 ok
-test container_cannot_write_to_host_through_default_mount ... $ shuru run --from docker --mount <crate-dir>/.tmpAWI21I:/workspace
+test container_cannot_write_to_host_through_default_mount ... $ shuru run --from docker --mount <crate-dir>/.tmpthbsMx:/workspace
 --- stdout ---
 from-host
 WROTE_IN_GUEST
@@ -68,49 +68,95 @@ seccomp-mode=Seccomp:	2
 shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
 
 ok
-test http_through_port_forward_reaches_container ... $ shuru run --from docker -p 61346:8080
+test http_through_port_forward_reaches_container ... $ shuru run --from docker -p 61603:8080
 --- stdout ---
 READY
 STOPPED
 
 --- stderr ---
 shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
-shuru: forwarding 127.0.0.1:61346 -> guest:8080
+shuru: forwarding 127.0.0.1:61603 -> guest:8080
 
-$ GET http://127.0.0.1:61346/
+$ GET http://127.0.0.1:61603/
 HTTP/1.1 200 OK
 Server: nginx/1.31.7
-Date: Mon, 26 Oct 2026 00:21:17 GMT
+Date: Mon, 26 Oct 2026 01:02:26 GMT
 Content-Type: text/html
 Content-Length: 19
-Last-Modified: Mon, 26 Oct 2026 00:21:15 GMT
+Last-Modified: Mon, 26 Oct 2026 01:02:26 GMT
 Connection: close
-ETag: "6ade9cfb-13"
+ETag: "6adea6a2-13"
 Accept-Ranges: bytes
 
-shuru-docker-72816
+shuru-docker-98351
 
 ok
-test named_volume_persists_across_container_and_daemon_restart ... $ shuru run --from docker 
+test named_volume_persists_across_container_restart ... $ shuru run --from docker 
 --- stdout ---
-after-container-restart=persisted-72816
-after-daemon-restart=persisted-72816
+after-container-restart=persisted-98351
+after-new-container=persisted-98351
 
 --- stderr ---
 shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
 
 ok
-test named_volume_persists_across_vm_stop_start_via_checkpoint ... $ shuru checkpoint create shuru-test-docker-data-72816 --from docker
+test named_volume_persists_across_vm_stop_start_via_checkpoint ... $ shuru checkpoint create shuru-test-docker-data-98351 --verbose --from docker
 --- stdout ---
 
 --- stderr ---
+shuru: creating working copy...
+shuru: kernel=<data-dir>/Image
+shuru: rootfs=<data-dir>/instances/98441/rootfs.ext4 (work copy)
 shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
-shuru: saving checkpoint 'shuru-test-docker-data-72816'...
-shuru: checkpoint 'shuru-test-docker-data-72816' saved
+shuru: VM created and validated successfully
+shuru: VM started, waiting for guest...
+random: crng init done
+virtio_blk virtio1: 1/0/0 default/read/poll queues
+virtio_blk virtio1: [vda] 8388608 512-byte logical blocks (4.29 GB/4.00 GiB)
+rtc-pl031 20050000.pl031: registered as rtc0
+rtc-pl031 20050000.pl031: setting system clock to 2026-10-26T01:02:32 UTC (1792976552)
+NET: Registered PF_INET6 protocol family
+Segment Routing with IPv6
+In-situ OAM (IOAM) with IPv6
+sit: IPv6, IPv4 and MPLS over IPv4 tunneling driver
+NET: Registered PF_PACKET protocol family
+Bridge firewalling registered
+NET: Registered PF_VSOCK protocol family
+clk: Disabling unused clocks
+Freeing unused kernel memory: 896K
+Run /init as init process
+EXT4-fs (vda): mounted filesystem 728de991-e6e3-4e1a-873d-bc29aeff5c07 r/w with ordered data mode. Quota mode: disabled.
+shuru-guest[  213.6ms]: starting as PID 1
+shuru-guest[  213.9ms]: filesystems mounted
+shuru-guest: no network device (sandbox mode)
+shuru-guest[  214.0ms]: networking ready
+shuru-guest[  216.6ms]: 1 service(s) starting
+shuru-guest[  216.6ms]: vsock listening on port 1024
+shuru-guest[  216.6ms]: port forward listener on port 1025
+shuru-guest: accepted vsock connection
+shuru-guest: service docker ready
+docker0: port 1(veth2b33299) entered blocking state
+docker0: port 1(veth2b33299) entered disabled state
+veth2b33299: entered allmulticast mode
+veth2b33299: entered promiscuous mode
+eth0: renamed from vethd3aa798
+docker0: port 1(veth2b33299) entered blocking state
+docker0: port 1(veth2b33299) entered forwarding state
+docker0: port 1(veth2b33299) entered disabled state
+vethd3aa798: renamed from eth0
+docker0: port 1(veth2b33299) entered disabled state
+veth2b33299 (unregistering): left allmulticast mode
+veth2b33299 (unregistering): left promiscuous mode
+docker0: port 1(veth2b33299) entered disabled state
+shuru-guest: accepted vsock connection
+shuru-guest: services stopped in 1.0s (stopped: ["docker"], killed: [])
+shuru: stopped services: docker
+shuru: saving checkpoint 'shuru-test-docker-data-98351'...
+shuru: checkpoint 'shuru-test-docker-data-98351' saved
 
-$ shuru run --from shuru-test-docker-data-72816
+$ shuru run --from shuru-test-docker-data-98351
 --- stdout ---
-after-vm-restart=vm-persisted-72816
+after-vm-restart=vm-persisted-98351
 
 --- stderr ---
 shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
@@ -131,6 +177,5 @@ WARNING: Your kernel does not support swap limit capabilities or the cgroup is n
 
 ok
 
-test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 123.84s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 78.78s
 
-exit=0

@@ -217,16 +217,27 @@ containers from that checkpoint with networking disabled:
 ./scripts/prepare-docker-checkpoint.sh
 
 # Serve the pre-pulled nginx-unprivileged image on host port 8080
-shuru run --from docker -p 8080:8080 -- with-dockerd sh -c \
-  'docker run -d -p 8080:8080 nginxinc/nginx-unprivileged:1.31.7-alpine-slim && sleep 300'
+shuru run --from docker -p 8080:8080 -- \
+  docker run --rm -p 8080:8080 nginxinc/nginx-unprivileged:1.31.7-alpine-slim
 curl http://127.0.0.1:8080/
 ```
 
-`with-dockerd CMD` starts dockerd, runs `CMD`, then stops dockerd so the disk
-is consistent for checkpointing. Pulling other images needs `--allow-net`,
-and the usual `--allow-host` allowlist applies to container traffic too:
-containers reach the internet only through the Shuru proxy, and nothing at
-all without `--allow-net`.
+dockerd is a guest service: it starts when the VM boots, the command waits
+until `docker info` answers, and the daemon is stopped and the disk synced
+before the VM powers off. Pulling other images needs `--allow-net`, and the
+usual `--allow-host` allowlist applies to container traffic too: containers
+reach the internet only through the Shuru proxy, and nothing at all without
+`--allow-net`.
+
+Any image can declare services the same way. A JSON file under
+`/etc/shuru/services/` names the command to run, an optional readiness
+check, and the stop timeout:
+
+```json
+{"exec": ["dockerd"], "ready": ["docker", "info"], "stop_timeout_secs": 30}
+```
+
+See docs/rfcs/0004-guest-services.md for the full contract.
 
 Docker isolation inside the VM stays at its defaults (seccomp, no new
 privileges). Do not use `--privileged` or mount the Docker socket into a
