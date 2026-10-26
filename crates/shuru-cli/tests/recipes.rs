@@ -382,7 +382,10 @@ fn browser_recipe_serves_cdp_inside_and_through_a_forwarded_port() {
     while std::time::Instant::now() < deadline {
         if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-            let _ = stream.write_all(b"GET /json/version HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
+            // The DevTools server ignores HTTP/1.0 requests.
+            let _ = stream.write_all(
+                b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            );
             let _ = stream.read_to_string(&mut body);
             if body.contains("Chrome/") {
                 break;
