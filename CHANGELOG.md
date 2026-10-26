@@ -7,11 +7,12 @@
 Substitution was one directional: the proxy swapped the placeholder for the
 real value on the way out and forwarded responses untouched, so a bound host
 that reflected the request, as debug endpoints and verbose error pages do,
-handed the real credential to the guest. The proxy now replaces every real
-value with its placeholder in everything a bound host sends back, across
-read boundaries and after a refresh, and asks for an uncompressed response
-on any request that carried a secret so an echo stays readable. Values
-shorter than 8 bytes are not redacted.
+handed the real credential to the guest. The proxy now masks every real
+value in everything a bound host sends back, across read boundaries and
+after a refresh, with the placeholder fitted to the same length so the
+response framing stays true, and asks for an uncompressed response on any
+request that carried a secret so an echo stays readable. Values shorter
+than 8 bytes are not redacted.
 
 ### CLI downloads trust the platform certificate store
 

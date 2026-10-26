@@ -3,17 +3,18 @@
 //! Substitution on the way out is only half of the promise that the real
 //! value never enters the VM. An upstream that reflects the request, which a
 //! debug endpoint or a verbose error page will do, would hand the credential
-//! straight back. This replaces every real value with its placeholder on the
-//! way back, so the guest sees the same token it sent.
+//! straight back. This masks every real value on the way back.
 //!
-//! Responses are treated as bytes, not HTTP. A replacement that only ever
-//! touches an exact match of the value needs no framing to stay safe, and a
-//! response that is not HTTP at all still gets scrubbed. Two things the scan
-//! cannot see: a value split across chunk boundaries, and a value that comes
-//! back transformed. Compression, the one transformation an honest upstream
-//! applies on its own, is closed off on the request side by asking for an
-//! identity response whenever a request carried a secret. The rest need the
-//! upstream to go out of its way.
+//! Responses are treated as bytes, not HTTP, and the mask is exactly as long
+//! as the value it covers: the placeholder, cut or padded to fit. A rewrite
+//! that never changes the length of anything leaves Content-Length and chunk
+//! sizes true, so no framing has to be read, and a response that is not HTTP
+//! at all still gets scrubbed. Two things the scan cannot see: a value split
+//! across chunk boundaries, and a value that comes back transformed.
+//! Compression, the one transformation an honest upstream applies on its own,
+//! is closed off on the request side by asking for an identity response
+//! whenever a request carried a secret. The rest need the upstream to go out
+//! of its way.
 //!
 //! See docs/rfcs/0002-refreshable-secrets.md, appendix B.
 
@@ -21,12 +22,22 @@
 /// ordinary response text and corrupt it, and is not a credential anyway.
 const MIN_VALUE_LEN: usize = 8;
 
+/// Fills the mask once the placeholder runs out.
+const PAD: u8 = b'*';
+
 pub(crate) struct Redactor {
-    /// Real value to placeholder, longest value first so that a value which
-    /// is a prefix of another never wins over the longer one.
+    /// Real value to its mask, longest value first so that a value which is
+    /// a prefix of another never wins over the longer one.
     pairs: Vec<(Vec<u8>, Vec<u8>)>,
     /// Trailing bytes of the last push that could still turn into a value.
     held: Vec<u8>,
+}
+
+/// The placeholder cut or padded to `len` bytes.
+pub(crate) fn mask(placeholder: &[u8], len: usize) -> Vec<u8> {
+    let mut mask = placeholder[..placeholder.len().min(len)].to_vec();
+    mask.resize(len, PAD);
+    mask
 }
 
 impl Redactor {
@@ -47,7 +58,8 @@ impl Redactor {
             if value.len() < MIN_VALUE_LEN || self.pairs.iter().any(|(v, _)| *v == value) {
                 continue;
             }
-            self.pairs.push((value, placeholder.into_bytes()));
+            let mask = mask(placeholder.as_bytes(), value.len());
+            self.pairs.push((value, mask));
         }
         self.pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
     }
@@ -69,9 +81,8 @@ impl Redactor {
         let mut i = 0;
         while i < data.len() {
             let rest = &data[i..];
-            if let Some((value, placeholder)) = self.pairs.iter().find(|(v, _)| rest.starts_with(v))
-            {
-                out.extend_from_slice(placeholder);
+            if let Some((value, mask)) = self.pairs.iter().find(|(v, _)| rest.starts_with(v)) {
+                out.extend_from_slice(mask);
                 i += value.len();
                 continue;
             }
@@ -106,6 +117,10 @@ mod tests {
         Redactor::new(vec![(PLACEHOLDER.to_string(), SECRET.to_string())])
     }
 
+    fn masked() -> String {
+        String::from_utf8(mask(PLACEHOLDER.as_bytes(), SECRET.len())).unwrap()
+    }
+
     /// Feed `input` in slices of `size`, then flush, returning everything forwarded.
     fn feed(r: &mut Redactor, input: &[u8], size: usize) -> Vec<u8> {
         let mut out = Vec::new();
@@ -123,11 +138,19 @@ mod tests {
     }
 
     #[test]
-    fn a_reflected_value_comes_back_as_the_placeholder() {
+    fn the_mask_is_the_placeholder_fitted_to_the_value() {
+        assert_eq!(mask(b"shuru_tok_abc", 5), b"shuru");
+        assert_eq!(mask(b"shuru_tok_abc", 13), b"shuru_tok_abc");
+        assert_eq!(mask(b"shuru_tok_abc", 16), b"shuru_tok_abc***");
+    }
+
+    #[test]
+    fn a_reflected_value_is_masked_without_changing_the_length() {
         let out = feed(&mut redactor(), echo_response().as_bytes(), usize::MAX);
+        assert_eq!(out.len(), echo_response().len());
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            echo_response().replace(SECRET, PLACEHOLDER)
+            echo_response().replace(SECRET, &masked())
         );
     }
 
@@ -138,7 +161,7 @@ mod tests {
             let out = feed(&mut redactor(), input.as_bytes(), size);
             assert_eq!(
                 String::from_utf8(out).unwrap(),
-                input.replace(SECRET, PLACEHOLDER),
+                input.replace(SECRET, &masked()),
                 "leaked at chunk size {size}"
             );
         }
@@ -150,7 +173,7 @@ mod tests {
         let first = r.push(b"data: hello sk-a");
         assert_eq!(first, b"data: hello ");
         let second = r.push(b"-much-longer-real-secret-value\n\n");
-        assert_eq!(second, format!("{PLACEHOLDER}\n\n").as_bytes());
+        assert_eq!(second, format!("{}\n\n", masked()).as_bytes());
     }
 
     #[test]
@@ -178,14 +201,18 @@ mod tests {
     #[test]
     fn rotated_values_are_still_redacted_after_a_refresh() {
         let mut r = redactor();
-        r.add(vec![(
-            PLACEHOLDER.to_string(),
-            "sk-rotated-value-number-two".to_string(),
-        )]);
-        let out = r.push(format!("old={SECRET} new=sk-rotated-value-number-two").as_bytes());
+        let rotated = "sk-rotated-value-number-two";
+        r.add(vec![(PLACEHOLDER.to_string(), rotated.to_string())]);
+        let input = format!("old={SECRET} new={rotated}");
+        let out = r.push(input.as_bytes());
+        assert_eq!(out.len(), input.len());
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            format!("old={PLACEHOLDER} new={PLACEHOLDER}")
+            format!(
+                "old={} new={}",
+                masked(),
+                String::from_utf8(mask(PLACEHOLDER.as_bytes(), rotated.len())).unwrap()
+            )
         );
     }
 
@@ -200,7 +227,7 @@ mod tests {
             b"a secret-prefix-and-more b secret-prefix c",
             usize::MAX,
         );
-        assert_eq!(out, b"a tok_long b tok_short c");
+        assert_eq!(out, b"a tok_long************** b tok_short**** c");
     }
 
     #[test]

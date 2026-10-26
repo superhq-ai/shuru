@@ -120,7 +120,7 @@ shuru checkpoint delete myenv
 
 ### Secrets
 
-Secrets keep API keys on the host. The guest receives a random placeholder token; the proxy substitutes the real value only on HTTPS requests to the specified hosts, and swaps it back for the placeholder in whatever those hosts send in reply, so an endpoint that echoes the request cannot hand the credential to the guest. The real secret never enters the VM.
+Secrets keep API keys on the host. The guest receives a random placeholder token; the proxy substitutes the real value only on HTTPS requests to the specified hosts, and masks it in whatever those hosts send in reply, so an endpoint that echoes the request cannot hand the credential to the guest. The real secret never enters the VM.
 
 ```sh
 # Inject a secret via CLI
