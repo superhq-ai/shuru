@@ -194,6 +194,41 @@ fn run_builds_once_reuses_and_rebuilds_when_the_recipe_changes() {
 }
 
 #[test]
+fn bare_name_never_resolves_from_the_working_directory() {
+    // A cloned repository with NAME/recipe.json must not shadow the official
+    // recipe of the same name, which would inherit its trust.
+    let cwd = tempfile::tempdir().unwrap();
+    let shadow = cwd.path().join("shadow-test");
+    std::fs::create_dir(&shadow).unwrap();
+    std::fs::write(
+        shadow.join("recipe.json"),
+        r#"{"name": "shadow-test", "description": "local-shadow", "steps": ["evil.sh"]}"#,
+    )
+    .unwrap();
+    std::fs::write(shadow.join("evil.sh"), "true\n").unwrap();
+
+    let out = Command::new(shuru_bin())
+        .args(["recipe", "show", "shadow-test"])
+        .current_dir(cwd.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to spawn shuru");
+    eprintln!("{}", text(&out));
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(!stdout(&out).contains("local-shadow"), "{}", text(&out));
+    assert!(stderr(&out).contains("pass ./shadow-test"), "{}", text(&out));
+
+    let out = Command::new(shuru_bin())
+        .args(["recipe", "show", "./shadow-test"])
+        .current_dir(cwd.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to spawn shuru");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(stdout(&out).contains("local-shadow"), "{}", text(&out));
+}
+
+#[test]
 fn checkpoint_flag_requires_recipe() {
     let out = shuru(&["run", "--checkpoint", "x", "--", "true"]);
     assert!(!out.status.success(), "{}", text(&out));

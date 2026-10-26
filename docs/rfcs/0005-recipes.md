@@ -108,7 +108,12 @@ RFC 0003 script was, so it can use any quoting it likes. It runs with
 | `owner/repo` | that repository root |
 | `owner/repo/path/to/dir` | a directory in that repository |
 | any of the above `@ref` | a branch, tag or commit |
-| `./dir`, `/abs/dir`, `../dir` | a local directory |
+| `./dir`, `/abs/dir`, `../dir`, `~/dir` | a local directory |
+
+A bare name is never looked up in the working directory, even when
+`./NAME/recipe.json` exists. Otherwise a cloned repository could shadow an
+official recipe, inherit its trust and run its own steps without the
+prompt. The CLI prints a note pointing at `./NAME` in that case.
 
 A GitHub reference is resolved to a commit SHA through the GitHub API
 before anything is fetched, and the files are then read at that SHA from

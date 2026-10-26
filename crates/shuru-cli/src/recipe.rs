@@ -109,13 +109,17 @@ struct IndexEntry {
 
 // --- Reference parsing ---
 
+/// Only an explicit path form is local. A bare name is never looked up in
+/// the working directory: a cloned repository must not be able to shadow
+/// an official recipe and inherit its trust.
 fn parse_reference(reference: &str) -> Result<Source> {
     let looks_local = reference.starts_with("./")
         || reference.starts_with("../")
         || reference.starts_with('/')
-        || reference.starts_with('~')
-        || reference == ".";
-    if looks_local || Path::new(reference).join("recipe.json").is_file() {
+        || reference.starts_with("~/")
+        || reference == "."
+        || reference == "..";
+    if looks_local {
         let path = if let Some(rest) = reference.strip_prefix("~/") {
             let home = std::env::var("HOME").context("HOME is not set")?;
             PathBuf::from(home).join(rest)
@@ -134,11 +138,19 @@ fn parse_reference(reference: &str) -> Result<Source> {
         bail!("invalid recipe reference: {}", reference);
     }
     let (owner, repo, path) = match parts.len() {
-        1 => (
-            OFFICIAL_OWNER.to_string(),
-            OFFICIAL_REPO.to_string(),
-            parts[0].to_string(),
-        ),
+        1 => {
+            if Path::new(parts[0]).join("recipe.json").is_file() {
+                eprintln!(
+                    "shuru: note: ./{} has a recipe.json, but a bare name means the official catalog; pass ./{} to build the local one",
+                    parts[0], parts[0]
+                );
+            }
+            (
+                OFFICIAL_OWNER.to_string(),
+                OFFICIAL_REPO.to_string(),
+                parts[0].to_string(),
+            )
+        }
         2 => (parts[0].to_string(), parts[1].to_string(), String::new()),
         _ => (
             parts[0].to_string(),
