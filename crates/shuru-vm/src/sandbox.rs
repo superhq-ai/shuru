@@ -268,8 +268,12 @@ impl Sandbox {
     /// Graceful stop: shutdown handshake, then power off. Falls back to a
     /// plain power off when the guest does not answer.
     pub fn stop(&self) -> Result<()> {
-        if let Err(e) = self.shutdown() {
-            tracing::warn!("guest shutdown failed, powering off: {}", e);
+        // Only a running guest can answer; a VM that already died would
+        // just make the vsock connect retry until it gives up.
+        if matches!(self.vm.state(), VmState::Running) {
+            if let Err(e) = self.shutdown() {
+                tracing::warn!("guest shutdown failed, powering off: {}", e);
+            }
         }
         self.kill()
     }
