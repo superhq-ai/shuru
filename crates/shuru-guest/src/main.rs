@@ -41,7 +41,7 @@ mod guest {
             if libc::fcntl(2, libc::F_GETFD) >= 0 {
                 return;
             }
-            let fd = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
+            let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
             if fd >= 0 {
                 for t in 0..3 {
                     libc::dup2(fd, t);
@@ -226,7 +226,7 @@ mod guest {
             let copy_len = name.len().min(libc::IFNAMSIZ);
             std::ptr::copy_nonoverlapping(
                 name.as_ptr(),
-                ifr.ifr_name.as_mut_ptr() as *mut u8,
+                ifr.ifr_name.as_mut_ptr().cast::<u8>(),
                 copy_len,
             );
 
@@ -260,11 +260,7 @@ mod guest {
             // Check if eth0 exists (network device present)
             let has_eth0 = {
                 let mut ifr: libc::ifreq = std::mem::zeroed();
-                std::ptr::copy_nonoverlapping(
-                    b"eth0\0".as_ptr(),
-                    ifr.ifr_name.as_mut_ptr() as *mut u8,
-                    5,
-                );
+                std::ptr::copy_nonoverlapping(c"eth0".as_ptr(), ifr.ifr_name.as_mut_ptr(), 5);
                 libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) == 0
             };
 
@@ -277,11 +273,7 @@ mod guest {
             // Check if eth0 already has an IP (configured by initramfs)
             let has_ip = {
                 let mut ifr: libc::ifreq = std::mem::zeroed();
-                std::ptr::copy_nonoverlapping(
-                    b"eth0\0".as_ptr(),
-                    ifr.ifr_name.as_mut_ptr() as *mut u8,
-                    5,
-                );
+                std::ptr::copy_nonoverlapping(c"eth0".as_ptr(), ifr.ifr_name.as_mut_ptr(), 5);
                 libc::ioctl(sock, libc::SIOCGIFADDR as _, &mut ifr) == 0
             };
 
@@ -392,12 +384,8 @@ mod guest {
         let mut reader = stream.try_clone().expect("failed to clone stream");
         let mut writer = stream;
 
-        loop {
-            let (msg_type, payload) = match frame::read_frame(&mut reader) {
-                Ok(Some(f)) => f,
-                _ => break, // EOF or error
-            };
-
+        // Ends on EOF or a read error.
+        while let Ok(Some((msg_type, payload))) = frame::read_frame(&mut reader) {
             match msg_type {
                 frame::MOUNT_REQ => {
                     let mount_req: MountRequest = match serde_json::from_slice(&payload) {

@@ -102,7 +102,7 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {
 
 /// Serialize `msg` as JSON and send it as a typed frame.
 pub fn send_json(w: &mut impl Write, msg_type: u8, msg: &impl serde::Serialize) -> io::Result<()> {
-    let payload = serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let payload = serde_json::to_vec(msg).map_err(io::Error::other)?;
     write_frame(w, msg_type, &payload)
 }
 

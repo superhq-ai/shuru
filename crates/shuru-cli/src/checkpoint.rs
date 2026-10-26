@@ -100,7 +100,7 @@ pub(crate) fn list() -> Result<()> {
 
     checkpoints.sort_by_key(|(_, _, t, _)| *t);
 
-    println!("{:<20} {:>10} {}", "NAME", "SIZE", "CREATED");
+    println!("NAME                       SIZE CREATED");
     for (name, size, mtime, is_cas) in &checkpoints {
         let size_str = if *is_cas {
             if *size >= 1024 * 1024 {
