@@ -103,6 +103,40 @@ mod guest {
             Some("newinstance,ptmxmode=0666"),
         );
         mount_fs("tmpfs", "/tmp", "tmpfs", None);
+        // Runtime state lives on tmpfs so pid files and sockets never land in
+        // a checkpoint. A stale /run/docker.pid otherwise blocks dockerd on
+        // the next boot.
+        // Both are guest RAM, so cap them well below the VM memory.
+        mount_fs("tmpfs", "/run", "tmpfs", Some("mode=0755,size=64m"));
+        std::fs::create_dir_all("/run/lock").ok();
+        std::fs::create_dir_all("/dev/shm").ok();
+        mount_fs("tmpfs", "/dev/shm", "tmpfs", Some("mode=1777,size=256m"));
+        mount_cgroup2();
+    }
+
+    /// Unified cgroup hierarchy with every controller delegated below the
+    /// root, which is what runc and containerd expect to find.
+    fn mount_cgroup2() {
+        if !mount_fs(
+            "cgroup2",
+            "/sys/fs/cgroup",
+            "cgroup2",
+            Some("nsdelegate,memory_recursiveprot"),
+        ) {
+            return;
+        }
+        let controllers = match std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers") {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for name in controllers.split_whitespace() {
+            if let Err(e) = std::fs::write(
+                "/sys/fs/cgroup/cgroup.subtree_control",
+                format!("+{}", name),
+            ) {
+                eprintln!("shuru-guest: failed to enable cgroup controller {}: {}", name, e);
+            }
+        }
     }
 
     fn process_mount(req: &MountRequest) -> MountResponse {
