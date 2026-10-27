@@ -5,6 +5,9 @@ use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::connection::{BUFFER_SIZE, HEADER_LEN};
 
+const VRING_USED_F_NO_NOTIFY: u16 = 1;
+const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
+
 pub(super) fn invalid_queue() -> io::Error {
     io::Error::other("invalid vsock virtqueue")
 }
@@ -58,6 +61,11 @@ impl Queue {
     }
 
     pub(super) fn head(&self, mem: &GuestMemoryMmap) -> io::Result<Option<u16>> {
+        self.head_at(mem, 0)
+    }
+
+    /// The head `ahead` places after the next one, if the driver posted it.
+    pub(super) fn head_at(&self, mem: &GuestMemoryMmap, ahead: usize) -> io::Result<Option<u16>> {
         let q = self;
         let available = u16::from_le(
             mem.read_obj::<u16>(GuestAddress(q.avail_addr + 2))
@@ -68,15 +76,33 @@ impl Queue {
         if count > q.size {
             return Err(invalid_queue());
         }
-        if count == 0 {
+        if ahead >= count as usize {
             return Ok(None);
         }
-        mem.read_obj::<u16>(GuestAddress(
-            q.avail_addr + 4 + (q.next_avail % q.size) as u64 * 2,
-        ))
-        .map(u16::from_le)
-        .map(Some)
-        .map_err(|_| invalid_queue())
+        let slot = q.next_avail.wrapping_add(ahead as u16) % q.size;
+        mem.read_obj::<u16>(GuestAddress(q.avail_addr + 4 + slot as u64 * 2))
+            .map(u16::from_le)
+            .map(Some)
+            .map_err(|_| invalid_queue())
+    }
+
+    /// Asks the driver to kick, or not, when it posts buffers.
+    pub(super) fn set_notify(&self, mem: &GuestMemoryMmap, on: bool) -> io::Result<()> {
+        let flags: u16 = if on { 0 } else { VRING_USED_F_NO_NOTIFY };
+        mem.write_obj(flags.to_le(), GuestAddress(self.used_addr))
+            .map_err(|_| invalid_queue())?;
+        // The flag has to be visible before the ring is checked again.
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Whether the driver wants an interrupt for buffers already used.
+    pub(super) fn wants_interrupt(&self, mem: &GuestMemoryMmap) -> bool {
+        fence(Ordering::SeqCst);
+        mem.read_obj::<u16>(GuestAddress(self.avail_addr))
+            .map_or(true, |flags| {
+                u16::from_le(flags) & VRING_AVAIL_F_NO_INTERRUPT == 0
+            })
     }
 
     pub(super) fn descriptors(
@@ -247,6 +273,27 @@ mod tests {
         assert!(q.head(&mem).unwrap().is_none());
         mem.write_obj(9u16.to_le(), GuestAddress(0x2002)).unwrap();
         assert!(q.head(&mem).is_err());
+    }
+
+    #[test]
+    fn heads_ahead_and_notification_flags() {
+        let mem = memory();
+        let q = queue(&mem);
+        mem.write_obj(3u16.to_le(), GuestAddress(0x2002)).unwrap();
+        for (slot, head) in [4u16, 6, 1].iter().enumerate() {
+            mem.write_obj(head.to_le(), GuestAddress(0x2004 + slot as u64 * 2))
+                .unwrap();
+        }
+        assert_eq!(q.head_at(&mem, 0).unwrap(), Some(4));
+        assert_eq!(q.head_at(&mem, 2).unwrap(), Some(1));
+        assert!(q.head_at(&mem, 3).unwrap().is_none());
+        q.set_notify(&mem, false).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x3000)).unwrap(), 1);
+        q.set_notify(&mem, true).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x3000)).unwrap(), 0);
+        assert!(q.wants_interrupt(&mem));
+        mem.write_obj(1u16.to_le(), GuestAddress(0x2000)).unwrap();
+        assert!(!q.wants_interrupt(&mem));
     }
 
     #[test]

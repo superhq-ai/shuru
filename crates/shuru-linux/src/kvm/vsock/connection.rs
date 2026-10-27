@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{self, Read};
+use std::io;
 use std::net::Shutdown;
 use std::ops::Bound;
 use std::os::fd::AsRawFd;
@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 pub const HEADER_LEN: usize = 44;
 pub const BUFFER_SIZE: usize = 256 * 1024;
 pub const MAX_PACKET: usize = 64 * 1024;
+// One connection reads at most this much per turn before the next one goes.
+const MAX_TURN: usize = 128 * 1024;
 pub const MAX_CONNECTIONS: usize = 1024;
 const MAX_RESETS: usize = MAX_CONNECTIONS + 256;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -115,6 +117,71 @@ fn send(socket: &UnixStream, bytes: &[u8]) -> io::Result<usize> {
     }
 }
 
+pub fn sendv(socket: &UnixStream, iov: &[libc::iovec]) -> io::Result<usize> {
+    let message = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: iov.as_ptr().cast_mut(),
+        msg_iovlen: iov.len() as _,
+        msg_control: std::ptr::null_mut(),
+        msg_controllen: 0,
+        msg_flags: 0,
+    };
+    let n = unsafe { libc::sendmsg(socket.as_raw_fd(), &message, libc::MSG_NOSIGNAL) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+pub fn readv(socket: &UnixStream, iov: &[libc::iovec]) -> io::Result<usize> {
+    let n = unsafe { libc::readv(socket.as_raw_fd(), iov.as_ptr(), iov.len() as _) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// The guest rx buffers on offer in one pass, in queue order. Each holds at
+/// least a header.
+pub trait RxBuffers {
+    /// Payload bytes buffer `index` takes after its header, or `None` when
+    /// the guest has not posted that many.
+    fn room(&mut self, index: usize) -> Option<usize>;
+    fn put_header(&mut self, index: usize, header: Header);
+    /// Reads at most `max` bytes from `socket` straight into the payloads
+    /// of buffers `first..`, filling each to its room before the next.
+    fn recv(&mut self, socket: &UnixStream, first: usize, max: usize) -> io::Result<usize>;
+}
+
+/// The payload of one guest tx packet.
+pub trait Payload {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Sends the bytes from `offset` on to `socket` without blocking.
+    fn send(&self, socket: &UnixStream, offset: usize) -> io::Result<usize>;
+    /// Appends the bytes from `offset` on to `out`.
+    fn copy(&self, offset: usize, out: &mut VecDeque<u8>);
+}
+
+impl Payload for [u8] {
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    fn send(&self, socket: &UnixStream, offset: usize) -> io::Result<usize> {
+        send(socket, &self[offset..])
+    }
+
+    fn copy(&self, offset: usize, out: &mut VecDeque<u8>) {
+        out.extend(&self[offset..]);
+    }
+}
+
 // Host to guest data stays in the host socket until the guest posts an rx
 // buffer, so every packet is sized to the buffer that carries it.
 pub struct Connection {
@@ -156,18 +223,24 @@ impl Connection {
         }
     }
 
-    fn encode(&mut self, buf: &mut [u8], op: u16, flags: u32, len: usize) -> usize {
-        buf[..HEADER_LEN].copy_from_slice(&self.header(op, flags, len).encode());
+    // Every header tells the guest how much we forwarded, so it doubles as
+    // a credit update.
+    fn stamp(&mut self, op: u16, flags: u32, len: usize) -> Header {
         self.advertised = self.forwarded;
         self.send_credit_update = false;
-        HEADER_LEN + len
+        self.header(op, flags, len)
+    }
+
+    fn control(&mut self, buffers: &mut dyn RxBuffers, index: usize, op: u16, flags: u32) -> usize {
+        buffers.put_header(index, self.stamp(op, flags, 0));
+        1
     }
 
     fn sends_data(&self) -> bool {
         self.established && self.local_shutdown & SEND == 0 && self.peer_shutdown & RECEIVE == 0
     }
 
-    fn receive(&mut self, header: Header, payload: &[u8]) -> bool {
+    fn receive<P: Payload + ?Sized>(&mut self, header: Header, payload: &P) -> bool {
         if !self.credit.update(header) {
             return false;
         }
@@ -196,7 +269,23 @@ impl Connection {
                     return false;
                 }
                 self.received = self.received.wrapping_add(payload.len() as u32);
-                self.incoming.extend(payload);
+                let mut offset = 0;
+                // Straight from guest memory while nothing is queued ahead.
+                while self.writable && self.incoming.is_empty() && offset < payload.len() {
+                    match payload.send(&self.socket, offset) {
+                        Ok(0) => return false,
+                        Ok(n) => {
+                            offset += n;
+                            self.forwarded = self.forwarded.wrapping_add(n as u32);
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => self.writable = false,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(_) => return false,
+                    }
+                }
+                if offset < payload.len() {
+                    payload.copy(offset, &mut self.incoming);
+                }
             }
             CREDIT_UPDATE => {}
             CREDIT_REQUEST => self.send_credit_update = true,
@@ -258,32 +347,34 @@ impl Connection {
         Ok(true)
     }
 
-    fn fill(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+    // Returns how many buffers from `first` on now hold a packet.
+    fn fill(&mut self, buffers: &mut dyn RxBuffers, first: usize) -> io::Result<usize> {
         if !self.established {
             if !std::mem::take(&mut self.send_request) {
-                return Ok(None);
+                return Ok(0);
             }
-            return Ok(Some(self.encode(buf, REQUEST, 0, 0)));
+            return Ok(self.control(buffers, first, REQUEST, 0));
         }
         if self.send_shutdown != 0 {
             let flags = std::mem::take(&mut self.send_shutdown);
-            return Ok(Some(self.encode(buf, SHUTDOWN, flags, 0)));
+            return Ok(self.control(buffers, first, SHUTDOWN, flags));
         }
-        if let Some(len) = self.fill_data(buf)? {
-            return Ok(Some(len));
+        let used = self.fill_data(buffers, first)?;
+        if used > 0 {
+            return Ok(used);
         }
         if std::mem::take(&mut self.send_credit_request) {
-            return Ok(Some(self.encode(buf, CREDIT_REQUEST, 0, 0)));
+            return Ok(self.control(buffers, first, CREDIT_REQUEST, 0));
         }
         if self.send_credit_update {
-            return Ok(Some(self.encode(buf, CREDIT_UPDATE, 0, 0)));
+            return Ok(self.control(buffers, first, CREDIT_UPDATE, 0));
         }
-        Ok(None)
+        Ok(0)
     }
 
-    fn fill_data(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
-        if !self.readable || !self.sends_data() {
-            return Ok(None);
+    fn fill_data(&mut self, buffers: &mut dyn RxBuffers, first: usize) -> io::Result<usize> {
+        if !self.readable || !self.sends_data() || buffers.room(first).unwrap_or(0) == 0 {
+            return Ok(0);
         }
         let credit = self.credit.available() as usize;
         if credit == 0 {
@@ -291,27 +382,35 @@ impl Connection {
                 self.credit_requested = true;
                 self.send_credit_request = true;
             }
-            return Ok(None);
+            return Ok(0);
         }
-        let room = (buf.len() - HEADER_LEN).min(credit).min(MAX_PACKET);
-        if room == 0 {
-            return Ok(None);
-        }
-        match (&self.socket).read(&mut buf[HEADER_LEN..HEADER_LEN + room]) {
+        match buffers.recv(&self.socket, first, credit.min(MAX_TURN)) {
             Ok(0) => {
                 self.readable = false;
                 self.local_shutdown |= SEND;
-                Ok(Some(self.encode(buf, SHUTDOWN, SEND, 0)))
+                Ok(self.control(buffers, first, SHUTDOWN, SEND))
             }
             Ok(n) => {
                 self.credit.sent = self.credit.sent.wrapping_add(n as u32);
-                Ok(Some(self.encode(buf, RW, 0, n)))
+                let mut index = first;
+                let mut left = n;
+                while left > 0 {
+                    let len = buffers.room(index).unwrap_or(0).min(left);
+                    if len == 0 {
+                        break;
+                    }
+                    let header = self.stamp(RW, 0, len);
+                    buffers.put_header(index, header);
+                    left -= len;
+                    index += 1;
+                }
+                Ok(index - first)
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 self.readable = false;
-                Ok(None)
+                Ok(0)
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(0),
             Err(e) => Err(e),
         }
     }
@@ -436,7 +535,7 @@ impl Mux {
         }
     }
 
-    pub fn receive(&mut self, header: Header, payload: &[u8]) {
+    pub fn receive<P: Payload + ?Sized>(&mut self, header: Header, payload: &P) {
         if header.src_cid != GUEST_CID || header.dst_cid != HOST_CID {
             return;
         }
@@ -476,49 +575,69 @@ impl Mux {
         }
     }
 
-    // Writes the next packet into one guest rx buffer and returns its length.
-    // Connections take turns so a bulk transfer cannot starve the others.
-    pub fn fill(&mut self, buf: &mut [u8]) -> Option<usize> {
-        if buf.len() < HEADER_LEN {
-            return None;
+    /// When the earliest handshake or close times out.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.connections.values().filter_map(|c| c.deadline).min()
+    }
+
+    // Puts packets into the guest buffers on offer and returns how many it
+    // used, all from the front. Connections take turns so a bulk transfer
+    // cannot starve the others.
+    pub fn fill(&mut self, buffers: &mut dyn RxBuffers) -> usize {
+        let mut next = 0;
+        while buffers.room(next).is_some() {
+            if let Some(header) = self.resets.pop_front() {
+                buffers.put_header(next, header);
+                next += 1;
+                continue;
+            }
+            let used = self.fill_turn(buffers, next);
+            if used == 0 && self.resets.is_empty() {
+                break;
+            }
+            next += used;
         }
-        if let Some(len) = self.fill_reset(buf) {
-            return Some(len);
-        }
+        next
+    }
+
+    fn fill_turn(&mut self, buffers: &mut dyn RxBuffers, first: usize) -> usize {
         let mut port = self.last_port;
         for _ in 0..self.connections.len() {
-            port = self
+            let Some(&next) = self
                 .connections
                 .range((Bound::Excluded(port), Bound::Unbounded))
                 .next()
                 .or_else(|| self.connections.first_key_value())
-                .map(|(port, _)| *port)?;
-            match self.connections.get_mut(&port)?.fill(buf) {
-                Ok(Some(len)) => {
+                .map(|(port, _)| port)
+            else {
+                return 0;
+            };
+            port = next;
+            match self
+                .connections
+                .get_mut(&port)
+                .unwrap()
+                .fill(buffers, first)
+            {
+                Ok(0) => {}
+                Ok(used) => {
                     self.last_port = port;
-                    return Some(len);
+                    return used;
                 }
-                Ok(None) => {}
                 Err(_) => {
                     self.cancel(port);
-                    return self.fill_reset(buf);
+                    return 0;
                 }
             }
         }
-        None
-    }
-
-    fn fill_reset(&mut self, buf: &mut [u8]) -> Option<usize> {
-        let header = self.resets.pop_front()?;
-        buf[..HEADER_LEN].copy_from_slice(&header.encode());
-        Some(HEADER_LEN)
+        0
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::sync::mpsc;
 
     // Linux 6.12.114 posts rx buffers of one page minus skb overhead.
@@ -545,13 +664,67 @@ mod tests {
         }
     }
 
+    struct Buffers {
+        data: Vec<Vec<u8>>,
+        lens: Vec<usize>,
+    }
+
+    impl Buffers {
+        fn new(count: usize, size: usize) -> Self {
+            Self {
+                data: vec![vec![0; size]; count],
+                lens: vec![0; count],
+            }
+        }
+
+        fn packets(&self, used: usize) -> Vec<(Header, Vec<u8>)> {
+            (0..used)
+                .map(|i| {
+                    let header = Header::decode(&self.data[i]).unwrap();
+                    assert_eq!(header.len as usize, self.lens[i] - HEADER_LEN);
+                    (header, self.data[i][HEADER_LEN..self.lens[i]].to_vec())
+                })
+                .collect()
+        }
+    }
+
+    impl RxBuffers for Buffers {
+        fn room(&mut self, index: usize) -> Option<usize> {
+            let buffer = self.data.get(index)?;
+            Some((buffer.len() - HEADER_LEN).min(MAX_PACKET))
+        }
+
+        fn put_header(&mut self, index: usize, header: Header) {
+            self.data[index][..HEADER_LEN].copy_from_slice(&header.encode());
+            self.lens[index] = HEADER_LEN + header.len as usize;
+        }
+
+        fn recv(&mut self, socket: &UnixStream, first: usize, max: usize) -> io::Result<usize> {
+            let mut iov = Vec::new();
+            let mut left = max;
+            for index in first.. {
+                let room = self.room(index).unwrap_or(0).min(left);
+                if room == 0 {
+                    break;
+                }
+                iov.push(libc::iovec {
+                    iov_base: self.data[index][HEADER_LEN..].as_mut_ptr().cast(),
+                    iov_len: room,
+                });
+                left -= room;
+            }
+            readv(socket, &iov)
+        }
+    }
+
+    fn batch(mux: &mut Mux, count: usize, size: usize) -> Vec<(Header, Vec<u8>)> {
+        let mut buffers = Buffers::new(count, size);
+        let used = mux.fill(&mut buffers);
+        buffers.packets(used)
+    }
+
     fn next(mux: &mut Mux, size: usize) -> Option<(Header, Vec<u8>)> {
-        let mut buf = vec![0; size];
-        let len = mux.fill(&mut buf)?;
-        assert!(len <= size);
-        let header = Header::decode(&buf).unwrap();
-        assert_eq!(header.len as usize, len - HEADER_LEN);
-        Some((header, buf[HEADER_LEN..len].to_vec()))
+        batch(mux, 1, size).pop()
     }
 
     fn packet(mux: &mut Mux) -> Option<(Header, Vec<u8>)> {
@@ -561,7 +734,7 @@ mod tests {
     fn established(mux: &mut Mux) -> (u32, UnixStream) {
         let (port, host, reply) = pending(mux);
         assert_eq!(packet(mux).unwrap().0.op, REQUEST);
-        mux.receive(guest(port, RESPONSE), &[]);
+        mux.receive(guest(port, RESPONSE), &[][..]);
         reply.recv().unwrap().unwrap();
         (port, host)
     }
@@ -607,7 +780,7 @@ mod tests {
         assert_eq!(request.src_port, port);
         assert_eq!(request.op, REQUEST);
         assert!(packet(&mut mux).is_none());
-        mux.receive(guest(port, RST), &[]);
+        mux.receive(guest(port, RST), &[][..]);
         assert!(reply.recv().unwrap().is_err());
         assert!(mux.connections.is_empty());
         assert!(packet(&mut mux).is_none());
@@ -619,13 +792,13 @@ mod tests {
         for kind in [STREAM, 99] {
             let mut header = guest(5000, REQUEST);
             header.kind = kind;
-            mux.receive(header, &[]);
+            mux.receive(header, &[][..]);
             let (reset, _) = packet(&mut mux).unwrap();
             assert_eq!(reset.op, RST);
             assert_eq!(reset.kind, kind);
             assert_eq!(reset.src_port, 5000);
         }
-        mux.receive(guest(5000, RST), &[]);
+        mux.receive(guest(5000, RST), &[][..]);
         assert!(packet(&mut mux).is_none());
     }
 
@@ -660,7 +833,7 @@ mod tests {
                     fwd_cnt: received.len() as u32,
                     ..guest(port, CREDIT_UPDATE)
                 },
-                &[],
+                &[][..],
             );
             mux.wake(port, true, false);
             while let Some((header, payload)) = packet(&mut mux) {
@@ -703,7 +876,6 @@ mod tests {
     fn buffers_too_small_for_data_carry_control_only() {
         let mut mux = Mux::new();
         let (_port, _host, _reply) = pending(&mut mux);
-        assert!(next(&mut mux, HEADER_LEN - 1).is_none());
         assert_eq!(next(&mut mux, HEADER_LEN).unwrap().0.op, REQUEST);
         let mut mux = Mux::new();
         let (_port, mut host) = established(&mut mux);
@@ -721,7 +893,7 @@ mod tests {
                 buf_alloc: 3,
                 ..guest(port, CREDIT_UPDATE)
             },
-            &[],
+            &[][..],
         );
         host.write_all(b"abcdef").unwrap();
         assert_eq!(packet(&mut mux).unwrap().1, b"abc");
@@ -733,7 +905,7 @@ mod tests {
                 fwd_cnt: 3,
                 ..guest(port, CREDIT_UPDATE)
             },
-            &[],
+            &[][..],
         );
         assert_eq!(packet(&mut mux).unwrap().1, b"def");
     }
@@ -785,6 +957,7 @@ mod tests {
     fn receive_window_rejects_overrun() {
         let mut mux = Mux::new();
         let (port, _host) = established(&mut mux);
+        mux.connections.get_mut(&port).unwrap().writable = false;
         guest_data(&mut mux, port, &vec![1; BUFFER_SIZE]);
         assert_eq!(mux.connections[&port].incoming.len(), BUFFER_SIZE);
         guest_data(&mut mux, port, &[0]);
@@ -822,7 +995,7 @@ mod tests {
         let mut mux = Mux::new();
         let (port, _host) = established(&mut mux);
         for _ in 0..1000 {
-            mux.receive(guest(port, CREDIT_REQUEST), &[]);
+            mux.receive(guest(port, CREDIT_REQUEST), &[][..]);
         }
         assert_eq!(packet(&mut mux).unwrap().0.op, CREDIT_UPDATE);
         assert!(packet(&mut mux).is_none());
@@ -832,11 +1005,11 @@ mod tests {
     fn resets_are_bounded() {
         let mut mux = Mux::new();
         while mux.can_receive() {
-            mux.receive(guest(9999, REQUEST), &[]);
+            mux.receive(guest(9999, REQUEST), &[][..]);
         }
         assert_eq!(mux.resets.len(), MAX_RESETS);
         for _ in 0..100 {
-            mux.receive(guest(9999, REQUEST), &[]);
+            mux.receive(guest(9999, REQUEST), &[][..]);
         }
         assert_eq!(mux.resets.len(), MAX_RESETS);
     }
@@ -851,7 +1024,7 @@ mod tests {
                 flags: SEND,
                 ..guest(port, SHUTDOWN)
             },
-            &[],
+            &[][..],
         );
         mux.pump();
         let mut data = [0; 3];
@@ -889,7 +1062,7 @@ mod tests {
                 flags: 3,
                 ..guest(port, SHUTDOWN)
             },
-            &[],
+            &[][..],
         );
         mux.pump();
         assert_eq!(packet(&mut mux).unwrap().0.op, RST);
@@ -907,7 +1080,7 @@ mod tests {
                 flags: RECEIVE,
                 ..guest(port, SHUTDOWN)
             },
-            &[],
+            &[][..],
         );
         mux.pump();
         assert!(mux.connections[&port].deadline.is_none());
@@ -928,7 +1101,7 @@ mod tests {
                 flags: SEND,
                 ..guest(port, SHUTDOWN)
             },
-            &[],
+            &[][..],
         );
         mux.pump();
         host.shutdown(Shutdown::Write).unwrap();
@@ -952,14 +1125,14 @@ mod tests {
                 src_cid: 99,
                 ..guest(port, RST)
             },
-            &[],
+            &[][..],
         );
         mux.receive(
             Header {
                 src_port: 99,
                 ..guest(port, RST)
             },
-            &[],
+            &[][..],
         );
         assert!(mux.connections.contains_key(&port));
         mux.receive(
@@ -967,7 +1140,7 @@ mod tests {
                 len: 100,
                 ..guest(port, RW)
             },
-            &[0],
+            &[0][..],
         );
         assert!(!mux.connections.contains_key(&port));
         assert_eq!(packet(&mut mux).unwrap().0.op, RST);
@@ -992,7 +1165,7 @@ mod tests {
         let mut mux = Mux::new();
         let (port, mut host) = established(&mut mux);
         host.write_all(b"never delivered").unwrap();
-        mux.receive(guest(port, RST), &[]);
+        mux.receive(guest(port, RST), &[][..]);
         assert!(packet(&mut mux).is_none());
         assert!(host.write_all(b"more").is_err());
     }
@@ -1007,6 +1180,79 @@ mod tests {
         assert_ne!(old_port, new_port);
         mux.cancel(old_port);
         assert!(mux.connections.contains_key(&new_port));
+    }
+
+    #[test]
+    fn one_read_fills_consecutive_buffers() {
+        let mut mux = Mux::new();
+        let (port, mut host) = established(&mut mux);
+        let data: Vec<u8> = (0..5 * RX_BUFFER as u32).map(|i| (i % 251) as u8).collect();
+        host.write_all(&data).unwrap();
+        let packets = batch(&mut mux, 8, RX_BUFFER);
+        assert!(packets.len() > 1);
+        let mut received: Vec<u8> = Vec::new();
+        for (header, payload) in &packets {
+            assert_eq!((header.op, header.src_port), (RW, port));
+            assert!(HEADER_LEN + payload.len() <= RX_BUFFER);
+            received.extend(payload);
+        }
+        assert_eq!(received.len(), MAX_TURN.min(data.len()));
+        assert_eq!(received, data[..received.len()]);
+        assert_eq!(packets.last().unwrap().0.fwd_cnt, 0);
+    }
+
+    #[test]
+    fn a_turn_stops_at_the_guest_credit() {
+        let mut mux = Mux::new();
+        let (port, mut host) = established(&mut mux);
+        mux.receive(
+            Header {
+                buf_alloc: 5000,
+                ..guest(port, CREDIT_UPDATE)
+            },
+            &[][..],
+        );
+        host.write_all(&vec![3; 3 * RX_BUFFER]).unwrap();
+        let packets = batch(&mut mux, 8, RX_BUFFER);
+        let data: Vec<usize> = packets
+            .iter()
+            .filter(|(header, _)| header.op == RW)
+            .map(|(_, payload)| payload.len())
+            .collect();
+        assert_eq!(
+            data,
+            [RX_BUFFER - HEADER_LEN, 5000 - (RX_BUFFER - HEADER_LEN)]
+        );
+        assert_eq!(packets.last().unwrap().0.op, CREDIT_REQUEST);
+    }
+
+    #[test]
+    fn guest_data_goes_straight_to_a_writable_socket() {
+        let mut mux = Mux::new();
+        let (port, mut host) = established(&mut mux);
+        guest_data(&mut mux, port, b"direct");
+        assert!(mux.connections[&port].incoming.is_empty());
+        assert_eq!(mux.connections[&port].forwarded, 6);
+        let mut bytes = [0; 6];
+        host.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"direct");
+    }
+
+    #[test]
+    fn connections_take_turns_within_a_batch() {
+        let mut mux = Mux::new();
+        let (a, mut host_a) = established(&mut mux);
+        let (b, mut host_b) = established(&mut mux);
+        host_a.write_all(&vec![1; MAX_TURN + 1000]).unwrap();
+        host_b.write_all(&[2; 1000]).unwrap();
+        let turn = MAX_TURN.div_ceil(RX_BUFFER - HEADER_LEN);
+        let order: Vec<u32> = batch(&mut mux, turn + 2, RX_BUFFER)
+            .iter()
+            .map(|(header, _)| header.src_port)
+            .collect();
+        let mut expected = vec![a; turn];
+        expected.extend([b, a]);
+        assert_eq!(order, expected);
     }
 
     #[test]

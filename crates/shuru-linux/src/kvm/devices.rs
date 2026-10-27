@@ -1,25 +1,45 @@
-use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::io;
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::{fence, AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use kvm_ioctls::VmFd;
+use kvm_ioctls::{IoEventAddress, VmFd};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vmm_sys_util::eventfd::EventFd;
 
 use super::layout;
 
 // ===========================================================================
-// MMIO device trait + bus
+// MMIO device traits + bus
 // ===========================================================================
 
+/// A device whose registers are guarded as a whole.
 pub trait MmioDevice: Send {
     fn read(&mut self, offset: u64, data: &mut [u8]);
     fn write(&mut self, offset: u64, data: &[u8]);
 }
 
+/// What the bus dispatches to. Every device does its own locking, so vCPUs
+/// touching different devices never wait on each other.
+pub trait MmioHandler: Send + Sync {
+    fn read(&self, offset: u64, data: &mut [u8]);
+    fn write(&self, offset: u64, data: &[u8]);
+}
+
+impl<T: MmioDevice> MmioHandler for Mutex<T> {
+    fn read(&self, offset: u64, data: &mut [u8]) {
+        self.lock().unwrap().read(offset, data);
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) {
+        self.lock().unwrap().write(offset, data);
+    }
+}
+
 pub struct MmioEntry {
     pub base: u64,
     pub size: u64,
-    pub device: Box<dyn MmioDevice>,
+    pub device: Box<dyn MmioHandler>,
 }
 
 pub struct MmioBus {
@@ -33,12 +53,12 @@ impl MmioBus {
         }
     }
 
-    pub fn add(&mut self, base: u64, size: u64, device: Box<dyn MmioDevice>) {
+    pub fn add(&mut self, base: u64, size: u64, device: Box<dyn MmioHandler>) {
         self.devices.push(MmioEntry { base, size, device });
     }
 
-    pub fn handle_read(&mut self, addr: u64, data: &mut [u8]) {
-        for entry in &mut self.devices {
+    pub fn handle_read(&self, addr: u64, data: &mut [u8]) {
+        for entry in &self.devices {
             if addr >= entry.base && addr < entry.base + entry.size {
                 entry.device.read(addr - entry.base, data);
                 return;
@@ -49,8 +69,8 @@ impl MmioBus {
         }
     }
 
-    pub fn handle_write(&mut self, addr: u64, data: &[u8]) {
-        for entry in &mut self.devices {
+    pub fn handle_write(&self, addr: u64, data: &[u8]) {
+        for entry in &self.devices {
             if addr >= entry.base && addr < entry.base + entry.size {
                 entry.device.write(addr - entry.base, data);
                 return;
@@ -283,6 +303,7 @@ const VIRTIO_MMIO_CONFIG: u64 = 0x100;
 
 const VIRTIO_STATUS_FEATURES_OK: u32 = 8;
 const VIRTIO_STATUS_DRIVER_OK: u32 = 4;
+const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
 
 #[derive(Clone)]
 pub struct VirtioQueueState {
@@ -307,6 +328,56 @@ impl VirtioQueueState {
             last_avail_idx: 0,
         }
     }
+
+    /// Whether the driver wants an interrupt for buffers put on this used ring.
+    pub fn wants_interrupt(&self, mem: &GuestMemoryMmap) -> bool {
+        // The used index must be visible to the driver before its flag is read.
+        fence(Ordering::SeqCst);
+        mem.read_obj::<u16>(GuestAddress(self.avail_addr))
+            .map_or(true, |flags| {
+                u16::from_le(flags) & VRING_AVAIL_F_NO_INTERRUPT == 0
+            })
+    }
+}
+
+pub const INTERRUPT_USED: u32 = 1;
+pub const INTERRUPT_CONFIG: u32 = 2;
+
+/// A device interrupt line and the status register that says why it fired.
+/// Both change under one lock so an acknowledgement cannot lower the line
+/// over a reason raised in the meantime.
+pub struct Interrupt {
+    vm_fd: Arc<VmFd>,
+    irq: u32,
+    status: Mutex<u32>,
+}
+
+impl Interrupt {
+    fn new(vm_fd: Arc<VmFd>, irq: u32) -> Self {
+        Interrupt {
+            vm_fd,
+            irq,
+            status: Mutex::new(0),
+        }
+    }
+
+    pub fn raise(&self, reason: u32) {
+        let mut status = self.status.lock().unwrap();
+        *status |= reason;
+        let _ = self.vm_fd.set_irq_line(self.irq, true);
+    }
+
+    fn status(&self) -> u32 {
+        *self.status.lock().unwrap()
+    }
+
+    fn ack(&self, reasons: u32) {
+        let mut status = self.status.lock().unwrap();
+        *status &= !reasons;
+        if *status == 0 {
+            let _ = self.vm_fd.set_irq_line(self.irq, false);
+        }
+    }
 }
 
 pub trait VirtioBackend: Send {
@@ -322,66 +393,36 @@ pub trait VirtioBackend: Send {
         &mut self,
         queues: &[VirtioQueueState],
         mem: &GuestMemoryMmap,
-        vm_fd: &Arc<VmFd>,
-        irq: u32,
-        interrupt_status: Arc<AtomicU32>,
+        interrupt: Arc<Interrupt>,
     );
+    /// Returns whether any buffer went onto a used ring.
     fn process_queue(
         &mut self,
         queue_idx: u16,
         queues: &mut [VirtioQueueState],
         mem: &GuestMemoryMmap,
-        vm_fd: &Arc<VmFd>,
-        irq: u32,
-    );
+    ) -> bool;
+    /// A backend with a worker of its own takes the queue kicks, one per
+    /// queue in queue order, and the transport leaves its queues alone.
+    fn take_kicks(&mut self, _kicks: &[EventFd]) -> io::Result<bool> {
+        Ok(false)
+    }
     fn reset(&mut self);
 }
 
-pub struct VirtioMmioDevice {
+struct Core {
     backend: Box<dyn VirtioBackend>,
     queues: Vec<VirtioQueueState>,
+    mem: GuestMemoryMmap,
     dev_features_sel: u32,
     drv_features: u64,
     drv_features_sel: u32,
     queue_sel: u32,
     status: u32,
-    interrupt_status: Arc<AtomicU32>,
-    vm_fd: Arc<VmFd>,
-    mem: GuestMemoryMmap,
-    irq: u32,
     activated: bool,
 }
 
-impl VirtioMmioDevice {
-    pub fn new(
-        backend: Box<dyn VirtioBackend>,
-        spi: u32,
-        vm_fd: Arc<VmFd>,
-        mem: GuestMemoryMmap,
-    ) -> Self {
-        let queue_count = backend.queue_count();
-        let queue_max = backend.queue_max_size();
-        let queues = (0..queue_count)
-            .map(|_| VirtioQueueState::new(queue_max))
-            .collect();
-
-        VirtioMmioDevice {
-            backend,
-            queues,
-            dev_features_sel: 0,
-            drv_features: 0,
-            drv_features_sel: 0,
-            queue_sel: 0,
-            status: 0,
-            interrupt_status: Arc::new(AtomicU32::new(0)),
-            vm_fd,
-            mem,
-            // KVM_IRQ_LINE on ARM: SPI N maps to intid N+32
-            irq: layout::spi_to_irq(spi),
-            activated: false,
-        }
-    }
-
+impl Core {
     fn selected_queue(&self) -> Option<&VirtioQueueState> {
         self.queues.get(self.queue_sel as usize)
     }
@@ -391,137 +432,279 @@ impl VirtioMmioDevice {
     }
 }
 
-impl MmioDevice for VirtioMmioDevice {
-    fn read(&mut self, offset: u64, data: &mut [u8]) {
-        let val: u32 = match offset {
-            VIRTIO_MMIO_MAGIC => 0x7472_6976,
-            VIRTIO_MMIO_VERSION => 2,
-            VIRTIO_MMIO_DEVICE_ID => self.backend.device_id(),
-            VIRTIO_MMIO_VENDOR_ID => 0x554D_4551,
-            VIRTIO_MMIO_DEV_FEATURES => {
-                let features = self.backend.device_features();
-                if self.dev_features_sel == 0 {
-                    features as u32
-                } else {
-                    (features >> 32) as u32
-                }
+/// Guest kicks land on an eventfd per queue inside KVM, so a kick never
+/// leaves the kernel and never holds up the vCPU that made it. The queues
+/// are served by the backend worker or by a thread per device.
+pub struct VirtioMmioDevice {
+    core: Arc<Mutex<Core>>,
+    interrupt: Arc<Interrupt>,
+    vm_fd: Arc<VmFd>,
+    notify: IoEventAddress,
+    kicks: Vec<EventFd>,
+    stop: EventFd,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl VirtioMmioDevice {
+    pub fn new(
+        backend: Box<dyn VirtioBackend>,
+        base: u64,
+        spi: u32,
+        vm_fd: Arc<VmFd>,
+        mem: GuestMemoryMmap,
+    ) -> io::Result<Self> {
+        let queue_count = backend.queue_count();
+        let queue_max = backend.queue_max_size();
+        let mut device = VirtioMmioDevice {
+            core: Arc::new(Mutex::new(Core {
+                backend,
+                queues: (0..queue_count)
+                    .map(|_| VirtioQueueState::new(queue_max))
+                    .collect(),
+                mem,
+                dev_features_sel: 0,
+                drv_features: 0,
+                drv_features_sel: 0,
+                queue_sel: 0,
+                status: 0,
+                activated: false,
+            })),
+            // KVM_IRQ_LINE on ARM: SPI N maps to intid N+32
+            interrupt: Arc::new(Interrupt::new(vm_fd.clone(), layout::spi_to_irq(spi))),
+            vm_fd,
+            notify: IoEventAddress::Mmio(base + VIRTIO_MMIO_QUEUE_NOTIFY),
+            kicks: Vec::with_capacity(queue_count),
+            stop: EventFd::new(libc::EFD_CLOEXEC)?,
+            worker: None,
+        };
+        for index in 0..queue_count {
+            let kick = EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)?;
+            device
+                .vm_fd
+                .register_ioevent(&kick, &device.notify, index as u32)
+                .map_err(io::Error::other)?;
+            device.kicks.push(kick);
+        }
+        let owned = device
+            .core
+            .lock()
+            .unwrap()
+            .backend
+            .take_kicks(&device.kicks)?;
+        if !owned {
+            let kicks = device
+                .kicks
+                .iter()
+                .map(EventFd::try_clone)
+                .collect::<io::Result<Vec<_>>>()?;
+            let stop = device.stop.try_clone()?;
+            let core = device.core.clone();
+            let interrupt = device.interrupt.clone();
+            device.worker = Some(
+                std::thread::Builder::new()
+                    .name("shuru-virtio".into())
+                    .spawn(move || serve(core, interrupt, kicks, stop))?,
+            );
+        }
+        Ok(device)
+    }
+
+    fn kick_all(&self) {
+        for kick in &self.kicks {
+            let _ = kick.write(1);
+        }
+    }
+}
+
+fn serve(core: Arc<Mutex<Core>>, interrupt: Arc<Interrupt>, kicks: Vec<EventFd>, stop: EventFd) {
+    let mut fds: Vec<libc::pollfd> = std::iter::once(&stop)
+        .chain(&kicks)
+        .map(|event| libc::pollfd {
+            fd: event.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    loop {
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if n < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
             }
-            VIRTIO_MMIO_QUEUE_NUM_MAX => self.selected_queue().map_or(0, |q| q.max_size as u32),
-            VIRTIO_MMIO_QUEUE_READY => self.selected_queue().map_or(0, |q| q.ready as u32),
-            VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status.load(Ordering::Acquire),
-            VIRTIO_MMIO_STATUS => self.status,
-            VIRTIO_MMIO_CONFIG_GENERATION => 0,
-            o if o >= VIRTIO_MMIO_CONFIG => self.backend.config_read(o - VIRTIO_MMIO_CONFIG),
-            _ => 0,
+            return;
+        }
+        if fds[0].revents != 0 {
+            return;
+        }
+        for (index, kick) in kicks.iter().enumerate() {
+            if fds[index + 1].revents & libc::POLLIN == 0 {
+                continue;
+            }
+            let _ = kick.read();
+            let mut core = core.lock().unwrap();
+            let Core {
+                backend,
+                queues,
+                mem,
+                activated,
+                ..
+            } = &mut *core;
+            if *activated
+                && backend.process_queue(index as u16, queues, mem)
+                && queues[index].wants_interrupt(mem)
+            {
+                interrupt.raise(INTERRUPT_USED);
+            }
+        }
+    }
+}
+
+impl Drop for VirtioMmioDevice {
+    fn drop(&mut self) {
+        let _ = self.stop.write(1);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        for (index, kick) in self.kicks.iter().enumerate() {
+            let _ = self
+                .vm_fd
+                .unregister_ioevent(kick, &self.notify, index as u32);
+        }
+    }
+}
+
+impl MmioHandler for VirtioMmioDevice {
+    fn read(&self, offset: u64, data: &mut [u8]) {
+        let val: u32 = if offset == VIRTIO_MMIO_INTERRUPT_STATUS {
+            self.interrupt.status()
+        } else {
+            let core = self.core.lock().unwrap();
+            match offset {
+                VIRTIO_MMIO_MAGIC => 0x7472_6976,
+                VIRTIO_MMIO_VERSION => 2,
+                VIRTIO_MMIO_DEVICE_ID => core.backend.device_id(),
+                VIRTIO_MMIO_VENDOR_ID => 0x554D_4551,
+                VIRTIO_MMIO_DEV_FEATURES => {
+                    let features = core.backend.device_features();
+                    if core.dev_features_sel == 0 {
+                        features as u32
+                    } else {
+                        (features >> 32) as u32
+                    }
+                }
+                VIRTIO_MMIO_QUEUE_NUM_MAX => core.selected_queue().map_or(0, |q| q.max_size as u32),
+                VIRTIO_MMIO_QUEUE_READY => core.selected_queue().map_or(0, |q| q.ready as u32),
+                VIRTIO_MMIO_STATUS => core.status,
+                VIRTIO_MMIO_CONFIG_GENERATION => 0,
+                o if o >= VIRTIO_MMIO_CONFIG => core.backend.config_read(o - VIRTIO_MMIO_CONFIG),
+                _ => 0,
+            }
         };
         let len = data.len().min(4);
         data[..len].copy_from_slice(&val.to_le_bytes()[..len]);
     }
 
-    fn write(&mut self, offset: u64, data: &[u8]) {
+    fn write(&self, offset: u64, data: &[u8]) {
         let mut bytes = [0u8; 4];
         let len = data.len().min(4);
         bytes[..len].copy_from_slice(&data[..len]);
         let val = u32::from_le_bytes(bytes);
 
         match offset {
-            VIRTIO_MMIO_DEV_FEATURES_SEL => self.dev_features_sel = val,
+            VIRTIO_MMIO_INTERRUPT_ACK => return self.interrupt.ack(val),
+            // Matching kicks never get here; KVM signals the eventfd itself.
+            VIRTIO_MMIO_QUEUE_NOTIFY => return,
+            _ => {}
+        }
+
+        let mut core = self.core.lock().unwrap();
+        match offset {
+            VIRTIO_MMIO_DEV_FEATURES_SEL => core.dev_features_sel = val,
             VIRTIO_MMIO_DRV_FEATURES => {
-                if self.drv_features_sel == 0 {
-                    self.drv_features = (self.drv_features & 0xFFFF_FFFF_0000_0000) | val as u64;
+                if core.drv_features_sel == 0 {
+                    core.drv_features = (core.drv_features & 0xFFFF_FFFF_0000_0000) | val as u64;
                 } else {
-                    self.drv_features =
-                        (self.drv_features & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32);
+                    core.drv_features =
+                        (core.drv_features & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32);
                 }
             }
-            VIRTIO_MMIO_DRV_FEATURES_SEL => self.drv_features_sel = val,
-            VIRTIO_MMIO_QUEUE_SEL => self.queue_sel = val,
+            VIRTIO_MMIO_DRV_FEATURES_SEL => core.drv_features_sel = val,
+            VIRTIO_MMIO_QUEUE_SEL => core.queue_sel = val,
             VIRTIO_MMIO_QUEUE_NUM => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.size = val as u16;
                 }
             }
             VIRTIO_MMIO_QUEUE_READY => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.ready = val == 1;
                 }
             }
-            VIRTIO_MMIO_QUEUE_NOTIFY => {
-                self.backend.process_queue(
-                    val as u16,
-                    &mut self.queues,
-                    &self.mem,
-                    &self.vm_fd,
-                    self.irq,
-                );
-                self.interrupt_status.fetch_or(1, Ordering::Release);
-                let _ = self.vm_fd.set_irq_line(self.irq, true);
-            }
-            VIRTIO_MMIO_INTERRUPT_ACK => {
-                self.interrupt_status.fetch_and(!val, Ordering::AcqRel);
-                if self.interrupt_status.load(Ordering::Acquire) == 0 {
-                    let _ = self.vm_fd.set_irq_line(self.irq, false);
-                }
-            }
             VIRTIO_MMIO_STATUS => {
-                let prev = self.status;
-                self.status = val;
+                let prev = core.status;
+                core.status = val;
                 if val == 0 {
-                    self.backend.reset();
-                    self.activated = false;
-                    self.interrupt_status.store(0, Ordering::Release);
+                    core.backend.reset();
+                    core.activated = false;
+                    for q in &mut core.queues {
+                        *q = VirtioQueueState::new(q.max_size);
+                    }
+                    self.interrupt.ack(u32::MAX);
                 }
                 if (val & VIRTIO_STATUS_FEATURES_OK) != 0 && (prev & VIRTIO_STATUS_FEATURES_OK) == 0
                 {
-                    self.backend
-                        .features_ok(self.drv_features & self.backend.device_features());
+                    let features = core.drv_features & core.backend.device_features();
+                    core.backend.features_ok(features);
                 }
-                if !self.activated
+                if !core.activated
                     && (val & VIRTIO_STATUS_DRIVER_OK) != 0
                     && (val & VIRTIO_STATUS_FEATURES_OK) != 0
                 {
-                    self.activated = true;
-                    self.backend.activate(
-                        &self.queues,
-                        &self.mem,
-                        &self.vm_fd,
-                        self.irq,
-                        self.interrupt_status.clone(),
-                    );
+                    core.activated = true;
+                    let Core {
+                        backend,
+                        queues,
+                        mem,
+                        ..
+                    } = &mut *core;
+                    backend.activate(queues, mem, self.interrupt.clone());
+                    drop(core);
+                    // Anything queued before the driver finished setting up.
+                    self.kick_all();
                 }
             }
             VIRTIO_MMIO_QUEUE_DESC_LOW => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.desc_addr = (q.desc_addr & !0xFFFF_FFFF) | val as u64;
                 }
             }
             VIRTIO_MMIO_QUEUE_DESC_HIGH => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.desc_addr = (q.desc_addr & 0xFFFF_FFFF) | ((val as u64) << 32);
                 }
             }
             VIRTIO_MMIO_QUEUE_DRIVER_LOW => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.avail_addr = (q.avail_addr & !0xFFFF_FFFF) | val as u64;
                 }
             }
             VIRTIO_MMIO_QUEUE_DRIVER_HIGH => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.avail_addr = (q.avail_addr & 0xFFFF_FFFF) | ((val as u64) << 32);
                 }
             }
             VIRTIO_MMIO_QUEUE_DEVICE_LOW => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.used_addr = (q.used_addr & !0xFFFF_FFFF) | val as u64;
                 }
             }
             VIRTIO_MMIO_QUEUE_DEVICE_HIGH => {
-                if let Some(q) = self.selected_queue_mut() {
+                if let Some(q) = core.selected_queue_mut() {
                     q.used_addr = (q.used_addr & 0xFFFF_FFFF) | ((val as u64) << 32);
                 }
             }
             o if o >= VIRTIO_MMIO_CONFIG => {
-                self.backend.config_write(o - VIRTIO_MMIO_CONFIG, val);
+                core.backend.config_write(o - VIRTIO_MMIO_CONFIG, val);
             }
             _ => {}
         }
@@ -544,8 +727,12 @@ pub(super) struct VringDesc {
 }
 
 pub fn avail_idx(mem: &GuestMemoryMmap, avail_addr: u64) -> u16 {
-    mem.read_obj::<u16>(GuestAddress(avail_addr + 2))
-        .unwrap_or(0)
+    let idx = mem
+        .read_obj::<u16>(GuestAddress(avail_addr + 2))
+        .unwrap_or(0);
+    // Ring entries the index covers must not be read before the index.
+    fence(Ordering::Acquire);
+    idx
 }
 
 pub fn avail_ring_entry(mem: &GuestMemoryMmap, avail_addr: u64, queue_size: u16, idx: u16) -> u16 {
@@ -579,6 +766,7 @@ pub fn write_used(
     let ring_off = 4 + (used_idx % queue_size) as u64 * 8;
     let _ = mem.write_obj(desc_id, GuestAddress(used_addr + ring_off));
     let _ = mem.write_obj(len, GuestAddress(used_addr + ring_off + 4));
+    fence(Ordering::Release);
     let _ = mem.write_obj(used_idx.wrapping_add(1), GuestAddress(used_addr + 2));
 }
 
@@ -645,30 +833,21 @@ impl VirtioBackend for BlockBackend {
 
     fn config_write(&mut self, _: u64, _: u32) {}
 
-    fn activate(
-        &mut self,
-        _: &[VirtioQueueState],
-        _: &GuestMemoryMmap,
-        _: &Arc<VmFd>,
-        _: u32,
-        _: Arc<AtomicU32>,
-    ) {
-    }
+    fn activate(&mut self, _: &[VirtioQueueState], _: &GuestMemoryMmap, _: Arc<Interrupt>) {}
 
     fn process_queue(
         &mut self,
         _queue_idx: u16,
         queues: &mut [VirtioQueueState],
         mem: &GuestMemoryMmap,
-        _vm_fd: &Arc<VmFd>,
-        _irq: u32,
-    ) {
+    ) -> bool {
         let q = match queues.get_mut(0) {
             Some(q) if q.ready => q,
-            _ => return,
+            _ => return false,
         };
 
         let current_avail = avail_idx(mem, q.avail_addr);
+        let used = q.last_avail_idx != current_avail;
 
         while q.last_avail_idx != current_avail {
             let head = avail_ring_entry(mem, q.avail_addr, q.size, q.last_avail_idx);
@@ -746,6 +925,7 @@ impl VirtioBackend for BlockBackend {
             );
             q.last_avail_idx = q.last_avail_idx.wrapping_add(1);
         }
+        used
     }
 
     fn reset(&mut self) {}
@@ -806,9 +986,7 @@ impl VirtioBackend for NetBackend {
         &mut self,
         queues: &[VirtioQueueState],
         mem: &GuestMemoryMmap,
-        vm_fd: &Arc<VmFd>,
-        irq: u32,
-        interrupt_status: Arc<AtomicU32>,
+        interrupt: Arc<Interrupt>,
     ) {
         // Set fd to non-blocking
         unsafe {
@@ -826,13 +1004,12 @@ impl VirtioBackend for NetBackend {
         let running = self.rx_running.clone();
         let fd = self.fd;
         let mem = mem.clone();
-        let vm_fd = vm_fd.clone();
 
         self.rx_thread = Some(
             std::thread::Builder::new()
                 .name("shuru-net-rx".into())
                 .spawn(move || {
-                    net_rx_loop(fd, mem, rx_q, vm_fd, irq, interrupt_status, running);
+                    net_rx_loop(fd, mem, rx_q, interrupt, running);
                 })
                 .expect("failed to spawn net-rx thread"),
         );
@@ -843,18 +1020,17 @@ impl VirtioBackend for NetBackend {
         queue_idx: u16,
         queues: &mut [VirtioQueueState],
         mem: &GuestMemoryMmap,
-        _vm_fd: &Arc<VmFd>,
-        _irq: u32,
-    ) {
+    ) -> bool {
         if queue_idx != 1 {
-            return; // RX handled by thread
+            return false; // RX handled by thread
         }
         let q = match queues.get_mut(1) {
             Some(q) if q.ready => q,
-            _ => return,
+            _ => return false,
         };
 
         let current_avail = avail_idx(mem, q.avail_addr);
+        let used = q.last_avail_idx != current_avail;
         while q.last_avail_idx != current_avail {
             let head = avail_ring_entry(mem, q.avail_addr, q.size, q.last_avail_idx);
 
@@ -886,6 +1062,7 @@ impl VirtioBackend for NetBackend {
             write_used(mem, q.used_addr, q.size, q.last_avail_idx, head as u32, 0);
             q.last_avail_idx = q.last_avail_idx.wrapping_add(1);
         }
+        used
     }
 
     fn reset(&mut self) {
@@ -907,9 +1084,7 @@ fn net_rx_loop(
     fd: RawFd,
     mem: GuestMemoryMmap,
     rx_q: VirtioQueueState,
-    vm_fd: Arc<VmFd>,
-    irq: u32,
-    interrupt_status: Arc<AtomicU32>,
+    interrupt: Arc<Interrupt>,
     running: Arc<AtomicBool>,
 ) {
     let mut last_avail = rx_q.last_avail_idx;
@@ -963,9 +1138,9 @@ fn net_rx_loop(
             used_idx = used_idx.wrapping_add(1);
             last_avail = last_avail.wrapping_add(1);
 
-            // Signal the guest
-            interrupt_status.fetch_or(1, Ordering::Release);
-            let _ = vm_fd.set_irq_line(irq, true);
+            if rx_q.wants_interrupt(&mem) {
+                interrupt.raise(INTERRUPT_USED);
+            }
         }
     }
 }

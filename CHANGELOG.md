@@ -15,10 +15,23 @@ The Linux backend now emulates virtio-vsock in the VMM instead of using
 vhost-vsock. Each VM has its own device and its own CID space, the host end
 of every connection is a socketpair inside the shuru process, and no other
 process on the host can reach the guest agent. Host data stays in that
-socket until the guest posts a receive buffer, then goes straight into it,
-sized to the buffer and to the credit the guest grants, so nothing queues
-in the VMM. Connections opened by the guest are refused. The vhost_vsock
-module is no longer needed.
+socket until the guest posts receive buffers, then one read puts it
+straight into guest memory across as many buffers as the credit the guest
+grants allows, so nothing queues in the VMM. Guest data goes from guest
+memory to the socket in one write and is only copied when the socket is
+full. Connections opened by the guest are refused. The vhost_vsock module
+is no longer needed.
+
+### Linux: devices no longer share a lock
+
+Every virtio device used to sit behind one lock, and disk and shared folder
+requests ran on the vCPU that rang the doorbell while holding it, so one
+busy device stalled every vCPU touching any other. Each device now has its
+own lock and its own thread. Doorbells go to an eventfd inside KVM, so
+ringing one no longer exits to the VMM, and interrupts fire only when
+buffers were used and the guest asked for them. Raising and acknowledging
+an interrupt now happen under one lock, which closes a window where an
+acknowledgement could lower the line over a newly raised reason.
 
 ### The guest checks who is connecting
 
@@ -33,13 +46,15 @@ without a token stops. The token is redacted from `--verbose` and
 The protocol version is 2. An OS image older than this release does not
 answer the hello, and `shuru upgrade` fetches the matching one.
 
-Measured on a1.metal against 0.9.3 on the same host:
+Measured on a1.metal against 0.9.3 on the same host, three runs each:
 
 | | 0.9.3 (vhost) | 0.10.0 |
 |---|---|---|
-| exec round trip p50 | 1.7 ms | 1.9 ms |
-| guest to host, 128 MB | 135 to 165 MB/s | 169 to 178 MB/s |
-| host to guest, 128 MB | 355 to 367 MB/s | 296 to 298 MB/s |
+| exec round trip p50 | 1.6 ms | 1.8 ms |
+| 16 parallel execs | 35 ms | 36 ms |
+| guest to host, 128 MB | 117 to 191 MB/s | 434 to 451 MB/s |
+| host to guest, 128 MB | 353 to 366 MB/s | 315 to 360 MB/s |
+| shared folder read, 128 MB | 241 to 245 MB/s | 343 to 384 MB/s |
 
 ### Crates
 
@@ -47,7 +62,9 @@ Measured on a1.metal against 0.9.3 on the same host:
   frames, protocol version 2.
 - `shuru-linux` 0.4.0: breaking. Userspace virtio-vsock,
   `VirtualMachine::new` returns a `Result`, `GUEST_CID` and `AF_VSOCK` are
-  gone.
+  gone. `kvm::devices`: the bus dispatches to `MmioHandler`, devices take
+  an `Interrupt`, and `VirtioBackend::process_queue` returns whether it
+  used a buffer.
 - `shuru-vm` 0.6.0 and `shuru-sdk` 0.8.0: the hello on every connection.
   They need a 0.10.0 OS image.
 - `shuru-guest` 0.5.0.

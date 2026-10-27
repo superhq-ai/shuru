@@ -16,13 +16,14 @@ use std::ffi::{CStr, CString, OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use kvm_ioctls::VmFd;
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
-use super::devices::{avail_idx, avail_ring_entry, write_used, VirtioBackend, VirtioQueueState};
+use super::devices::{
+    avail_idx, avail_ring_entry, write_used, Interrupt, VirtioBackend, VirtioQueueState,
+};
 
 // ===========================================================================
 // FUSE wire protocol (subset)
@@ -764,49 +765,39 @@ impl VirtioBackend for VirtioFsBackend {
 
     fn config_write(&mut self, _: u64, _: u32) {}
 
-    fn activate(
-        &mut self,
-        _queues: &[VirtioQueueState],
-        _mem: &GuestMemoryMmap,
-        _vm_fd: &Arc<VmFd>,
-        _irq: u32,
-        _interrupt_status: Arc<AtomicU32>,
-    ) {
-    }
+    fn activate(&mut self, _: &[VirtioQueueState], _: &GuestMemoryMmap, _: Arc<Interrupt>) {}
 
     fn process_queue(
         &mut self,
-        _queue_idx: u16,
+        queue_idx: u16,
         queues: &mut [VirtioQueueState],
         mem: &GuestMemoryMmap,
-        _vm_fd: &Arc<VmFd>,
-        _irq: u32,
-    ) {
+    ) -> bool {
         // Both queues (hiprio = 0, request = 1) are handled the same way.
-        for q_idx in 0..queues.len() {
-            let q = match queues.get_mut(q_idx) {
-                Some(q) if q.ready && q.size > 0 => q,
-                _ => continue,
-            };
+        let q = match queues.get_mut(usize::from(queue_idx)) {
+            Some(q) if q.ready && q.size > 0 => q,
+            _ => return false,
+        };
 
-            let current_avail = avail_idx(mem, q.avail_addr);
-            while q.last_avail_idx != current_avail {
-                let head = avail_ring_entry(mem, q.avail_addr, q.size, q.last_avail_idx);
-                let spans = collect_desc_chain(mem, q.desc_addr, head, q.size);
+        let current_avail = avail_idx(mem, q.avail_addr);
+        let used = q.last_avail_idx != current_avail;
+        while q.last_avail_idx != current_avail {
+            let head = avail_ring_entry(mem, q.avail_addr, q.size, q.last_avail_idx);
+            let spans = collect_desc_chain(mem, q.desc_addr, head, q.size);
 
-                let written = self.handle_request(mem, &spans);
+            let written = self.handle_request(mem, &spans);
 
-                write_used(
-                    mem,
-                    q.used_addr,
-                    q.size,
-                    q.last_avail_idx,
-                    head as u32,
-                    written,
-                );
-                q.last_avail_idx = q.last_avail_idx.wrapping_add(1);
-            }
+            write_used(
+                mem,
+                q.used_addr,
+                q.size,
+                q.last_avail_idx,
+                head as u32,
+                written,
+            );
+            q.last_avail_idx = q.last_avail_idx.wrapping_add(1);
         }
+        used
     }
 
     fn reset(&mut self) {
