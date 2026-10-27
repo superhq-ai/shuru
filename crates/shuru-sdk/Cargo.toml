@@ -1,6 +1,6 @@
 [package]
 name = "shuru-sdk"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "Async Rust SDK for Shuru microVMs"
 license = "Apache-2.0"
@@ -11,7 +11,7 @@ default = []
 cas = ["shuru-store", "blake3"]
 
 [dependencies]
-shuru-vm = { version = "0.5.1", path = "../shuru-vm" }
+shuru-vm = { version = "0.5.2", path = "../shuru-vm" }
 shuru-proto = { version = "0.4.0", path = "../shuru-proto" }
 shuru-proxy = { version = "0.4.0", path = "../shuru-proxy" }
 shuru-store = { version = "0.1.1", path = "../shuru-store", optional = true }
@@ -20,3 +20,6 @@ anyhow = "1"
 blake3 = { version = "1", optional = true }
 libc = "0.2"
 tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

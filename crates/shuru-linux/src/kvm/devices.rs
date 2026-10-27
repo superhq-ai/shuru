@@ -317,6 +317,8 @@ pub trait VirtioBackend: Send {
     fn queue_max_size(&self) -> u16;
     fn config_read(&self, offset: u64) -> u32;
     fn config_write(&mut self, offset: u64, value: u32);
+    /// The feature set the driver accepted, once it sets FEATURES_OK.
+    fn features_ok(&mut self, _features: u64) {}
     fn activate(
         &mut self,
         queues: &[VirtioQueueState],
@@ -463,11 +465,17 @@ impl MmioDevice for VirtioMmioDevice {
                 }
             }
             VIRTIO_MMIO_STATUS => {
+                let prev = self.status;
                 self.status = val;
                 if val == 0 {
                     self.backend.reset();
                     self.activated = false;
                     self.interrupt_status.store(0, Ordering::Release);
+                }
+                if (val & VIRTIO_STATUS_FEATURES_OK) != 0 && (prev & VIRTIO_STATUS_FEATURES_OK) == 0
+                {
+                    self.backend
+                        .features_ok(self.drv_features & self.backend.device_features());
                 }
                 if !self.activated
                     && (val & VIRTIO_STATUS_DRIVER_OK) != 0
@@ -525,15 +533,15 @@ impl MmioDevice for VirtioMmioDevice {
 // Virtio descriptor chain helpers
 // ===========================================================================
 
-const VRING_DESC_F_NEXT: u16 = 1;
+pub(super) const VRING_DESC_F_NEXT: u16 = 1;
 const VRING_DESC_F_WRITE: u16 = 2;
 
 #[derive(Clone, Copy)]
-struct VringDesc {
-    addr: u64,
-    len: u32,
-    flags: u16,
-    next: u16,
+pub(super) struct VringDesc {
+    pub(super) addr: u64,
+    pub(super) len: u32,
+    pub(super) flags: u16,
+    pub(super) next: u16,
 }
 
 pub fn avail_idx(mem: &GuestMemoryMmap, avail_addr: u64) -> u16 {
@@ -547,7 +555,7 @@ pub fn avail_ring_entry(mem: &GuestMemoryMmap, avail_addr: u64, queue_size: u16,
         .unwrap_or(0)
 }
 
-fn read_desc(mem: &GuestMemoryMmap, desc_addr: u64, idx: u16) -> VringDesc {
+pub(super) fn read_desc(mem: &GuestMemoryMmap, desc_addr: u64, idx: u16) -> VringDesc {
     let off = idx as u64 * 16;
     VringDesc {
         addr: mem.read_obj(GuestAddress(desc_addr + off)).unwrap_or(0),
@@ -586,7 +594,7 @@ const VIRTIO_BLK_T_IN: u32 = 0;
 const VIRTIO_BLK_T_OUT: u32 = 1;
 const VIRTIO_BLK_S_OK: u8 = 0;
 const VIRTIO_BLK_S_IOERR: u8 = 1;
-const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+pub(super) const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
 pub struct BlockBackend {
     disk: File,

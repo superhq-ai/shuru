@@ -25,6 +25,7 @@ pub(crate) struct ConfigData {
     pub network_mac: Option<[u8; 6]>,
     pub has_socket: bool,
     pub mounts: Vec<(String, String, bool)>, // (tag, host_path, read_only)
+    pub has_balloon: bool,
 }
 
 pub struct VirtualMachineConfiguration {
@@ -52,6 +53,7 @@ impl VirtualMachineConfiguration {
                 network_mac: None,
                 has_socket: false,
                 mounts: Vec::new(),
+                has_balloon: false,
             }),
         }
     }
@@ -119,8 +121,8 @@ impl VirtualMachineConfiguration {
         // Entropy device is a no-op on KVM — /dev/urandom is available.
     }
 
-    pub fn set_memory_balloon_devices(&self, _devices: &[VirtioMemoryBalloonDevice]) {
-        // Memory balloon is not yet implemented for KVM.
+    pub fn set_memory_balloon_devices(&self, devices: &[VirtioMemoryBalloonDevice]) {
+        self.inner.borrow_mut().has_balloon = !devices.is_empty();
     }
 
     pub fn validate(&self) -> Result<()> {

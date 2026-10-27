@@ -222,6 +222,7 @@ impl VmConfigBuilder {
         config.set_socket_devices(&[socket_device]);
 
         config.set_entropy_devices(&[VirtioEntropyDevice::new()]);
+        config.set_memory_balloon_devices(&[VirtioMemoryBalloonDevice::new()]);
 
         config
             .validate()
@@ -290,6 +291,16 @@ impl Sandbox {
         self.vm
             .stop()
             .map_err(|e| anyhow::anyhow!("Failed to stop VM: {}", e))
+    }
+
+    /// How much memory the guest keeps, in bytes. The guest hands the rest
+    /// back to the host through the balloon device and gets it back when
+    /// the target rises again. On a Linux host the guest also reports free
+    /// pages on its own, so idle memory returns without a target.
+    pub fn set_memory_target(&self, bytes: u64) -> Result<()> {
+        self.vm
+            .set_memory_target(bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to set memory target: {}", e))
     }
 
     /// Block until the guest control server accepts vsock connections.

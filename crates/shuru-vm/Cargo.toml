@@ -1,6 +1,6 @@
 [package]
 name = "shuru-vm"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "High-level VM management for shuru"
 license = "Apache-2.0"
@@ -16,6 +16,6 @@ tracing = "0.1"
 socket2 = "0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-shuru-darwin = { version = "0.2.1", path = "../shuru-darwin" }
+shuru-darwin = { version = "0.2.2", path = "../shuru-darwin" }
 [target.'cfg(target_os = "linux")'.dependencies]
-shuru-linux = { version = "0.3.1", path = "../shuru-linux" }
+shuru-linux = { version = "0.3.2", path = "../shuru-linux" }

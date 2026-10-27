@@ -1,5 +1,6 @@
-/// Placeholder — memory balloon is not yet implemented for KVM.
-/// Kept for API compatibility with shuru-darwin.
+/// A virtio memory balloon. The guest reports free pages back to the host
+/// on its own, and `VirtualMachine::set_memory_target` can ask it to give
+/// up more.
 pub struct VirtioMemoryBalloonDevice;
 
 impl VirtioMemoryBalloonDevice {
