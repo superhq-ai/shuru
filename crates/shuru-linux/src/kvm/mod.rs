@@ -2,6 +2,7 @@ pub mod balloon;
 pub mod devices;
 pub mod layout;
 pub mod virtio_fs;
+pub mod vsock;
 
 use std::fs::File;
 use std::io::Read;
@@ -35,7 +36,7 @@ pub struct KvmVm {
     pub vcpus: Vec<VcpuFd>,
     pub vcpu_threads: Vec<std::thread::JoinHandle<()>>,
     pub running: Arc<AtomicBool>,
-    pub guest_cid: u64,
+    pub vsock: Option<Arc<vsock::VsockControl>>,
     pub balloon: Option<Arc<balloon::BalloonControl>>,
     #[allow(dead_code)]
     _gic: DeviceFd,
@@ -54,7 +55,6 @@ pub struct VmCreateConfig {
     pub network_fd: Option<i32>,
     pub network_mac: Option<[u8; 6]>,
     pub has_vsock: bool,
-    pub guest_cid: u64,
     /// Virtio-fs mounts: (tag, host_path, read_only).
     pub mounts: Vec<(String, String, bool)>,
     pub has_balloon: bool,
@@ -155,16 +155,18 @@ impl KvmVm {
             virtio_idx += 1;
         }
 
-        // Vhost-vsock
-        let guest_cid = config.guest_cid;
+        let mut vsock_control = None;
         if config.has_vsock {
+            let backend = vsock::VsockBackend::new()
+                .map_err(|e| VzError::new(format!("failed to create vsock device: {e}")))?;
+            vsock_control = Some(backend.control());
             let spi = VIRTIO_SPI_BASE + virtio_idx;
             let base = VIRTIO_MMIO_BASE + (virtio_idx as u64) * VIRTIO_MMIO_GAP;
             bus.add(
                 base,
                 VIRTIO_MMIO_SIZE,
                 Box::new(VirtioMmioDevice::new(
-                    Box::new(VhostVsockBackend::new(guest_cid)),
+                    Box::new(backend),
                     spi,
                     vm_fd.clone(),
                     mem.clone(),
@@ -280,7 +282,7 @@ impl KvmVm {
             vcpus,
             vcpu_threads: Vec::new(),
             running: Arc::new(AtomicBool::new(false)),
-            guest_cid,
+            vsock: vsock_control,
             balloon: balloon_control,
             _gic: gic,
         })
@@ -314,6 +316,9 @@ impl KvmVm {
         }
         for handle in self.vcpu_threads.drain(..) {
             let _ = handle.join();
+        }
+        if let Some(vsock) = &self.vsock {
+            vsock.deactivate();
         }
     }
 }

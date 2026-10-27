@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.10.0
+
+### Linux: a VM can no longer reach another VM
+
+On a Linux host every VM asked vhost-vsock for guest CID 3. vhost CIDs are
+global to the host kernel, so the second VM got EADDRINUSE, the error was
+printed and ignored, and its host side connected to CID 3 anyway: the first
+VM. Reproduced on a1.metal with 0.9.3, a second `shuru run` executed inside
+the first sandbox and printed its marker file and kernel boot_id. macOS was
+not affected.
+
+The Linux backend now emulates virtio-vsock in the VMM instead of using
+vhost-vsock. Each VM has its own device and its own CID space, the host end
+of every connection is a socketpair inside the shuru process, and no other
+process on the host can reach the guest agent. Host data stays in that
+socket until the guest posts a receive buffer, then goes straight into it,
+sized to the buffer and to the credit the guest grants, so nothing queues
+in the VMM. Connections opened by the guest are refused. The vhost_vsock
+module is no longer needed.
+
+### The guest checks who is connecting
+
+Every boot gets a random 32 byte token and a 16 byte instance id on the
+kernel command line. The guest agent requires the token as the first frame
+of every connection, on the control channel and on port forwards, and
+answers with the instance id, which the host checks. A connection that
+reaches the wrong VM is refused instead of served, and a guest booted
+without a token stops. The token is redacted from `--verbose` and
+`--console` output. This applies on macOS too.
+
+The protocol version is 2. An OS image older than this release does not
+answer the hello, and `shuru upgrade` fetches the matching one.
+
+Measured on a1.metal against 0.9.3 on the same host:
+
+| | 0.9.3 (vhost) | 0.10.0 |
+|---|---|---|
+| exec round trip p50 | 1.7 ms | 1.9 ms |
+| guest to host, 128 MB | 135 to 165 MB/s | 169 to 178 MB/s |
+| host to guest, 128 MB | 355 to 367 MB/s | 296 to 298 MB/s |
+
+### Crates
+
+- `shuru-proto` 0.5.0: `hello::Identity`, the `HELLO` and `HELLO_OK`
+  frames, protocol version 2.
+- `shuru-linux` 0.4.0: breaking. Userspace virtio-vsock,
+  `VirtualMachine::new` returns a `Result`, `GUEST_CID` and `AF_VSOCK` are
+  gone.
+- `shuru-vm` 0.6.0 and `shuru-sdk` 0.8.0: the hello on every connection.
+  They need a 0.10.0 OS image.
+- `shuru-guest` 0.5.0.
+
 ## 0.9.3
 
 ### Guest memory goes back to the host

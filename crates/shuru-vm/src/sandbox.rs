@@ -142,28 +142,42 @@ impl VmConfigBuilder {
             boot_loader.set_initrd(initrd);
         }
 
+        let mut identity = shuru_proto::hello::Identity {
+            token: [0; 32],
+            instance: [0; 16],
+        };
+        getrandom::fill(&mut identity.token)
+            .map_err(|_| anyhow::anyhow!("failed to generate guest token"))?;
+        getrandom::fill(&mut identity.instance)
+            .map_err(|_| anyhow::anyhow!("failed to generate guest instance"))?;
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let token = hex(&identity.token);
         let cmdline = if self.verbose {
             "console=hvc0 root=/dev/vda rw init=/usr/bin/shuru-init"
         } else {
             "console=hvc0 root=/dev/vda rw init=/usr/bin/shuru-init quiet"
         };
-        boot_loader.set_command_line(cmdline);
+        boot_loader.set_command_line(&format!(
+            "{cmdline} shuru.token={token} shuru.instance={}",
+            hex(&identity.instance)
+        ));
 
         let memory_bytes = self.memory_mb * 1024 * 1024;
         let config = VirtualMachineConfiguration::new(&boot_loader, self.cpus, memory_bytes);
 
-        let dev_null; // keep the File alive so the fd stays valid
-        let serial_attachment = if self.console {
-            FileHandleSerialAttachment::new(
-                std::io::stdin().as_raw_fd(),
-                std::io::stdout().as_raw_fd(),
-            )
-        } else if self.verbose {
-            FileHandleSerialAttachment::new_write_only(std::io::stderr().as_raw_fd())
+        let serial_output: std::os::fd::OwnedFd = if self.console || self.verbose {
+            crate::serial::output(token, self.console)?.into()
         } else {
-            dev_null = std::fs::File::open("/dev/null")
-                .map_err(|e| anyhow::anyhow!("failed to open /dev/null: {}", e))?;
-            FileHandleSerialAttachment::new_write_only(dev_null.as_raw_fd())
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")?
+                .into()
+        };
+        let output_fd = serial_output.as_raw_fd();
+        let serial_attachment = if self.console {
+            FileHandleSerialAttachment::new(std::io::stdin().as_raw_fd(), output_fd)
+        } else {
+            FileHandleSerialAttachment::new_write_only(output_fd)
         };
         let serial = VirtioConsoleSerialPort::new_with_attachment(&serial_attachment);
         config.set_serial_ports(&[serial]);
@@ -228,8 +242,16 @@ impl VmConfigBuilder {
             .validate()
             .map_err(|e| anyhow::anyhow!("VM configuration invalid: {}", e))?;
 
+        #[cfg(target_os = "linux")]
+        let machine = VirtualMachine::new(&config)?;
+        #[cfg(target_os = "macos")]
+        let machine = VirtualMachine::new(&config);
         Ok(Sandbox {
-            vm: Arc::new(VirtualMachine::new(&config)),
+            vm: Arc::new(GuestVm {
+                machine,
+                identity,
+                _serial_output: serial_output,
+            }),
             mounts: Mutex::new(mount_requests),
         })
     }
@@ -238,7 +260,7 @@ impl VmConfigBuilder {
 // --- Sandbox ---
 
 pub struct Sandbox {
-    vm: Arc<VirtualMachine>,
+    vm: Arc<GuestVm>,
     mounts: Mutex<Vec<MountRequest>>,
 }
 
@@ -942,8 +964,28 @@ impl Sandbox {
     }
 
     fn connect_vsock(&self) -> Result<TcpStream> {
-        let state_rx = self.vm.state_channel();
-        for attempt in 1..=1000 {
+        self.vm.connect_to_vsock_port(VSOCK_PORT)
+    }
+}
+
+struct GuestVm {
+    machine: VirtualMachine,
+    identity: shuru_proto::hello::Identity,
+    _serial_output: std::os::fd::OwnedFd,
+}
+
+impl std::ops::Deref for GuestVm {
+    type Target = VirtualMachine;
+    fn deref(&self) -> &Self::Target {
+        &self.machine
+    }
+}
+
+impl GuestVm {
+    fn connect_to_vsock_port(&self, port: u32) -> Result<TcpStream> {
+        let state_rx = self.machine.state_channel();
+        let attempts = if port == VSOCK_PORT { 1000 } else { 1 };
+        for attempt in 1..=attempts {
             // Check if VM died (e.g. guest mount failure -> reboot POWER_OFF)
             if let Ok(state) = state_rx.try_recv() {
                 match state {
@@ -954,13 +996,22 @@ impl Sandbox {
                     _ => {}
                 }
             }
-            match self.vm.connect_to_vsock_port(VSOCK_PORT) {
-                Ok(s) => {
+            match self.machine.connect_to_vsock_port(port) {
+                Ok(mut s) => {
                     let _ = s.set_nodelay(true);
+                    let timeout = Some(Duration::from_secs(2));
+                    s.set_read_timeout(timeout)?;
+                    s.set_write_timeout(timeout)?;
+                    self.identity.connect(&mut s).context(
+                        "the guest did not answer the connection hello; \
+                         its image is likely older than this shuru, run `shuru upgrade`",
+                    )?;
+                    s.set_read_timeout(None)?;
+                    s.set_write_timeout(None)?;
                     return Ok(s);
                 }
                 Err(e) => {
-                    if attempt == 1000 {
+                    if attempt == attempts {
                         bail!(
                             "Failed to connect to guest after {} attempts: {}",
                             attempt,
@@ -1016,11 +1067,7 @@ impl Drop for PortForwardHandle {
     }
 }
 
-fn handle_forward_connection(
-    tcp_stream: TcpStream,
-    vm: &VirtualMachine,
-    guest_port: u16,
-) -> Result<()> {
+fn handle_forward_connection(tcp_stream: TcpStream, vm: &GuestVm, guest_port: u16) -> Result<()> {
     let vsock_stream = open_forward_stream(vm, guest_port)?;
     // Bidirectional relay between TCP and vsock
     relay(tcp_stream, vsock_stream);
@@ -1030,7 +1077,7 @@ fn handle_forward_connection(
 /// Open a vsock forward channel to a TCP port inside the guest and complete
 /// the forward handshake, returning the connected stream. The stream is a raw
 /// bidirectional pipe to `127.0.0.1:guest_port` inside the guest.
-fn open_forward_stream(vm: &VirtualMachine, guest_port: u16) -> Result<TcpStream> {
+fn open_forward_stream(vm: &GuestVm, guest_port: u16) -> Result<TcpStream> {
     let mut vsock_stream = vm
         .connect_to_vsock_port(VSOCK_PORT_FORWARD)
         .map_err(|e| anyhow::anyhow!("vsock connect for port forward: {}", e))?;

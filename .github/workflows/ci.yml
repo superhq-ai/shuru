@@ -37,3 +37,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p shuru-cli
+
+  linux-test:
+    name: Linux tests
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p shuru-proto -p shuru-linux -p shuru-vm -p shuru-guest

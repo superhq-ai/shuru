@@ -1629,7 +1629,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shuru-cli"
-version = "0.9.3"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1665,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "shuru-guest"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "flate2",
  "ignore",
@@ -1679,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "shuru-linux"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "crossbeam-channel",
  "kvm-bindings",
@@ -1693,10 +1693,11 @@ dependencies = [
 
 [[package]]
 name = "shuru-proto"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
+ "subtle",
 ]
 
 [[package]]
@@ -1724,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "shuru-sdk"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1751,10 +1752,11 @@ dependencies = [
 
 [[package]]
 name = "shuru-vm"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
  "shuru-darwin",

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod sandbox;
+mod serial;
 mod workdisk;
 
 pub use sandbox::{MountConfig, PortForwardHandle, Sandbox, VmConfigBuilder};
