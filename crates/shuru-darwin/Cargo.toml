@@ -1,6 +1,6 @@
 [package]
 name = "shuru-darwin"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Virtualization.framework bindings for shuru"
 license = "Apache-2.0"
@@ -27,5 +27,7 @@ objc2-virtualization = { version = "0.3", features = [
     "dispatch2",
     "VZFileHandleNetworkDeviceAttachment",
     "VZNetworkBlockDeviceStorageDeviceAttachment",
+    "VZMemoryBalloonDevice",
+    "VZVirtioTraditionalMemoryBalloonDevice",
 ] }
 

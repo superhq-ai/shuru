@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.9.3
+
+### Guest memory goes back to the host
+
+Every VM now carries a virtio memory balloon (RFC 0006). On a Linux host
+the guest kernel reports the pages it has freed and the host discards
+them, so an idle sandbox costs what the guest is using, not what it has
+touched since boot. Measured on a1.metal: a guest that filled and freed
+1 GB took the host process from 1109 MB resident back to 87 MB within
+seven seconds, with nobody asking.
+
+A caller can also set a memory target. The guest gives up the difference
+through the balloon and takes it back when the target rises, on Linux and
+on macOS. `shuru run` is unchanged.
+
+### Crates
+
+- `shuru-linux` 0.3.2: the balloon backend, `set_memory_target` and
+  `ballooned_bytes` on `VirtualMachine`.
+- `shuru-darwin` 0.2.2: `set_memory_target` through the framework balloon.
+- `shuru-vm` 0.5.2: the balloon is attached on both platforms;
+  `Sandbox::set_memory_target`.
+- `shuru-sdk` 0.7.1: `AsyncSandbox::set_memory_target` and the `balloon`
+  example.
+
 ## 0.9.2
 
 ### The working disk can no longer outlive its run

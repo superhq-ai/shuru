@@ -48,6 +48,7 @@ impl VirtualMachine {
             has_vsock: inner.has_socket,
             guest_cid: layout::GUEST_CID,
             mounts: inner.mounts.clone(),
+            has_balloon: inner.has_balloon,
         };
 
         match kvm::KvmVm::create(create_config) {
@@ -121,6 +122,29 @@ impl VirtualMachine {
         self.running.store(false, Ordering::Release);
         let _ = self.state_tx.try_send(VmState::Stopped);
         Ok(())
+    }
+
+    /// How much memory the guest should keep. The balloon driver in the
+    /// guest hands the rest to the host, and gets it back when the target
+    /// rises again. Fails without a balloon device.
+    pub fn set_memory_target(&self, bytes: u64) -> Result<()> {
+        let vm = self.vm.lock().unwrap();
+        let control = vm
+            .as_ref()
+            .and_then(|v| v.balloon.clone())
+            .ok_or_else(|| VzError::new("no memory balloon device"))?;
+        control.set_memory_target(bytes);
+        Ok(())
+    }
+
+    /// Bytes the guest has handed over in response to the memory target.
+    pub fn ballooned_bytes(&self) -> u64 {
+        self.vm
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|v| v.balloon.as_ref().map(|b| b.ballooned_bytes()))
+            .unwrap_or(0)
     }
 
     pub fn state_channel(&self) -> Receiver<VmState> {

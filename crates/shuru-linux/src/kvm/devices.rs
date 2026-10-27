@@ -525,15 +525,15 @@ impl MmioDevice for VirtioMmioDevice {
 // Virtio descriptor chain helpers
 // ===========================================================================
 
-const VRING_DESC_F_NEXT: u16 = 1;
+pub(super) const VRING_DESC_F_NEXT: u16 = 1;
 const VRING_DESC_F_WRITE: u16 = 2;
 
 #[derive(Clone, Copy)]
-struct VringDesc {
-    addr: u64,
-    len: u32,
-    flags: u16,
-    next: u16,
+pub(super) struct VringDesc {
+    pub(super) addr: u64,
+    pub(super) len: u32,
+    pub(super) flags: u16,
+    pub(super) next: u16,
 }
 
 pub fn avail_idx(mem: &GuestMemoryMmap, avail_addr: u64) -> u16 {
@@ -547,7 +547,7 @@ pub fn avail_ring_entry(mem: &GuestMemoryMmap, avail_addr: u64, queue_size: u16,
         .unwrap_or(0)
 }
 
-fn read_desc(mem: &GuestMemoryMmap, desc_addr: u64, idx: u16) -> VringDesc {
+pub(super) fn read_desc(mem: &GuestMemoryMmap, desc_addr: u64, idx: u16) -> VringDesc {
     let off = idx as u64 * 16;
     VringDesc {
         addr: mem.read_obj(GuestAddress(desc_addr + off)).unwrap_or(0),
@@ -586,7 +586,7 @@ const VIRTIO_BLK_T_IN: u32 = 0;
 const VIRTIO_BLK_T_OUT: u32 = 1;
 const VIRTIO_BLK_S_OK: u8 = 0;
 const VIRTIO_BLK_S_IOERR: u8 = 1;
-const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+pub(super) const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
 pub struct BlockBackend {
     disk: File,

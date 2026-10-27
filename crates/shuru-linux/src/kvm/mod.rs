@@ -1,3 +1,4 @@
+pub mod balloon;
 pub mod devices;
 pub mod layout;
 pub mod virtio_fs;
@@ -35,6 +36,7 @@ pub struct KvmVm {
     pub vcpu_threads: Vec<std::thread::JoinHandle<()>>,
     pub running: Arc<AtomicBool>,
     pub guest_cid: u64,
+    pub balloon: Option<Arc<balloon::BalloonControl>>,
     #[allow(dead_code)]
     _gic: DeviceFd,
 }
@@ -55,6 +57,7 @@ pub struct VmCreateConfig {
     pub guest_cid: u64,
     /// Virtio-fs mounts: (tag, host_path, read_only).
     pub mounts: Vec<(String, String, bool)>,
+    pub has_balloon: bool,
 }
 
 impl KvmVm {
@@ -213,6 +216,26 @@ impl KvmVm {
             virtio_idx += 1;
         }
 
+        // Virtio balloon
+        let mut balloon_control = None;
+        if config.has_balloon {
+            let backend = balloon::BalloonBackend::new(config.memory_bytes);
+            balloon_control = Some(backend.control());
+            let spi = VIRTIO_SPI_BASE + virtio_idx;
+            let base = VIRTIO_MMIO_BASE + (virtio_idx as u64) * VIRTIO_MMIO_GAP;
+            bus.add(
+                base,
+                VIRTIO_MMIO_SIZE,
+                Box::new(VirtioMmioDevice::new(
+                    Box::new(backend),
+                    spi,
+                    vm_fd.clone(),
+                    mem.clone(),
+                )),
+            );
+            virtio_idx += 1;
+        }
+
         // Create vCPUs (must exist before GIC init)
         let mut vcpus = Vec::with_capacity(config.cpu_count);
         for i in 0..config.cpu_count {
@@ -258,6 +281,7 @@ impl KvmVm {
             vcpu_threads: Vec::new(),
             running: Arc::new(AtomicBool::new(false)),
             guest_cid,
+            balloon: balloon_control,
             _gic: gic,
         })
     }

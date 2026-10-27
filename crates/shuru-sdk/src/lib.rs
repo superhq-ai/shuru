@@ -294,6 +294,10 @@ enum SandboxCmd {
         name: String,
         reply: oneshot::Sender<Result<()>>,
     },
+    SetMemoryTarget {
+        bytes: u64,
+        reply: oneshot::Sender<Result<()>>,
+    },
     Stop {
         reply: oneshot::Sender<Result<()>>,
     },
@@ -345,6 +349,21 @@ impl AsyncSandbox {
         ready_rx.await??;
 
         Ok(Self { cmd_tx })
+    }
+
+    /// How much memory the guest keeps, in bytes. The guest hands the rest
+    /// back to the host through the balloon device and gets it back when
+    /// the target rises again. On a Linux host the guest also reports free
+    /// pages on its own, so idle memory returns without a target.
+    pub async fn set_memory_target(&self, bytes: u64) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SandboxCmd::SetMemoryTarget {
+                bytes,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("VM thread exited"))?;
+        reply_rx.await?
     }
 
     /// Execute a command and wait for the result.
@@ -1035,6 +1054,9 @@ fn run_vm_loop(
                 std::thread::spawn(move || {
                     let _ = reply.send(sb.connect_forward(port));
                 });
+            }
+            SandboxCmd::SetMemoryTarget { bytes, reply } => {
+                let _ = reply.send(sandbox.set_memory_target(bytes));
             }
             SandboxCmd::Checkpoint { name, reply } => {
                 let result = (|| -> Result<()> {
