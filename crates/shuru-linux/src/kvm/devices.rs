@@ -317,6 +317,8 @@ pub trait VirtioBackend: Send {
     fn queue_max_size(&self) -> u16;
     fn config_read(&self, offset: u64) -> u32;
     fn config_write(&mut self, offset: u64, value: u32);
+    /// The feature set the driver accepted, once it sets FEATURES_OK.
+    fn features_ok(&mut self, _features: u64) {}
     fn activate(
         &mut self,
         queues: &[VirtioQueueState],
@@ -463,11 +465,17 @@ impl MmioDevice for VirtioMmioDevice {
                 }
             }
             VIRTIO_MMIO_STATUS => {
+                let prev = self.status;
                 self.status = val;
                 if val == 0 {
                     self.backend.reset();
                     self.activated = false;
                     self.interrupt_status.store(0, Ordering::Release);
+                }
+                if (val & VIRTIO_STATUS_FEATURES_OK) != 0 && (prev & VIRTIO_STATUS_FEATURES_OK) == 0
+                {
+                    self.backend
+                        .features_ok(self.drv_features & self.backend.device_features());
                 }
                 if !self.activated
                     && (val & VIRTIO_STATUS_DRIVER_OK) != 0

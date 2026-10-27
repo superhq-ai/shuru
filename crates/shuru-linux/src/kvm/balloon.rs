@@ -26,23 +26,63 @@ use super::devices::{
     VIRTIO_F_VERSION_1, VRING_DESC_F_NEXT,
 };
 
+const VIRTIO_BALLOON_F_STATS_VQ: u64 = 1 << 1;
 const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u64 = 1 << 2;
+const VIRTIO_BALLOON_F_FREE_PAGE_HINT: u64 = 1 << 3;
 const VIRTIO_BALLOON_F_REPORTING: u64 = 1 << 5;
+
+const OFFERED_FEATURES: u64 =
+    VIRTIO_F_VERSION_1 | VIRTIO_BALLOON_F_DEFLATE_ON_OOM | VIRTIO_BALLOON_F_REPORTING;
 
 /// Balloon pages are always 4 KiB, whatever the guest page size.
 const PAGE_SHIFT: u32 = 12;
 const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
 
-const INFLATE_QUEUE: u16 = 0;
-const DEFLATE_QUEUE: u16 = 1;
-/// The spec puts the reporting queue at index 4, after stats (2) and free
-/// page hints (3). The Linux virtio-mmio transport instead numbers queues
-/// by the names the driver asks for, and with those two features not
-/// offered that makes it index 2. Both numberings fit in five queues, and
-/// any kick past the inflate and deflate pair can only be a report.
-const QUEUE_COUNT: usize = 5;
-
 const VIRTIO_MMIO_INT_CONFIG: u32 = 2;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum QueueRole {
+    Inflate,
+    Deflate,
+    Stats,
+    FreePageHint,
+    Reporting,
+}
+
+/// The optional queues in spec order. Each exists only when its feature is
+/// negotiated, and a queue that does not exist takes no index, so the ones
+/// after it move up. The spec numbers them 2, 3 and 4, which is their
+/// position only when all three are negotiated.
+const OPTIONAL_QUEUES: [(u64, QueueRole); 3] = [
+    (VIRTIO_BALLOON_F_STATS_VQ, QueueRole::Stats),
+    (VIRTIO_BALLOON_F_FREE_PAGE_HINT, QueueRole::FreePageHint),
+    (VIRTIO_BALLOON_F_REPORTING, QueueRole::Reporting),
+];
+
+struct QueueLayout {
+    roles: Vec<QueueRole>,
+}
+
+impl QueueLayout {
+    fn for_features(features: u64) -> Self {
+        let mut roles = vec![QueueRole::Inflate, QueueRole::Deflate];
+        roles.extend(
+            OPTIONAL_QUEUES
+                .iter()
+                .filter(|(bit, _)| features & bit != 0)
+                .map(|(_, role)| *role),
+        );
+        QueueLayout { roles }
+    }
+
+    fn role(&self, idx: u16) -> Option<QueueRole> {
+        self.roles.get(usize::from(idx)).copied()
+    }
+
+    fn len(&self) -> usize {
+        self.roles.len()
+    }
+}
 
 struct IrqLine {
     vm_fd: Arc<VmFd>,
@@ -82,6 +122,7 @@ impl BalloonControl {
 pub struct BalloonBackend {
     control: Arc<BalloonControl>,
     host_page: u64,
+    layout: QueueLayout,
 }
 
 impl BalloonBackend {
@@ -95,6 +136,7 @@ impl BalloonBackend {
                 irq: Mutex::new(None),
             }),
             host_page: if page > 0 { page as u64 } else { PAGE_SIZE },
+            layout: QueueLayout::for_features(OFFERED_FEATURES),
         }
     }
 
@@ -149,7 +191,7 @@ impl BalloonBackend {
         }
     }
 
-    fn drain(&self, queue_idx: u16, q: &mut VirtioQueueState, mem: &GuestMemoryMmap) {
+    fn drain(&self, role: QueueRole, q: &mut VirtioQueueState, mem: &GuestMemoryMmap) {
         if q.size == 0 {
             return;
         }
@@ -159,10 +201,13 @@ impl BalloonBackend {
             let mut idx = head;
             loop {
                 let desc = read_desc(mem, q.desc_addr, idx);
-                match queue_idx {
-                    INFLATE_QUEUE => self.discard_pfns(mem, desc.addr, desc.len),
-                    DEFLATE_QUEUE => {}
-                    _ => self.discard(mem, desc.addr, desc.len as u64),
+                match role {
+                    QueueRole::Inflate => self.discard_pfns(mem, desc.addr, desc.len),
+                    QueueRole::Deflate => {}
+                    QueueRole::Reporting => self.discard(mem, desc.addr, desc.len as u64),
+                    QueueRole::Stats | QueueRole::FreePageHint => {
+                        unreachable!("the balloon does not offer stats or free page hints")
+                    }
                 }
                 if desc.flags & VRING_DESC_F_NEXT == 0 {
                     break;
@@ -181,11 +226,11 @@ impl VirtioBackend for BalloonBackend {
     }
 
     fn device_features(&self) -> u64 {
-        VIRTIO_F_VERSION_1 | VIRTIO_BALLOON_F_DEFLATE_ON_OOM | VIRTIO_BALLOON_F_REPORTING
+        OFFERED_FEATURES
     }
 
     fn queue_count(&self) -> usize {
-        QUEUE_COUNT
+        QueueLayout::for_features(OFFERED_FEATURES).len()
     }
 
     fn queue_max_size(&self) -> u16 {
@@ -204,6 +249,10 @@ impl VirtioBackend for BalloonBackend {
         if offset == 4 {
             self.control.actual_pages.store(value, Ordering::Release);
         }
+    }
+
+    fn features_ok(&mut self, features: u64) {
+        self.layout = QueueLayout::for_features(features);
     }
 
     fn activate(
@@ -229,9 +278,12 @@ impl VirtioBackend for BalloonBackend {
         _: &Arc<VmFd>,
         _: u32,
     ) {
-        if let Some(q) = queues.get_mut(queue_idx as usize) {
+        let Some(role) = self.layout.role(queue_idx) else {
+            return;
+        };
+        if let Some(q) = queues.get_mut(usize::from(queue_idx)) {
             if q.ready {
-                self.drain(queue_idx, q, mem);
+                self.drain(role, q, mem);
             }
         }
     }
@@ -239,5 +291,6 @@ impl VirtioBackend for BalloonBackend {
     fn reset(&mut self) {
         *self.control.irq.lock().unwrap() = None;
         self.control.actual_pages.store(0, Ordering::Release);
+        self.layout = QueueLayout::for_features(OFFERED_FEATURES);
     }
 }

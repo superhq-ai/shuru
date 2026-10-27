@@ -5,9 +5,9 @@
 7.0.0-1014-aws
 16
                total        used        free      shared  buff/cache   available
-Mem:           32011         691       29840           1        1810       31319
+Mem:           32011         699       29759           1        1885       31311
 4096
-crw-rw---- 1 root kvm 10, 232 Oct 26 00:45 /dev/kvm
+crw-rw---- 1 root kvm 10, 232 Oct 27 00:37 /dev/kvm
 /xfs.img on /mnt/xfs type xfs (rw,relatime,inode64,logbufs=8,logbsize=32k,noquota)
 shuru 0.9.3
 === guest view of the device
@@ -19,46 +19,47 @@ balloon features: 00100100000000000000000000000000100000000000000000000000000000
   deflate_on_oom(2)=1 reporting(5)=1 version_1(32)=1
 page_reporting_order=10
 === balloon example
-booted                                   host rss    21 MB   guest MemTotal: 1998 MB  MemFree: 1972 MB
-guest holds 1 GB in tmpfs                host rss  1109 MB   guest MemTotal: 1998 MB  MemFree: 942 MB
-guest freed it +1s                       host rss  1109 MB   guest MemTotal: 1998 MB  MemFree: 1973 MB
-guest freed it +2s                       host rss   854 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
-guest freed it +3s                       host rss   854 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
-guest freed it +4s                       host rss   642 MB   guest MemTotal: 1998 MB  MemFree: 1973 MB
-guest freed it +5s                       host rss   598 MB   guest MemTotal: 1998 MB  MemFree: 1973 MB
-guest freed it +6s                       host rss   582 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
-guest freed it +7s                       host rss   342 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
-guest freed it +8s                       host rss   326 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
-guest freed it +9s                       host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
-guest freed it +10s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
-guest freed it +11s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
-guest freed it +12s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
-guest freed it +13s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
-guest freed it +14s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
-guest freed it +15s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
-guest freed it +16s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1973 MB
-guest freed it +17s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1973 MB
-guest freed it +18s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1973 MB
-guest freed it +19s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1973 MB
-guest freed it +20s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1973 MB
-guest freed it +21s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1973 MB
-guest freed it +22s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1973 MB
-guest freed it +23s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1973 MB
-guest freed it +24s                      host rss    90 MB   guest MemTotal: 1998 MB  MemFree: 1973 MB
-target 1 GB +1s                          host rss    84 MB   guest MemTotal: 1998 MB  MemFree: 942 MB
-target 1 GB +2s                          host rss    84 MB   guest MemTotal: 1998 MB  MemFree: 942 MB
-target 1 GB +3s                          host rss    84 MB   guest MemTotal: 1998 MB  MemFree: 942 MB
-target 1 GB +4s                          host rss    84 MB   guest MemTotal: 1998 MB  MemFree: 942 MB
-target 2 GB +1s                          host rss    84 MB   guest MemTotal: 1998 MB  MemFree: 1902 MB
-target 2 GB +2s                          host rss    84 MB   guest MemTotal: 1998 MB  MemFree: 1910 MB
-wall=40.41s
+booted                                   host rss    23 MB   guest MemTotal: 1998 MB  MemFree: 1968 MB
+guest holds 1 GB in tmpfs                host rss  1109 MB   guest MemTotal: 1998 MB  MemFree: 933 MB
+guest freed it +1s                       host rss  1109 MB   guest MemTotal: 1998 MB  MemFree: 1975 MB
+guest freed it +2s                       host rss   855 MB   guest MemTotal: 1998 MB  MemFree: 1975 MB
+guest freed it +3s                       host rss   855 MB   guest MemTotal: 1998 MB  MemFree: 1975 MB
+guest freed it +4s                       host rss   599 MB   guest MemTotal: 1998 MB  MemFree: 1975 MB
+guest freed it +5s                       host rss   599 MB   guest MemTotal: 1998 MB  MemFree: 1975 MB
+guest freed it +6s                       host rss   535 MB   guest MemTotal: 1998 MB  MemFree: 1975 MB
+guest freed it +7s                       host rss   343 MB   guest MemTotal: 1998 MB  MemFree: 1975 MB
+guest freed it +8s                       host rss   323 MB   guest MemTotal: 1998 MB  MemFree: 1975 MB
+guest freed it +9s                       host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1975 MB
+guest freed it +10s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1975 MB
+guest freed it +11s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1975 MB
+guest freed it +12s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1975 MB
+guest freed it +13s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
+guest freed it +14s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
+guest freed it +15s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1975 MB
+guest freed it +16s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
+guest freed it +17s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
+guest freed it +18s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
+guest freed it +19s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
+guest freed it +20s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
+guest freed it +21s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
+guest freed it +22s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
+guest freed it +23s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
+guest freed it +24s                      host rss    87 MB   guest MemTotal: 1998 MB  MemFree: 1974 MB
+target 1 GB +1s                          host rss    84 MB   guest MemTotal: 1998 MB  MemFree: 951 MB
+target 1 GB +2s                          host rss    84 MB   guest MemTotal: 1998 MB  MemFree: 951 MB
+target 1 GB +3s                          host rss    84 MB   guest MemTotal: 1998 MB  MemFree: 951 MB
+target 1 GB +4s                          host rss    84 MB   guest MemTotal: 1998 MB  MemFree: 951 MB
+target 2 GB +1s                          host rss    84 MB   guest MemTotal: 1998 MB  MemFree: 1887 MB
+target 2 GB +2s                          host rss    84 MB   guest MemTotal: 1998 MB  MemFree: 1894 MB
+wall=38.99s
 === guest reporting worker after a run (should be idle, not stuck in the report call)
 shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
 stacks-checked
 === done
 
-=== Before the queue index fix: the guest reporting worker stuck in the report call
-=== and the balloon device (virtio2, IRQ 50) with a single interrupt, no memory returned
+=== Before the queue layout followed the negotiated features: the guest reporting worker
+=== stuck in the report call and the balloon device (virtio2, IRQ 50) with a single
+=== interrupt, no memory returned
 
 --- interrupts
  13:          1          0     GICv3  50 Level     virtio2

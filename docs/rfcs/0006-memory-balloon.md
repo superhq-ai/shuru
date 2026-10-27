@@ -63,15 +63,17 @@ use. The deflate queue is acknowledged and nothing else: a discarded page
 reads as zero when the guest touches it again, so giving memory back costs
 one page fault per page and no host work.
 
-The queue numbering needs one note. The spec puts the reporting queue at
-index 4, after stats (2) and free page hints (3). The Linux virtio-mmio
-transport numbers queues by the names the driver asks for, and with stats
-and hints not offered that makes it index 2. The first build handled index
-4 only, the guest kicked index 2, and its reporting worker waited forever
-for an acknowledgement that never came (visible as a kworker parked in
-`virtballoon_free_page_report`). The backend now treats any kick past the
-inflate and deflate pair as a report, which is right under either
-numbering because no other queue can exist.
+Queue indices follow the negotiated features. The spec lists stats,
+free page hints and reporting as queues 2, 3 and 4, but each exists only
+when its feature is negotiated, and a queue that does not exist takes no
+index. The Linux driver, Cloud Hypervisor, crosvm and QEMU all number the
+optional queues this way, in spec order, skipping the absent ones. The
+backend builds its layout from the features the driver accepted at
+`FEATURES_OK`, so with only reporting on offer the reporting queue is
+index 2, and if stats are added later it moves to 3 on its own. The first
+build hardcoded index 4, the guest kicked index 2, and its reporting
+worker waited forever for an acknowledgement that never came (visible as
+a kworker parked in `virtballoon_free_page_report`).
 
 ### The target
 
@@ -107,14 +109,14 @@ size of the host process:
 
 | step | host resident | guest MemFree |
 |---|---|---|
-| booted | 21 MB | 1972 MB |
-| guest fills 1 GB of tmpfs | 1109 MB | 942 MB |
-| 2 s after the guest frees it | 854 MB | 1974 MB |
-| 5 s | 598 MB | 1973 MB |
-| 7 s | 342 MB | 1974 MB |
-| 9 s | 90 MB | 1974 MB |
-| target 1 GB, 1 s later | 84 MB | 942 MB |
-| target 2 GB, 1 s later | 84 MB | 1902 MB |
+| booted | 23 MB | 1968 MB |
+| guest fills 1 GB of tmpfs | 1109 MB | 933 MB |
+| 2 s after the guest frees it | 855 MB | 1975 MB |
+| 5 s | 599 MB | 1975 MB |
+| 7 s | 343 MB | 1975 MB |
+| 9 s | 87 MB | 1975 MB |
+| target 1 GB, 1 s later | 84 MB | 951 MB |
+| target 2 GB, 1 s later | 84 MB | 1887 MB |
 
 The 1 GB came back without anyone asking, about 256 MB per two second
 round.
