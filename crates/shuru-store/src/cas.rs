@@ -91,7 +91,7 @@ const ZERO_CHUNK_HASH: &str = "ZERO";
 
 impl ChunkIndex {
     pub fn new(disk_size: u64) -> Self {
-        let num_chunks = ((disk_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64) as usize;
+        let num_chunks = disk_size.div_ceil(CHUNK_SIZE as u64) as usize;
         ChunkIndex {
             hashes: vec![ZERO_CHUNK_HASH.to_string(); num_chunks],
             disk_size,
@@ -153,7 +153,7 @@ impl ChunkIndex {
         f.read_exact(&mut buf8)?;
         let num_chunks = u64::from_le_bytes(buf8) as usize;
 
-        let expected_chunks = ((disk_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64) as usize;
+        let expected_chunks = disk_size.div_ceil(CHUNK_SIZE as u64) as usize;
         anyhow::ensure!(
             num_chunks == expected_chunks,
             "index {}: chunk count {} does not match disk_size {} (expected {})",
@@ -282,7 +282,7 @@ impl CasBackend {
     pub fn set_disk_size(&mut self, new_size: u64) {
         let mut index = self.index.write().unwrap();
         if new_size > index.disk_size() {
-            let new_num_chunks = ((new_size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64) as usize;
+            let new_num_chunks = new_size.div_ceil(CHUNK_SIZE as u64) as usize;
             while index.num_chunks() < new_num_chunks {
                 index.hashes.push(ZERO_CHUNK_HASH.to_string());
             }
@@ -355,7 +355,7 @@ impl CasBackend {
             let hash = self
                 .store
                 .put(data)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             index.set_hash(chunk_idx, hash);
         }
         dirty.clear();
@@ -444,7 +444,7 @@ impl CasBackend {
                 let new_hash = self
                     .store
                     .put(&buf)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 self.index.write().unwrap().set_hash(chunk_idx, new_hash);
                 return Ok(buf);
             }
@@ -461,10 +461,7 @@ impl CasBackend {
                 tracing::warn!("chunk {} not found in store, returning zeros", hash);
                 Ok(vec![0u8; CHUNK_SIZE])
             }
-            Err(e) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            )),
+            Err(e) => Err(std::io::Error::other(e.to_string())),
         }
     }
 }

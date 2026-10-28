@@ -853,10 +853,14 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
 
     // Set up proxy networking if enabled
     let (vm_fd, proxy_handle) = if config.allow_net {
-        let mut proxy_config = ProxyConfig::default();
-        proxy_config.secrets = config.secrets;
-        proxy_config.network.allow = config.allowed_hosts;
-        proxy_config.expose_host = config.expose_host;
+        let proxy_config = ProxyConfig {
+            secrets: config.secrets,
+            network: NetworkConfig {
+                allow: config.allowed_hosts,
+            },
+            expose_host: config.expose_host,
+            ..Default::default()
+        };
 
         let (vm_fd, host_fd) = shuru_proxy::create_socketpair()?;
         let handle = shuru_proxy::start(host_fd, proxy_config)?;

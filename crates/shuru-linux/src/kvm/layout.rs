@@ -1,7 +1,7 @@
-/// aarch64 memory map for the KVM virtual machine.
-///
-/// Below DRAM_BASE is MMIO space for devices.
-/// DRAM starts at 1 GiB and extends for the configured memory size.
+//! aarch64 memory map for the KVM virtual machine.
+//!
+//! Below DRAM_BASE is MMIO space for devices.
+//! DRAM starts at 1 GiB and extends for the configured memory size.
 
 // RAM
 pub const DRAM_BASE: u64 = 0x4000_0000; // 1 GiB

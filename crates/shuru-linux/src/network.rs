@@ -27,7 +27,7 @@ impl MACAddress {
     /// Generate a random locally-administered MAC address.
     pub fn random_local() -> Self {
         let mut bytes = [0u8; 6];
-        let fd = unsafe { libc::open(b"/dev/urandom\0".as_ptr() as *const _, libc::O_RDONLY) };
+        let fd = unsafe { libc::open(c"/dev/urandom".as_ptr(), libc::O_RDONLY) };
         if fd >= 0 {
             unsafe {
                 libc::read(fd, bytes.as_mut_ptr() as *mut libc::c_void, 6);

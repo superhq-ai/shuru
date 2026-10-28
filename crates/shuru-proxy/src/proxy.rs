@@ -30,14 +30,33 @@ const SECRET_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Cloudflare-protected sites accept the TLS fingerprint. The client-side
 /// (guest <-> proxy) uses rustls with our generated CA cert.
 pub struct ProxyEngine {
-    config: Arc<ProxyConfig>,
     event_rx: mpsc::UnboundedReceiver<StackEvent>,
     cmd_tx: mpsc::UnboundedSender<StackCommand>,
     connections: HashMap<ConnectionId, mpsc::UnboundedSender<Vec<u8>>>,
-    secrets: Arc<SecretResolver>,
-    ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
+    shared: Arc<Shared>,
+}
+
+/// State every connection task reads.
+struct Shared {
+    config: Arc<ProxyConfig>,
+    ca: tokio::sync::Mutex<CertificateAuthority>,
+    secrets: SecretResolver,
     upstream_ssl: SslConnector,
     allowed_ips: AllowedIps,
+}
+
+/// The guest side of one proxied connection.
+struct Guest {
+    id: ConnectionId,
+    rx: GuestRx,
+    tx: GuestTx,
+    cmd_tx: mpsc::UnboundedSender<StackCommand>,
+}
+
+impl Guest {
+    fn close(&self) {
+        let _ = self.cmd_tx.send(StackCommand::Close { id: self.id });
+    }
 }
 
 impl ProxyEngine {
@@ -56,17 +75,19 @@ impl ProxyEngine {
         let upstream_ssl = builder.build();
 
         let config = Arc::new(config);
-        let secrets = Arc::new(SecretResolver::new(config.clone(), placeholders));
+        let secrets = SecretResolver::new(config.clone(), placeholders);
 
         ProxyEngine {
-            config,
             event_rx,
             cmd_tx,
             connections: HashMap::new(),
-            secrets,
-            ca: Arc::new(tokio::sync::Mutex::new(ca)),
-            upstream_ssl,
-            allowed_ips,
+            shared: Arc::new(Shared {
+                config,
+                ca: tokio::sync::Mutex::new(ca),
+                secrets,
+                upstream_ssl,
+                allowed_ips,
+            }),
         }
     }
 
@@ -94,10 +115,16 @@ impl ProxyEngine {
                     permit,
                 } => {
                     let cmd_tx = self.cmd_tx.clone();
-                    let config = self.config.clone();
-                    let allowed_ips = self.allowed_ips.clone();
+                    let shared = self.shared.clone();
                     tokio::spawn(async move {
-                        dns::handle_dns_query(src, payload, cmd_tx, &config, &allowed_ips).await;
+                        dns::handle_dns_query(
+                            src,
+                            payload,
+                            cmd_tx,
+                            &shared.config,
+                            &shared.allowed_ips,
+                        )
+                        .await;
                         drop(permit);
                     });
                 }
@@ -108,31 +135,16 @@ impl ProxyEngine {
     fn handle_new_connection(&mut self, conn: TcpConnection) {
         let (data_tx, data_rx) = mpsc::unbounded_channel();
         self.connections.insert(conn.id, data_tx);
-        let guest_rx = GuestRx::new(conn.id, data_rx, self.cmd_tx.clone());
-        let guest_tx = GuestTx::new(conn.id, self.cmd_tx.clone(), conn.to_guest);
-
-        let cmd_tx = self.cmd_tx.clone();
-        let config = self.config.clone();
-        let ca = self.ca.clone();
-        let secrets = self.secrets.clone();
-        let upstream_ssl = self.upstream_ssl.clone();
-        let allowed_ips = self.allowed_ips.clone();
+        let guest = Guest {
+            id: conn.id,
+            rx: GuestRx::new(conn.id, data_rx, self.cmd_tx.clone()),
+            tx: GuestTx::new(conn.id, self.cmd_tx.clone(), conn.to_guest),
+            cmd_tx: self.cmd_tx.clone(),
+        };
+        let shared = self.shared.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(
-                conn.id,
-                conn.dst,
-                guest_rx,
-                guest_tx,
-                cmd_tx,
-                &config,
-                ca,
-                secrets,
-                upstream_ssl,
-                &allowed_ips,
-            )
-            .await
-            {
+            if let Err(e) = handle_connection(guest, conn.dst, &shared).await {
                 debug!("connection to {} ended: {e}", conn.dst);
             }
         });
@@ -141,17 +153,11 @@ impl ProxyEngine {
 
 /// Handle a single proxied TCP connection.
 async fn handle_connection(
-    id: ConnectionId,
+    mut guest: Guest,
     dst: SocketAddr,
-    mut guest_rx: GuestRx,
-    guest_tx: GuestTx,
-    cmd_tx: mpsc::UnboundedSender<StackCommand>,
-    config: &ProxyConfig,
-    ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
-    secrets: Arc<SecretResolver>,
-    upstream_ssl: SslConnector,
-    allowed_ips: &AllowedIps,
+    shared: &Shared,
 ) -> anyhow::Result<()> {
+    let config = &shared.config;
     // Check if this is a connection to an exposed host port (host.shuru.internal).
     if let std::net::IpAddr::V4(ipv4) = dst.ip() {
         if let Some(host_port) = config.exposed_host_port(ipv4, dst.port()) {
@@ -166,15 +172,7 @@ async fn handle_connection(
             );
             let upstream = TcpStream::connect(local_dst).await?;
             let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
-            return blind_relay(
-                id,
-                &mut upstream_rd,
-                &mut upstream_wr,
-                guest_rx,
-                guest_tx,
-                cmd_tx,
-            )
-            .await;
+            return blind_relay(guest, &mut upstream_rd, &mut upstream_wr).await;
         }
     }
 
@@ -189,14 +187,15 @@ async fn handle_connection(
         if let std::net::IpAddr::V4(ipv4) = dst.ip() {
             const GATEWAY: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 0, 0, 1);
             let is_allowed = ipv4 == GATEWAY
-                || allowed_ips
+                || shared
+                    .allowed_ips
                     .write()
                     .expect("allowed_ips lock poisoned")
                     .get(&ipv4)
                     .is_some();
             if !is_allowed {
                 debug!("IP not in DNS-pinned set, rejecting: {dst}");
-                let _ = cmd_tx.send(StackCommand::Close { id });
+                guest.close();
                 return Err(anyhow::anyhow!(
                     "connection to {dst} blocked: IP not resolved via allowed DNS"
                 ));
@@ -209,7 +208,8 @@ async fn handle_connection(
     if is_tls {
         // Buffer data until we have a complete TLS ClientHello record.
         // The ClientHello may span multiple TCP segments.
-        let mut tls_buf = guest_rx
+        let mut tls_buf = guest
+            .rx
             .recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("connection closed before data"))?;
@@ -221,7 +221,7 @@ async fn handle_connection(
             if tls_buf.len() >= 5 + record_len {
                 break; // have the complete record
             }
-            match guest_rx.recv().await {
+            match guest.rx.recv().await {
                 Some(chunk) => tls_buf.extend_from_slice(&chunk),
                 None => break, // connection closed
             }
@@ -237,14 +237,14 @@ async fn handle_connection(
             match &sni {
                 Some(domain) if !config.is_domain_allowed(domain) => {
                     debug!("SNI not in allowlist, rejecting: {domain}");
-                    let _ = cmd_tx.send(StackCommand::Close { id });
+                    guest.close();
                     return Err(anyhow::anyhow!(
                         "TLS to {dst} blocked: SNI '{domain}' not in allowlist"
                     ));
                 }
                 None => {
                     debug!("no SNI in ClientHello, rejecting connection to {dst}");
-                    let _ = cmd_tx.send(StackCommand::Close { id });
+                    guest.close();
                     return Err(anyhow::anyhow!("TLS to {dst} blocked: no SNI"));
                 }
                 _ => {}
@@ -254,32 +254,19 @@ async fn handle_connection(
         if let Some(domain) = sni {
             // Resolved per connection, so a rotated secret is picked up by the
             // next connection to the domain without the guest noticing.
-            let substitutions = match secrets.substitutions_for_domain(&domain).await {
+            let substitutions = match shared.secrets.substitutions_for_domain(&domain).await {
                 Ok(substitutions) => substitutions,
                 Err(e) => {
                     // Warn rather than debug: the guest only sees a dropped
                     // TLS connection, so this is the sole account of why.
                     warn!("TLS to {domain} blocked: {e:#}");
-                    let _ = cmd_tx.send(StackCommand::Close { id });
+                    guest.close();
                     return Err(e.context(format!("TLS to {domain} blocked")));
                 }
             };
             if !substitutions.is_empty() {
                 debug!("MITM: {domain}");
-                return handle_mitm(
-                    id,
-                    dst,
-                    domain,
-                    tls_buf,
-                    guest_rx,
-                    guest_tx,
-                    cmd_tx,
-                    ca,
-                    secrets,
-                    substitutions,
-                    upstream_ssl,
-                )
-                .await;
+                return handle_mitm(guest, dst, domain, tls_buf, substitutions, shared).await;
             }
         }
 
@@ -291,15 +278,7 @@ async fn handle_connection(
         // Send the buffered TLS data
         upstream_wr.write_all(&tls_buf).await?;
 
-        return blind_relay(
-            id,
-            &mut upstream_rd,
-            &mut upstream_wr,
-            guest_rx,
-            guest_tx,
-            cmd_tx,
-        )
-        .await;
+        return blind_relay(guest, &mut upstream_rd, &mut upstream_wr).await;
     }
 
     // Non-TLS: blind tunnel
@@ -307,26 +286,21 @@ async fn handle_connection(
     let upstream = TcpStream::connect(dst).await?;
     let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
 
-    blind_relay(
-        id,
-        &mut upstream_rd,
-        &mut upstream_wr,
-        guest_rx,
-        guest_tx,
-        cmd_tx,
-    )
-    .await
+    blind_relay(guest, &mut upstream_rd, &mut upstream_wr).await
 }
 
 /// Blind bidirectional relay (no inspection).
 async fn blind_relay(
-    id: ConnectionId,
+    guest: Guest,
     upstream_rd: &mut tokio::net::tcp::OwnedReadHalf,
     upstream_wr: &mut tokio::net::tcp::OwnedWriteHalf,
-    mut guest_rx: GuestRx,
-    guest_tx: GuestTx,
-    cmd_tx: mpsc::UnboundedSender<StackCommand>,
 ) -> anyhow::Result<()> {
+    let Guest {
+        id,
+        rx: mut guest_rx,
+        tx: guest_tx,
+        cmd_tx,
+    } = guest;
     let upstream_to_guest = async {
         let mut buf = vec![0u8; 65536];
         loop {
@@ -360,24 +334,21 @@ async fn blind_relay(
 
 /// MITM: terminate TLS on both sides, relay HTTP/1.1 with secret substitution.
 async fn handle_mitm(
-    id: ConnectionId,
+    guest: Guest,
     dst: SocketAddr,
     domain: String,
     first_chunk: Vec<u8>,
-    guest_rx: GuestRx,
-    guest_tx: GuestTx,
-    cmd_tx: mpsc::UnboundedSender<StackCommand>,
-    ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
-    secrets: Arc<SecretResolver>,
     substitutions: Vec<(String, String)>,
-    upstream_ssl: SslConnector,
+    shared: &Shared,
 ) -> anyhow::Result<()> {
     let acceptor = {
-        let mut ca = ca.lock().await;
+        let mut ca = shared.ca.lock().await;
         ca.acceptor_for_domain(&domain)?
     };
 
-    let mut guest_stream = ChannelStream::new(guest_rx, guest_tx);
+    let Guest { id, rx, tx, cmd_tx } = guest;
+    let secrets = &shared.secrets;
+    let mut guest_stream = ChannelStream::new(rx, tx);
     guest_stream.prepend(first_chunk);
 
     // Client-side: rustls with our generated CA cert
@@ -386,7 +357,7 @@ async fn handle_mitm(
     // Upstream: BoringSSL — Chrome's TLS fingerprint passes Cloudflare
     let upstream_tcp = TcpStream::connect(dst).await?;
     let upstream_tls =
-        tokio_boring::connect(upstream_ssl.configure()?, &domain, upstream_tcp)
+        tokio_boring::connect(shared.upstream_ssl.configure()?, &domain, upstream_tcp)
             .await
             .map_err(|e| anyhow::anyhow!("BoringSSL connect to {domain}: {e}"))?;
 

@@ -12,14 +12,14 @@
 //! gracefully.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::ffi::{CString, OsStr};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use super::devices::{avail_ring_entry, write_used, Interrupt, VirtioBackend, VirtioQueueState};
 
@@ -177,14 +177,6 @@ struct FuseAttrOut {
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
-struct FuseGetattrIn {
-    getattr_flags: u32,
-    dummy: u32,
-    fh: u64,
-}
-
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
 struct FuseSetattrIn {
     valid: u32,
     padding: u32,
@@ -327,20 +319,6 @@ struct FuseDirent {
     namelen: u32,
     kind: u32,
     // name follows, padded to 8 bytes
-}
-
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-struct FuseGetxattrIn {
-    size: u32,
-    padding: u32,
-}
-
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-struct FuseAccessIn {
-    mask: u32,
-    padding: u32,
 }
 
 #[repr(C)]
@@ -500,14 +478,6 @@ impl<'a> ResponseWriter<'a> {
             span_off: 0,
             total_written: 0,
         }
-    }
-
-    fn capacity(&self) -> u32 {
-        self.spans
-            .iter()
-            .filter(|s| s.writable)
-            .map(|s| s.len)
-            .sum()
     }
 
     fn write_bytes(&mut self, input: &[u8]) -> bool {
@@ -1034,10 +1004,10 @@ impl VirtioFsBackend {
             Err(_) => return (-libc::EINVAL, 0),
         };
 
-        if req.valid & FATTR_MODE != 0 {
-            if unsafe { libc::chmod(cpath.as_ptr(), req.mode as libc::mode_t) } < 0 {
-                return (-errno(), 0);
-            }
+        if req.valid & FATTR_MODE != 0
+            && unsafe { libc::chmod(cpath.as_ptr(), req.mode as libc::mode_t) } < 0
+        {
+            return (-errno(), 0);
         }
         if req.valid & (FATTR_UID | FATTR_GID) != 0 {
             let uid = if req.valid & FATTR_UID != 0 {
@@ -1054,10 +1024,10 @@ impl VirtioFsBackend {
                 return (-errno(), 0);
             }
         }
-        if req.valid & FATTR_SIZE != 0 {
-            if unsafe { libc::truncate(cpath.as_ptr(), req.size as libc::off_t) } < 0 {
-                return (-errno(), 0);
-            }
+        if req.valid & FATTR_SIZE != 0
+            && unsafe { libc::truncate(cpath.as_ptr(), req.size as libc::off_t) } < 0
+        {
+            return (-errno(), 0);
         }
         if req.valid & (FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW) != 0 {
             let now = libc::timespec {
@@ -1187,7 +1157,7 @@ impl VirtioFsBackend {
             };
             let child_path = ent.path();
 
-            let kind = mode_to_dt(meta.mode() as u32);
+            let kind = mode_to_dt(meta.mode());
             let name_bytes = name.as_bytes();
             let namelen = name_bytes.len();
             let entry_size = if plus {
@@ -1521,11 +1491,11 @@ impl VirtioFsBackend {
             return (-errno(), 0);
         }
         let out = FuseStatfsOut {
-            blocks: stat.f_blocks as u64,
-            bfree: stat.f_bfree as u64,
-            bavail: stat.f_bavail as u64,
-            files: stat.f_files as u64,
-            ffree: stat.f_ffree as u64,
+            blocks: stat.f_blocks,
+            bfree: stat.f_bfree,
+            bavail: stat.f_bavail,
+            files: stat.f_files,
+            ffree: stat.f_ffree,
             bsize: stat.f_bsize as u32,
             namelen: stat.f_namemax as u32,
             frsize: stat.f_frsize as u32,
@@ -1717,7 +1687,7 @@ fn attr_from_meta(ino: u64, meta: &std::fs::Metadata) -> FuseAttr {
         atimensec: meta.atime_nsec() as u32,
         mtimensec: meta.mtime_nsec() as u32,
         ctimensec: meta.ctime_nsec() as u32,
-        mode: meta.mode() as u32,
+        mode: meta.mode(),
         nlink: meta.nlink() as u32,
         uid: meta.uid(),
         gid: meta.gid(),
@@ -1728,14 +1698,14 @@ fn attr_from_meta(ino: u64, meta: &std::fs::Metadata) -> FuseAttr {
 }
 
 fn mode_to_dt(mode: u32) -> u32 {
-    match mode & libc::S_IFMT as u32 {
-        m if m == libc::S_IFREG as u32 => libc::DT_REG as u32,
-        m if m == libc::S_IFDIR as u32 => libc::DT_DIR as u32,
-        m if m == libc::S_IFLNK as u32 => libc::DT_LNK as u32,
-        m if m == libc::S_IFIFO as u32 => libc::DT_FIFO as u32,
-        m if m == libc::S_IFSOCK as u32 => libc::DT_SOCK as u32,
-        m if m == libc::S_IFCHR as u32 => libc::DT_CHR as u32,
-        m if m == libc::S_IFBLK as u32 => libc::DT_BLK as u32,
+    match mode & libc::S_IFMT {
+        m if m == libc::S_IFREG => libc::DT_REG as u32,
+        m if m == libc::S_IFDIR => libc::DT_DIR as u32,
+        m if m == libc::S_IFLNK => libc::DT_LNK as u32,
+        m if m == libc::S_IFIFO => libc::DT_FIFO as u32,
+        m if m == libc::S_IFSOCK => libc::DT_SOCK as u32,
+        m if m == libc::S_IFCHR => libc::DT_CHR as u32,
+        m if m == libc::S_IFBLK => libc::DT_BLK as u32,
         _ => libc::DT_UNKNOWN as u32,
     }
 }

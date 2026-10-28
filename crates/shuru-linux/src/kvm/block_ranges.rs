@@ -11,7 +11,7 @@ pub(super) fn decode_ranges(
     capacity: u64,
     kind: u32,
 ) -> Result<Vec<(i64, i64, bool)>, u8> {
-    if payload.is_empty() || payload.len() % 16 != 0 || payload.len() / 16 > MAX_RANGES {
+    if payload.is_empty() || !payload.len().is_multiple_of(16) || payload.len() / 16 > MAX_RANGES {
         return Err(VIRTIO_BLK_S_IOERR);
     }
     let mut ranges = Vec::new();

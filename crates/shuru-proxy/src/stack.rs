@@ -320,7 +320,7 @@ impl NetworkStack {
                 // Defer close until pending_send is drained so we don't
                 // drop data that has not been pushed to smoltcp yet. A guest
                 // that stops answering is timed out by smoltcp.
-                if self.pending_send.get(&id.0).map_or(true, |p| p.is_empty()) {
+                if self.pending_send.get(&id.0).is_none_or(|p| p.is_empty()) {
                     self.close_socket(id.0);
                 } else {
                     let socket = self.sockets.get_mut::<TcpSocket>(id.0);
@@ -468,9 +468,7 @@ impl NetworkStack {
                 // local_endpoint() is the destination the guest was trying to reach
                 // (because any_ip=true, smoltcp accepted it as local)
                 if let Some(local) = socket.local_endpoint() {
-                    let ipv4 = match local.addr {
-                        IpAddress::Ipv4(ip) => ip,
-                    };
+                    let IpAddress::Ipv4(ipv4) = local.addr;
                     // Remove this specific handle from the listener vec
                     if let Some(handles) = self.listening.get_mut(&(ipv4, local.port)) {
                         handles.retain(|h| *h != handle);

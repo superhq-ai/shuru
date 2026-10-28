@@ -893,7 +893,7 @@ impl BlockBackend {
                 if self.read_only
                     || total == 0
                     || total > MAX_RANGES * 16
-                    || total % 16 != 0
+                    || !total.is_multiple_of(16)
                     || sector != 0
                 {
                     return Err(fail);
@@ -930,7 +930,7 @@ impl BlockBackend {
                 if kind == VIRTIO_BLK_T_OUT && self.read_only {
                     return Err(fail);
                 }
-                if total % 512 != 0
+                if !total.is_multiple_of(512)
                     || sector > self.capacity
                     || total as u64 / 512 > self.capacity - sector
                 {
