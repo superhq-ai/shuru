@@ -66,8 +66,9 @@ A directory on the node data volume (XFS):
 
 ```
 snap-<id>/
-  manifest.json   format version, CPU fingerprint, guest image hashes,
-                  memory size, vCPU count, device list, parent snapshot
+  manifest.json   format version, release and guest protocol version,
+                  CPU fingerprint, guest image hashes, memory size,
+                  vCPU count, device list, parent snapshot
   state.bin       vCPU, interrupt controller, timer and device state,
                   versioned binary encoding
   memory          guest memory, a sparse file the size of guest RAM
@@ -190,13 +191,45 @@ must be consistent on its own; a snapshot keeps both.
 
 ### Restoring
 
-1. Check the manifest: format version, guest image hashes, and the CPU
-   fingerprint (`MIDR_EL1` and the ID registers KVM exposes). A mismatch
-   is refused, not attempted. Nodes in one pool run identical hardware.
+1. Check the manifest: format version, release, and the CPU fingerprint
+   (`MIDR_EL1` and the ID registers KVM exposes). Nodes in one pool run
+   identical hardware. A snapshot this host cannot resume is not
+   attempted; it falls back as described under Snapshots across releases.
 2. Map `memory` private, reflink `disk` into a new working disk.
 3. Create the VM and vCPUs, restore GIC and vCPU state, set the counter
    offset, restore devices, write a new VM generation ID.
 4. Start the vCPUs. Connect over vsock, rotate the token, send the time.
+
+### Snapshots across releases
+
+A snapshot holds the guest kernel and agent of the release that took it,
+running, in `memory`, and its device state in the encoding of that VMM.
+A newer host restoring it does not boot the new kernel; it resumes the old
+one, so it has to read the old device state and talk to the old agent.
+Refusing every snapshot from an earlier release would make each upgrade
+break every template and every paused sandbox. Instead:
+
+- The manifest records the release and the guest protocol version.
+  `state.bin` is versioned per section, and the VMM reads the encodings of
+  the last few releases (four to start) and refuses older ones.
+- The host keeps speaking the guest protocol versions of those releases.
+  The hello reply gains the guest protocol version, and the host uses the
+  matching framing on that connection. Until now a protocol change could
+  drop older agents, as protocol 3 did in 0.11.0. From the first release
+  with snapshots, a change keeps the older versions in the window
+  answerable.
+- A device added in a later release is absent from an older snapshot;
+  the restored VM runs without it until its next cold boot. A device whose
+  state encoding changed reads the old encoding.
+- Past the window, or on a CPU fingerprint mismatch, a resume becomes a
+  cold boot of the snapshot `disk` with the current kernel and image.
+  Files survive; processes and memory do not. The host reports it as a
+  reboot with the reason, never as a successful restore.
+
+Disks need none of this. A working disk is a block level clone, so
+replacing the base image never changes a disk cloned from it, and an old
+disk boots with the current kernel and agent because the agent lives in
+the initramfs (RFC 0010).
 
 ### Snapshots that leave the node
 
@@ -232,6 +265,8 @@ of 0.11.0:
 | 50 concurrent restores from one snapshot | wall time, host memory used | shared pages counted once |
 | pause of a sandbox restored from a template and idle since | pause call to VM gone, bytes written | under 100 ms, changed pages only |
 | pause of a cold-booted 2 GB guest using 300 MB | bytes written, time | about 300 MB |
+| restore of a snapshot taken by the previous release | restore call to first exec reply | same as a same-release restore |
+| resume of a snapshot past the window | what the caller sees | a reported reboot from its disk, files intact |
 
 Every number goes in the evidence log next to the cold boot figures from
 the same host and build. If restore of the base snapshot does not beat a
