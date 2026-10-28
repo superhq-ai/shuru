@@ -4,7 +4,7 @@
 - Date: 2026-10-28
 - Scope: shuru-proxy, shuru-linux, shuru-vm, shuru-cli, shuru-sdk
 - Depends on: nothing
-- Bears on: RFC 0007 (hosted Shuru), RFC 0008 (node runtime)
+- Bears on: hosted Shuru, RFC 0008 (node runtime)
 
 ## Summary
 

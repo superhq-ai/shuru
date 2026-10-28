@@ -4,7 +4,7 @@
 - Date: 2026-10-27
 - Scope: shuru-guest, shuru-proto, shuru-linux, shuru-vm, shuru-sdk, shuru-cli, `scripts/prepare-rootfs.sh`, `kernel/shuru_defconfig`, OS image
 - Depends on: nothing
-- Bears on: RFC 0007 (hosted Shuru), RFC 0009 (Linux VM snapshots)
+- Bears on: hosted Shuru, RFC 0009 (Linux VM snapshots)
 
 ## Summary
 
@@ -104,7 +104,7 @@ else leaves it.
   the power off. Other processes are not signalled; the seal captures
   what they had written.
 - **Checkpoint of a running sandbox.** The Rust SDK today, and forks of a
-  running sandbox in RFC 0007. Seal, clone, thaw; the sandbox carries on.
+  running sandbox in hosted Shuru. Seal, clone, thaw; the sandbox carries on.
   Services are not stopped. What they had written is on the disk and what
   they held in memory is not, the same contract as a cloud disk snapshot:
   a database recovers as it would after a power cut.

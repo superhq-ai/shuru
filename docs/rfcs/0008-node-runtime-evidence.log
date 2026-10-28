@@ -1,0 +1,65 @@
+=== Linux host: a1.metal, Ubuntu 24.04, kernel 7.0.0-1014-aws, KVM
+=== shuru 0.9.3 (released), OS image 0.9.2, data dir on XFS
+=== VM A writes a marker into its own /tmp and stays up; VM B, started 10 s later,
+=== reads /tmp/who. Each VM has its own working disk, so B should never see the marker.
+
+shuru 0.9.3
+=== VM A: writes a marker, stays up 40 s
+=== VM B: reads /tmp/who
+b-exit=0
+--- VM processes while A is still up
+2234 /home/ubuntu/shuru run -- sh -c echo marker-from-VM-A > /tmp/who; echo A-kernel-boot-id $(cat /proc/sys/kernel/random/boot_id); sleep 40; echo A-exiting
+a-exit=0
+--- a.log
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+A-kernel-boot-id 4cc534ea-e08a-4207-a79b-c7b9685f731a
+A-exiting
+--- b.log
+shuru: booting VM (2cpus, 2048MB RAM, 4096MB disk)...
+marker-from-VM-A
+B-kernel-boot-id 4cc534ea-e08a-4207-a79b-c7b9685f731a
+B-done
+--- vsock CID errors
+none logged
+=== done
+
+=== drivers/vhost/vsock.c, linux-6.12.y: a second VM asking for CID 3 gets EADDRINUSE.
+=== shuru-linux would log that and carry on. B logged nothing, which fits the host side
+=== connecting to CID 3, owned by VM A, and finishing before B set up its own vsock device.
+
+static int vhost_vsock_set_cid(struct vhost_vsock *vsock, u64 guest_cid)
+{
+	struct vhost_vsock *other;
+
+	/* Refuse reserved CIDs */
+	if (guest_cid <= VMADDR_CID_HOST ||
+	    guest_cid == U32_MAX)
+		return -EINVAL;
+
+	/* 64-bit CIDs are not yet supported */
+	if (guest_cid > U32_MAX)
+		return -EINVAL;
+
+	/* Refuse if CID is assigned to the guest->host transport (i.e. nested
+	 * VM), to make the loopback work.
+	 */
+	if (vsock_find_cid(guest_cid))
+		return -EADDRINUSE;
+
+	/* Refuse if CID is already in use */
+	mutex_lock(&vhost_vsock_mutex);
+	other = vhost_vsock_get(guest_cid);
+	if (other && other != vsock) {
+		mutex_unlock(&vhost_vsock_mutex);
+		return -EADDRINUSE;
+	}
+
+	if (vsock->guest_cid)
+		hash_del_rcu(&vsock->hash);
+
+	vsock->guest_cid = guest_cid;
+	hash_add_rcu(vhost_vsock_hash, &vsock->hash, vsock->guest_cid);
+	mutex_unlock(&vhost_vsock_mutex);
+
+	return 0;
+}
