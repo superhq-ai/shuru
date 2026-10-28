@@ -70,6 +70,43 @@ travel in 256 KiB frames. A failed write reports the guest error, and the
 TypeScript SDK no longer rescans a long response line for every chunk it
 receives, which made a 64 MB read take 1.7 s instead of 0.5 s.
 
+### Host memory no longer grows with what the guest does
+
+A guest could grow the host shuru process without limit: by writing to a
+socket the remote never read, by flooding a socket the guest never read, or
+by printing to a spawned process stdout the client never consumed. The old
+build reached 2 GB in five seconds on the last case. The proxy now holds a
+fixed window per connection each way and its smoltcp buffers are halved to
+512 KiB and 256 KiB at the same measured throughput. stdio and SDK event
+queues are bounded, and buffered exec output and file reads fail past 64 MiB
+with an error that points at streaming instead. On Linux the VMM validates virtqueue
+sizes, ring addresses and descriptor chains, and caps virtio-fs handles,
+inodes and request sizes, so a guest cannot loop, crash or inflate it either.
+RFC 0011 has the rule, the remaining per-VM ceilings and the cgroup envelope
+for hosted nodes.
+
+### Kill reaches a process that stopped reading stdin
+
+Stdin and the kill signal shared one connection, so a process that stopped
+reading stdin left the kill queued behind stdin nobody would take, and the
+SDK kept piling stdin up in the shuru process. A kill now sends SIGTERM as
+before and, if the process is still running two seconds later, SIGKILL on a
+connection of its own. The guest also kills a process group when the host
+hangs up on it. In the TypeScript SDK, `write()` on a spawned process now
+returns a promise that resolves once the data reaches the VM; up to 1 MiB
+is in flight and the rest waits in the calling process. The stdio server
+refuses more than 4 MiB of unacknowledged stdin per process. A single write
+over 1 MiB used to break the stream; it is now split.
+
+### Short connections no longer get refused at random
+
+The network proxy added a listener for each guest SYN it inspected, but
+smoltcp also read frames straight from the guest while it polled. A SYN that
+arrived during a poll skipped inspection and was answered with a reset, so a
+loop of short connections failed with "Connection refused" somewhere between
+150 and 475 connections in. smoltcp now only sees inspected frames, and 600
+back to back connections succeed.
+
 ### Checkpoint saves report stopped services again
 
 `shuru checkpoint create --verbose` prints the services that were stopped

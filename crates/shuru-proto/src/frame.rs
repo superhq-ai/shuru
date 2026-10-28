@@ -172,3 +172,6 @@ pub const THAW_REQ: u8 = 0x64;
 pub const THAW_RESP: u8 = 0x65;
 pub const TRIM_REQ: u8 = 0x66;
 pub const TRIM_RESP: u8 = 0x67;
+
+pub const KILL_REQ: u8 = 0x18;
+pub const KILL_RESP: u8 = 0x19;

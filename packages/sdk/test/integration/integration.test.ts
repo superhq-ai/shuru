@@ -73,6 +73,31 @@ describe.if(canRun)("sandbox lifecycle", () => {
 		expect(result.stdout.trim()).toBe("alive");
 	}, 30_000);
 
+	test("stdin larger than a frame reaches a spawned process", async () => {
+		const size = 3 * 1024 * 1024 + 5;
+		const proc = await sb.spawn(`head -c ${size} | wc -c`);
+		let out = "";
+		proc.on("stdout", (d) => {
+			out += d.toString();
+		});
+		await proc.write(Buffer.alloc(size, 0x61));
+		expect(await proc.exited).toBe(0);
+		expect(out.trim()).toBe(String(size));
+	}, 30_000);
+
+	test("kill reaches a process that stopped reading stdin", async () => {
+		const proc = await sb.spawn("sleep 600");
+		const writes = proc.write(Buffer.alloc(8 * 1024 * 1024));
+		await new Promise((r) => setTimeout(r, 1000));
+		const start = Date.now();
+		await proc.kill();
+		await proc.exited;
+		expect(Date.now() - start).toBeLessThan(10_000);
+		await expect(writes).rejects.toThrow();
+		const result = await sb.exec("pgrep -x sleep || echo none");
+		expect(result.stdout.trim()).toBe("none");
+	}, 30_000);
+
 	test("multiple sequential execs", async () => {
 		await sb.exec("echo a > /tmp/seq.txt");
 		await sb.exec("echo b >> /tmp/seq.txt");

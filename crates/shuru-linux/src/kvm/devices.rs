@@ -687,7 +687,11 @@ impl MmioHandler for VirtioMmioDevice {
             VIRTIO_MMIO_QUEUE_SEL => core.queue_sel = val,
             VIRTIO_MMIO_QUEUE_NUM => {
                 if let Some(q) = core.selected_queue_mut() {
-                    q.size = val as u16;
+                    q.size = if (1..=q.max_size as u32).contains(&val) {
+                        val as u16
+                    } else {
+                        0
+                    };
                 }
             }
             VIRTIO_MMIO_QUEUE_READY => {
@@ -1073,7 +1077,11 @@ pub struct NetBackend {
     mac: [u8; 6],
     rx_running: Arc<AtomicBool>,
     rx_thread: Option<std::thread::JoinHandle<()>>,
+    tx_buf: Vec<u8>,
 }
+
+// The virtio-net header plus one Ethernet frame at the 65535-byte IP MTU.
+const MAX_TX_FRAME: usize = VIRTIO_NET_HDR_SIZE + 14 + 65535;
 
 impl NetBackend {
     pub fn new(fd: RawFd, mac: [u8; 6]) -> Self {
@@ -1081,6 +1089,7 @@ impl NetBackend {
             fd,
             mac,
             rx_running: Arc::new(AtomicBool::new(false)),
+            tx_buf: vec![0; MAX_TX_FRAME],
             rx_thread: None,
         }
     }
@@ -1155,30 +1164,36 @@ impl VirtioBackend for NetBackend {
             return false; // RX handled by thread
         }
         let q = match queues.get_mut(1) {
-            Some(q) if q.ready => q,
-            _ => return false,
+            Some(q) => q,
+            None => return false,
         };
-
-        let current_avail = avail_idx(mem, q.avail_addr);
+        let current_avail = match q.pending(mem) {
+            Some(idx) => idx,
+            None => return false,
+        };
         let used = q.last_avail_idx != current_avail;
         while q.last_avail_idx != current_avail {
             let head = avail_ring_entry(mem, q.avail_addr, q.size, q.last_avail_idx);
 
-            let mut packet = Vec::new();
-            let mut desc = read_desc(mem, q.desc_addr, head);
-            loop {
-                let mut buf = vec![0u8; desc.len as usize];
-                let _ = mem.read_slice(&mut buf, GuestAddress(desc.addr));
-                packet.extend_from_slice(&buf);
-                if desc.flags & VRING_DESC_F_NEXT == 0 {
+            // A chain that loops, is longer than one frame, or points
+            // outside guest memory is dropped.
+            let mut len = 0;
+            for desc in q.chain(mem, head, VRING_DESC_F_NEXT).unwrap_or_default() {
+                let end = len + desc.len as usize;
+                if end > MAX_TX_FRAME
+                    || mem
+                        .read_slice(&mut self.tx_buf[len..end], GuestAddress(desc.addr))
+                        .is_err()
+                {
+                    len = 0;
                     break;
                 }
-                desc = read_desc(mem, q.desc_addr, desc.next);
+                len = end;
             }
 
             // Skip virtio-net header, send raw Ethernet frame
-            if packet.len() > VIRTIO_NET_HDR_SIZE {
-                let frame = &packet[VIRTIO_NET_HDR_SIZE..];
+            if len > VIRTIO_NET_HDR_SIZE {
+                let frame = &self.tx_buf[VIRTIO_NET_HDR_SIZE..len];
                 unsafe {
                     libc::send(
                         self.fd,
@@ -1242,12 +1257,21 @@ fn net_rx_loop(
         let frame = &buf[..n as usize];
 
         // Check for available RX descriptors
-        let current_avail = avail_idx(&mem, rx_q.avail_addr);
+        let mut ring = rx_q.clone();
+        ring.last_avail_idx = last_avail;
+        let current_avail = match ring.pending(&mem) {
+            Some(idx) => idx,
+            None => continue,
+        };
         if last_avail == current_avail {
             continue; // drop frame — no buffers
         }
 
         let head = avail_ring_entry(&mem, rx_q.avail_addr, rx_q.size, last_avail);
+        if head >= rx_q.size {
+            last_avail = last_avail.wrapping_add(1);
+            continue;
+        }
         let desc = read_desc(&mem, rx_q.desc_addr, head);
 
         let total = VIRTIO_NET_HDR_SIZE + frame.len();
@@ -1400,3 +1424,108 @@ mod block_tests {
     }
 }
 
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    const DESC: u64 = 0x1000;
+    const AVAIL: u64 = 0x2000;
+    const USED: u64 = 0x3000;
+
+    fn queue(size: u16) -> VirtioQueueState {
+        VirtioQueueState {
+            size,
+            ready: true,
+            desc_addr: DESC,
+            avail_addr: AVAIL,
+            used_addr: USED,
+            ..VirtioQueueState::new(256)
+        }
+    }
+
+    fn desc(mem: &GuestMemoryMmap, i: u16, addr: u64, len: u32, flags: u16, next: u16) {
+        let at = DESC + i as u64 * 16;
+        mem.write_obj(addr, GuestAddress(at)).unwrap();
+        mem.write_obj(len, GuestAddress(at + 8)).unwrap();
+        mem.write_obj(flags, GuestAddress(at + 12)).unwrap();
+        mem.write_obj(next, GuestAddress(at + 14)).unwrap();
+    }
+
+    fn offer(mem: &GuestMemoryMmap, heads: &[u16]) {
+        for (i, head) in heads.iter().enumerate() {
+            mem.write_obj(*head, GuestAddress(AVAIL + 4 + i as u64 * 2))
+                .unwrap();
+        }
+        mem.write_obj(heads.len() as u16, GuestAddress(AVAIL + 2))
+            .unwrap();
+    }
+
+    fn memory() -> GuestMemoryMmap {
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap()
+    }
+
+    #[test]
+    fn pending_rejects_unusable_queues() {
+        let mem = memory();
+        offer(&mem, &[0]);
+        assert_eq!(queue(8).pending(&mem), Some(1));
+        assert_eq!(queue(0).pending(&mem), None);
+        assert_eq!(queue(257).pending(&mem), None);
+        let mut far = queue(8);
+        far.desc_addr = 0x1FFC0;
+        assert_eq!(far.pending(&mem), None);
+        mem.write_obj(9u16, GuestAddress(AVAIL + 2)).unwrap();
+        assert_eq!(queue(8).pending(&mem), None);
+    }
+
+    #[test]
+    fn chain_rejects_loops_out_of_range_and_foreign_flags() {
+        let mem = memory();
+        let q = queue(8);
+        desc(&mem, 0, 0x8000, 4, VRING_DESC_F_NEXT, 1);
+        desc(&mem, 1, 0x8000, 4, 0, 0);
+        assert_eq!(
+            q.chain(&mem, 0, VRING_DESC_F_NEXT).map(|c| c.len()),
+            Some(2)
+        );
+        desc(&mem, 1, 0x8000, 4, VRING_DESC_F_NEXT, 0);
+        assert!(q.chain(&mem, 0, VRING_DESC_F_NEXT).is_none());
+        desc(&mem, 1, 0x8000, 4, VRING_DESC_F_NEXT, 8);
+        assert!(q.chain(&mem, 0, VRING_DESC_F_NEXT).is_none());
+        desc(&mem, 1, 0x8000, 4, VRING_DESC_F_WRITE, 0);
+        assert!(q.chain(&mem, 0, VRING_DESC_F_NEXT).is_none());
+        assert!(q.chain(&mem, 8, VRING_DESC_F_NEXT).is_none());
+    }
+
+    #[test]
+    fn net_tx_drops_bad_chains_and_sends_good_frames() {
+        let mem = memory();
+        let (host, guest) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        host.set_nonblocking(true).unwrap();
+        let mut net = NetBackend::new(guest.as_raw_fd(), [0; 6]);
+        let mut queues = [queue(8), queue(8)];
+
+        // A chain that points at itself, then one descriptor of 4 GiB.
+        desc(&mem, 0, 0x8000, 64, VRING_DESC_F_NEXT, 0);
+        desc(&mem, 1, 0x8000, u32::MAX, 0, 0);
+        // A frame split over two descriptors.
+        mem.write_slice(&[0xAB; 64], GuestAddress(0x9000)).unwrap();
+        desc(
+            &mem,
+            2,
+            0x9000,
+            VIRTIO_NET_HDR_SIZE as u32,
+            VRING_DESC_F_NEXT,
+            3,
+        );
+        desc(&mem, 3, 0x9000 + VIRTIO_NET_HDR_SIZE as u64, 20, 0, 0);
+        offer(&mem, &[0, 1, 2]);
+
+        assert!(net.process_queue(1, &mut queues, &mem));
+        assert_eq!(queues[1].last_avail_idx, 3);
+        let mut frame = [0u8; 128];
+        assert_eq!(host.recv(&mut frame).unwrap(), 20);
+        assert!(host.recv(&mut frame).is_err());
+        drop(guest);
+    }
+}

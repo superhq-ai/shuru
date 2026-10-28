@@ -20,6 +20,8 @@
 /// Cap on a single request head. A head larger than this is tunnelled rather
 /// than buffered without bound.
 const MAX_HEAD: usize = 64 * 1024;
+/// Longest chunk-size or trailer line kept while looking for its end.
+const MAX_CHUNK_LINE: usize = 4096;
 
 const HEAD_END: &[u8] = b"\r\n\r\n";
 
@@ -233,6 +235,10 @@ impl Chunked {
                             }
                         }
                         None => {
+                            // Not consuming makes the caller tunnel the rest.
+                            if line.len() + rest.len() > MAX_CHUNK_LINE {
+                                return (pos, false);
+                            }
                             line.extend_from_slice(rest);
                             pos = data.len();
                         }
@@ -268,6 +274,9 @@ impl Chunked {
                             }
                         }
                         None => {
+                            if line.len() + rest.len() > MAX_CHUNK_LINE {
+                                return (pos, false);
+                            }
                             line.extend_from_slice(rest);
                             pos = data.len();
                         }

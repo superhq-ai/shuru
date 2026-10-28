@@ -106,7 +106,7 @@ proc.on("stdout", (data: Buffer) => { /* real-time chunks */ });
 proc.on("stderr", (data: Buffer) => { /* real-time chunks */ });
 proc.on("exit", (code: number) => { /* process exited */ });
 
-proc.write("input to stdin\n"); // write to stdin
+await proc.write("input to stdin\n"); // resolves once it reaches the VM
 await proc.kill();               // send SIGTERM
 const exitCode = await proc.exited; // await completion
 console.log(proc.pid);             // process ID

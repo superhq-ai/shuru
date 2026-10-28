@@ -24,6 +24,16 @@ pub struct ExecRequest {
     pub cols: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Names the process for a KillRequest on another connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+}
+
+/// Kill an exec by the id it was started with. Sent on its own connection,
+/// so it arrives even when the exec connection is backed up with stdin.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KillRequest {
+    pub id: u64,
 }
 
 // --- Shutdown protocol ---

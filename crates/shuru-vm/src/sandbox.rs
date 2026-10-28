@@ -23,6 +23,43 @@ use shuru_linux::terminal;
 #[cfg(target_os = "linux")]
 use shuru_linux::*;
 
+/// Most bytes a buffered call (`read_file`, `exec_buffered`) holds on the
+/// host, so a guest cannot grow host memory by producing more.
+pub const MAX_BUFFERED: usize = 64 * 1024 * 1024;
+
+fn too_large() -> String {
+    format!(
+        "{} MiB, the limit for buffered calls; stream it instead",
+        MAX_BUFFERED >> 20
+    )
+}
+
+pub struct ExecOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: i32,
+}
+
+#[derive(Default)]
+struct Capped(Vec<u8>);
+
+impl Write for Capped {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.0.len() + buf.len() > MAX_BUFFERED {
+            return Err(std::io::Error::other(format!(
+                "output is larger than {}",
+                too_large()
+            )));
+        }
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 use shuru_proto::{
     frame, ChmodRequest, CopyRequest, DiscardRequest, ExecRequest, ForwardRequest, ForwardResponse,
     FsOkResponse, MkdirRequest, MountRequest, MountResponse, PortMapping, ReadDirRequest,
@@ -460,6 +497,23 @@ impl Sandbox {
         Ok(())
     }
 
+    /// Run a command and hold its output in memory, up to MAX_BUFFERED per
+    /// stream. Output past that fails the call; stream it with `open_exec`.
+    pub fn exec_buffered(
+        &self,
+        argv: &[impl AsRef<str>],
+        env: &HashMap<String, String>,
+    ) -> Result<ExecOutput> {
+        let mut stdout = Capped::default();
+        let mut stderr = Capped::default();
+        let exit_code = self.exec_with_env(argv, env, &mut stdout, &mut stderr)?;
+        Ok(ExecOutput {
+            stdout: stdout.0,
+            stderr: stderr.0,
+            exit_code,
+        })
+    }
+
     /// Run a command non-interactively over vsock, streaming output to the
     /// provided writers. Returns the guest process exit code.
     pub fn exec(
@@ -491,6 +545,7 @@ impl Sandbox {
             rows: None,
             cols: None,
             cwd: None,
+            id: None,
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -539,6 +594,9 @@ impl Sandbox {
             match frame::read_frame(&mut reader).context("reading read_file response")? {
                 Some((frame::READ_FILE_RESP, chunk)) if chunk.is_empty() => return Ok(data),
                 Some((frame::READ_FILE_RESP, chunk)) => {
+                    if data.len() + chunk.len() > MAX_BUFFERED {
+                        bail!("{path} is larger than {}", too_large());
+                    }
                     data.extend_from_slice(&chunk);
                 }
                 Some((frame::ERROR, payload)) => {
@@ -785,18 +843,22 @@ impl Sandbox {
     /// Open a vsock connection for streaming exec. Returns the raw stream
     /// after sending mounts + ExecRequest. Caller manages I/O (reads
     /// STDOUT/STDERR/EXIT frames, writes STDIN/KILL frames).
+    /// Returns the stream and an id that `kill_exec` takes.
     pub fn open_exec(
         &self,
         argv: &[impl AsRef<str>],
         env: &HashMap<String, String>,
         cwd: Option<&str>,
-    ) -> Result<TcpStream> {
+    ) -> Result<(TcpStream, u64)> {
         let stream = self.connect_vsock()?;
         let mut writer = stream.try_clone()?;
         let mut reader = stream.try_clone()?;
 
         self.send_mount_requests(&mut writer, &mut reader)?;
 
+        let mut bytes = [0; 8];
+        getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("generate exec id"))?;
+        let id = u64::from_ne_bytes(bytes);
         let req = ExecRequest {
             argv: argv.iter().map(|s| s.as_ref().to_string()).collect(),
             env: env.clone(),
@@ -804,10 +866,28 @@ impl Sandbox {
             rows: None,
             cols: None,
             cwd: cwd.map(|s| s.to_string()),
+            id: Some(id),
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
-        Ok(stream)
+        Ok((stream, id))
+    }
+
+    /// SIGKILL the process group of an exec from `open_exec`. Works when its
+    /// own connection is stalled, for example behind stdin it never reads.
+    pub fn kill_exec(&self, id: u64) -> Result<()> {
+        let mut stream = self.connect_vsock()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        frame::send_json(
+            &mut stream,
+            frame::KILL_REQ,
+            &shuru_proto::KillRequest { id },
+        )?;
+        match frame::read_frame(&mut stream)? {
+            Some((frame::KILL_RESP, _)) => Ok(()),
+            _ => bail!("guest did not acknowledge kill"),
+        }
     }
 
     /// Open a vsock connection for an interactive shell with PTY support.
@@ -845,6 +925,7 @@ impl Sandbox {
             rows: Some(rows),
             cols: Some(cols),
             cwd: cwd.map(|s| s.to_string()),
+            id: None,
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -892,6 +973,7 @@ impl Sandbox {
             rows: Some(rows),
             cols: Some(cols),
             cwd: None,
+            id: None,
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 

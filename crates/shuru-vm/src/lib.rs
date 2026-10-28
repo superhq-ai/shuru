@@ -6,7 +6,9 @@ mod sandbox;
 mod serial;
 mod workdisk;
 
-pub use sandbox::{AfterSave, MountConfig, PortForwardHandle, Sandbox, VmConfigBuilder};
+pub use sandbox::{
+    AfterSave, ExecOutput, MountConfig, PortForwardHandle, Sandbox, VmConfigBuilder, MAX_BUFFERED,
+};
 pub use shuru_proto::{
     frame, ExecRequest, ForwardRequest, ForwardResponse, MountRequest, MountResponse, PortMapping,
     ReadFileRequest, WriteFileRequest, WriteFileResponse, VSOCK_PORT, VSOCK_PORT_FORWARD,

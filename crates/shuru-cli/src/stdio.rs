@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use base64::Engine;
@@ -37,6 +39,16 @@ const PARSE_ERROR: i32 = -32700;
 const METHOD_NOT_FOUND: i32 = -32601;
 const INVALID_PARAMS: i32 = -32602;
 const SERVER_ERROR: i32 = -32000;
+
+const EVENT_QUEUE: usize = 64;
+
+/// Stdin a client may have queued for one process before writes fail. The
+/// SDK waits for each write to be acknowledged, so it stays well under this.
+const STDIN_BACKLOG: usize = 4 * 1024 * 1024;
+
+/// How long a killed process gets to exit before its connection is closed,
+/// which makes the guest kill it outright.
+const KILL_GRACE: Duration = Duration::from_secs(2);
 
 // --- JSON-RPC 2.0 types ---
 
@@ -261,12 +273,55 @@ enum Event {
 // --- Process handle for stdin/kill ---
 
 enum ProcessInput {
-    Stdin(Vec<u8>),
+    Stdin {
+        data: Vec<u8>,
+        id: serde_json::Value,
+    },
     Kill,
 }
 
 struct ProcessHandle {
     input_tx: std::sync::mpsc::Sender<ProcessInput>,
+    state: Arc<ProcessState>,
+}
+
+#[derive(Default)]
+struct ProcessState {
+    /// Stdin bytes accepted from the client and not yet written to the guest.
+    backlog: AtomicUsize,
+    killed: AtomicBool,
+    exited: AtomicBool,
+    exec_id: Mutex<Option<u64>>,
+}
+
+impl ProcessState {
+    /// SIGKILL the process if it outlives the grace period. A guest blocked
+    /// writing stdin to a process that never reads it cannot see the KILL
+    /// frame queued behind that stdin, so this goes on its own connection.
+    fn kill_after_grace(self: Arc<Self>, sandbox: Arc<Sandbox>) {
+        std::thread::spawn(move || {
+            std::thread::sleep(KILL_GRACE);
+            if self.exited.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Some(id) = *self.exec_id.lock().unwrap() {
+                if let Err(e) = sandbox.kill_exec(id) {
+                    eprintln!("shuru: kill failed: {e}");
+                }
+            }
+        });
+    }
+}
+
+/// Reply to a request that carried an id; notifications get no reply.
+fn reply_input(out: &SharedWriter, id: serde_json::Value, result: Result<(), String>) {
+    if id.is_null() {
+        return;
+    }
+    let _ = match result {
+        Ok(()) => send_result_shared(out, id, EmptyResult {}),
+        Err(msg) => send_error_shared(out, id, SERVER_ERROR, msg),
+    };
 }
 
 // --- Shared writer ---
@@ -359,8 +414,9 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
         None
     };
 
-    // Event channel: background threads -> main loop
-    let (event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+    // Event channel: background threads -> main loop. Bounded, so a client
+    // that stops reading stalls the guest instead of growing this process.
+    let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<Event>(EVENT_QUEUE);
 
     // Send ready notification
     send_json_shared(
@@ -481,12 +537,23 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 pid_counter += 1;
                 let pid = format!("p{}", pid_counter);
 
-                // Channel for sending stdin/kill to the process
+                // Channel for sending stdin/kill to the process. Its bytes
+                // are bounded by STDIN_BACKLOG, checked before each send.
                 let (input_tx, input_rx) = std::sync::mpsc::channel::<ProcessInput>();
-                processes.insert(pid.clone(), ProcessHandle { input_tx });
+                let state = Arc::new(ProcessState::default());
+                // Dropping a finished process ends its input thread.
+                processes.retain(|_, h| !h.state.exited.load(Ordering::SeqCst));
+                processes.insert(
+                    pid.clone(),
+                    ProcessHandle {
+                        input_tx,
+                        state: state.clone(),
+                    },
+                );
 
                 let sb = sandbox.clone();
                 let tx = event_tx.clone();
+                let out_for_input = out.clone();
                 let pid_clone = pid.clone();
                 let mut spawn_env = secret_env.clone();
                 spawn_env.extend(params.env);
@@ -494,7 +561,10 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 bg_threads.push(std::thread::spawn(move || {
                     let argv: Vec<&str> = params.argv.iter().map(|s| s.as_str()).collect();
                     let stream = match sb.open_exec(&argv, &spawn_env, params.cwd.as_deref()) {
-                        Ok(s) => s,
+                        Ok((s, id)) => {
+                            *state.exec_id.lock().unwrap() = Some(id);
+                            s
+                        }
                         Err(e) => {
                             eprintln!("shuru: spawn failed: {}", e);
                             let _ = tx.send(Event::Exit {
@@ -515,19 +585,41 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                     // Returns vsock_writer so it isn't dropped before the read
                     // loop finishes — on Apple vsock, dropping the original fd
                     // closes the entire connection even if a dup'd reader exists.
+                    let input_state = state.clone();
                     let input_thread = std::thread::spawn(move || -> std::net::TcpStream {
+                        let state = input_state;
+                        let mut closed: Option<&str> = None;
                         for msg in input_rx {
                             match msg {
-                                ProcessInput::Stdin(data) => {
-                                    if frame::write_frame(&mut vsock_writer, frame::STDIN, &data)
-                                        .is_err()
-                                    {
-                                        break;
+                                ProcessInput::Stdin { data, id } => {
+                                    state.backlog.fetch_sub(data.len(), Ordering::SeqCst);
+                                    if state.killed.load(Ordering::SeqCst) {
+                                        closed = Some("process was killed");
                                     }
+                                    let result = match closed {
+                                        Some(why) => Err(why.to_string()),
+                                        None => data
+                                            .chunks(frame::FILE_CHUNK)
+                                            .try_for_each(|chunk| {
+                                                frame::write_frame(
+                                                    &mut vsock_writer,
+                                                    frame::STDIN,
+                                                    chunk,
+                                                )
+                                            })
+                                            .map_err(|e| {
+                                                closed = Some("process stdin is closed");
+                                                format!("writing stdin: {e}")
+                                            }),
+                                    };
+                                    reply_input(&out_for_input, id, result);
                                 }
                                 ProcessInput::Kill => {
-                                    let _ = frame::write_frame(&mut vsock_writer, frame::KILL, &[]);
-                                    break;
+                                    if closed.is_none() {
+                                        let _ =
+                                            frame::write_frame(&mut vsock_writer, frame::KILL, &[]);
+                                    }
+                                    closed = Some("process was killed");
                                 }
                             }
                         }
@@ -581,6 +673,7 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                             }
                         }
                     }
+                    state.exited.store(true, Ordering::SeqCst);
 
                     let _ = input_thread.join();
                 }));
@@ -602,20 +695,55 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                     }
                 };
                 if let Some(handle) = processes.get(&params.pid) {
-                    let _ = handle.input_tx.send(ProcessInput::Kill);
+                    if !handle.state.killed.swap(true, Ordering::SeqCst) {
+                        let _ = handle.input_tx.send(ProcessInput::Kill);
+                        handle.state.clone().kill_after_grace(sandbox.clone());
+                    }
                 }
                 send_result_shared(&out, req.id, EmptyResult {})?;
             }
 
             method::INPUT => {
-                // Fire-and-forget notification (may have no id)
+                // A request is answered once the data reaches the guest; a
+                // notification (no id) gets no answer and no backpressure.
+                let id = req.id;
                 let params: InputParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
-                    Err(_) => continue,
+                    Err(e) => {
+                        reply_input(&out, id, Err(format!("invalid params: {e}")));
+                        continue;
+                    }
                 };
-                if let Some(handle) = processes.get(&params.pid) {
-                    if let Ok(data) = BASE64.decode(&params.data) {
-                        let _ = handle.input_tx.send(ProcessInput::Stdin(data));
+                let Some(handle) = processes.get(&params.pid) else {
+                    reply_input(&out, id, Err(format!("no process {}", params.pid)));
+                    continue;
+                };
+                let data = match BASE64.decode(&params.data) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        reply_input(&out, id, Err(format!("invalid base64: {e}")));
+                        continue;
+                    }
+                };
+                let len = data.len();
+                let backlog = &handle.state.backlog;
+                if backlog.load(Ordering::SeqCst) + len > STDIN_BACKLOG {
+                    let msg = format!(
+                        "stdin backlog for {} is over {} MiB; wait for earlier writes",
+                        params.pid,
+                        STDIN_BACKLOG >> 20
+                    );
+                    if id.is_null() {
+                        eprintln!("shuru: {msg}, dropped {len} bytes");
+                    }
+                    reply_input(&out, id, Err(msg));
+                    continue;
+                }
+                backlog.fetch_add(len, Ordering::SeqCst);
+                if let Err(e) = handle.input_tx.send(ProcessInput::Stdin { data, id }) {
+                    if let ProcessInput::Stdin { id, .. } = e.0 {
+                        backlog.fetch_sub(len, Ordering::SeqCst);
+                        reply_input(&out, id, Err("process has exited".into()));
                     }
                 }
             }
@@ -900,7 +1028,8 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
     // any background threads stuck on read_frame().
     let _ = sandbox.stop();
 
-    // Wait briefly for background threads to notice and exit
+    // Input threads run until their process entry goes away.
+    drop(processes);
     for thread in bg_threads {
         let _ = thread.join();
     }
@@ -917,13 +1046,10 @@ fn handle_exec(
     env: &HashMap<String, String>,
     out: &SharedWriter,
 ) -> Result<()> {
-    let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
-
-    let exit_code = match sandbox.exec_with_env(argv, env, &mut stdout_buf, &mut stderr_buf) {
-        Ok(code) => code,
+    let output = match sandbox.exec_buffered(argv, env) {
+        Ok(output) => output,
         Err(e) => {
-            return send_error_shared(out, id, SERVER_ERROR, format!("exec failed: {}", e));
+            return send_error_shared(out, id, SERVER_ERROR, format!("exec failed: {:#}", e));
         }
     };
 
@@ -931,9 +1057,9 @@ fn handle_exec(
         out,
         id,
         ExecResultPayload {
-            stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
-            exit_code,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code: output.exit_code,
         },
     )
 }

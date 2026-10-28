@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex};
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::devices::{
-    avail_idx, avail_ring_entry, read_desc, write_used, Interrupt, VirtioBackend, VirtioQueueState,
-    INTERRUPT_CONFIG, VIRTIO_F_VERSION_1, VRING_DESC_F_NEXT,
+    avail_ring_entry, write_used, Interrupt, VirtioBackend, VirtioQueueState, INTERRUPT_CONFIG,
+    VIRTIO_F_VERSION_1, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE,
 };
 
 const VIRTIO_BALLOON_F_STATS_VQ: u64 = 1 << 1;
@@ -35,6 +35,7 @@ const OFFERED_FEATURES: u64 =
 
 /// Balloon pages are always 4 KiB, whatever the guest page size.
 const PAGE_SHIFT: u32 = 12;
+const MAX_INFLATE_PFNS: u32 = 256;
 const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -181,28 +182,28 @@ impl BalloonBackend {
     }
 
     fn drain(&self, role: QueueRole, q: &mut VirtioQueueState, mem: &GuestMemoryMmap) -> bool {
-        if q.size == 0 {
-            return false;
-        }
-        let current = avail_idx(mem, q.avail_addr);
+        let current = match q.pending(mem) {
+            Some(idx) => idx,
+            None => return false,
+        };
         let used = q.last_avail_idx != current;
         while q.last_avail_idx != current {
             let head = avail_ring_entry(mem, q.avail_addr, q.size, q.last_avail_idx);
-            let mut idx = head;
-            loop {
-                let desc = read_desc(mem, q.desc_addr, idx);
+            let chain = q
+                .chain(mem, head, VRING_DESC_F_NEXT | VRING_DESC_F_WRITE)
+                .unwrap_or_default();
+            for desc in chain {
                 match role {
-                    QueueRole::Inflate => self.discard_pfns(mem, desc.addr, desc.len),
+                    // Linux sends at most 256 page numbers per buffer.
+                    QueueRole::Inflate => {
+                        self.discard_pfns(mem, desc.addr, desc.len.min(MAX_INFLATE_PFNS * 4))
+                    }
                     QueueRole::Deflate => {}
                     QueueRole::Reporting => self.discard(mem, desc.addr, desc.len as u64),
                     QueueRole::Stats | QueueRole::FreePageHint => {
                         unreachable!("the balloon does not offer stats or free page hints")
                     }
                 }
-                if desc.flags & VRING_DESC_F_NEXT == 0 {
-                    break;
-                }
-                idx = desc.next;
             }
             write_used(mem, q.used_addr, q.size, q.last_avail_idx, head as u32, 0);
             q.last_avail_idx = q.last_avail_idx.wrapping_add(1);

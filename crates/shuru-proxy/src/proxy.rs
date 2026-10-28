@@ -12,7 +12,7 @@ use crate::config::ProxyConfig;
 use crate::dns;
 use crate::secrets::SecretResolver;
 use crate::stack::{ConnectionId, StackCommand, StackEvent, TcpConnection};
-use crate::stream::ChannelStream;
+use crate::stream::{ChannelStream, GuestRx, GuestTx};
 use crate::substitute::RequestStream;
 use crate::tls::CertificateAuthority;
 use crate::AllowedIps;
@@ -88,12 +88,17 @@ impl ProxyEngine {
                 StackEvent::Closed { id } => {
                     self.connections.remove(&id);
                 }
-                StackEvent::DnsQuery { src, payload } => {
+                StackEvent::DnsQuery {
+                    src,
+                    payload,
+                    permit,
+                } => {
                     let cmd_tx = self.cmd_tx.clone();
                     let config = self.config.clone();
                     let allowed_ips = self.allowed_ips.clone();
                     tokio::spawn(async move {
                         dns::handle_dns_query(src, payload, cmd_tx, &config, &allowed_ips).await;
+                        drop(permit);
                     });
                 }
             }
@@ -103,6 +108,8 @@ impl ProxyEngine {
     fn handle_new_connection(&mut self, conn: TcpConnection) {
         let (data_tx, data_rx) = mpsc::unbounded_channel();
         self.connections.insert(conn.id, data_tx);
+        let guest_rx = GuestRx::new(conn.id, data_rx, self.cmd_tx.clone());
+        let guest_tx = GuestTx::new(conn.id, self.cmd_tx.clone(), conn.to_guest);
 
         let cmd_tx = self.cmd_tx.clone();
         let config = self.config.clone();
@@ -115,7 +122,8 @@ impl ProxyEngine {
             if let Err(e) = handle_connection(
                 conn.id,
                 conn.dst,
-                data_rx,
+                guest_rx,
+                guest_tx,
                 cmd_tx,
                 &config,
                 ca,
@@ -135,7 +143,8 @@ impl ProxyEngine {
 async fn handle_connection(
     id: ConnectionId,
     dst: SocketAddr,
-    mut data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut guest_rx: GuestRx,
+    guest_tx: GuestTx,
     cmd_tx: mpsc::UnboundedSender<StackCommand>,
     config: &ProxyConfig,
     ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
@@ -157,7 +166,15 @@ async fn handle_connection(
             );
             let upstream = TcpStream::connect(local_dst).await?;
             let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
-            return blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx).await;
+            return blind_relay(
+                id,
+                &mut upstream_rd,
+                &mut upstream_wr,
+                guest_rx,
+                guest_tx,
+                cmd_tx,
+            )
+            .await;
         }
     }
 
@@ -192,7 +209,7 @@ async fn handle_connection(
     if is_tls {
         // Buffer data until we have a complete TLS ClientHello record.
         // The ClientHello may span multiple TCP segments.
-        let mut tls_buf = data_rx
+        let mut tls_buf = guest_rx
             .recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("connection closed before data"))?;
@@ -204,7 +221,7 @@ async fn handle_connection(
             if tls_buf.len() >= 5 + record_len {
                 break; // have the complete record
             }
-            match data_rx.recv().await {
+            match guest_rx.recv().await {
                 Some(chunk) => tls_buf.extend_from_slice(&chunk),
                 None => break, // connection closed
             }
@@ -254,7 +271,8 @@ async fn handle_connection(
                     dst,
                     domain,
                     tls_buf,
-                    data_rx,
+                    guest_rx,
+                    guest_tx,
                     cmd_tx,
                     ca,
                     secrets,
@@ -273,7 +291,15 @@ async fn handle_connection(
         // Send the buffered TLS data
         upstream_wr.write_all(&tls_buf).await?;
 
-        return blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx).await;
+        return blind_relay(
+            id,
+            &mut upstream_rd,
+            &mut upstream_wr,
+            guest_rx,
+            guest_tx,
+            cmd_tx,
+        )
+        .await;
     }
 
     // Non-TLS: blind tunnel
@@ -281,7 +307,15 @@ async fn handle_connection(
     let upstream = TcpStream::connect(dst).await?;
     let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
 
-    blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx).await
+    blind_relay(
+        id,
+        &mut upstream_rd,
+        &mut upstream_wr,
+        guest_rx,
+        guest_tx,
+        cmd_tx,
+    )
+    .await
 }
 
 /// Blind bidirectional relay (no inspection).
@@ -289,23 +323,17 @@ async fn blind_relay(
     id: ConnectionId,
     upstream_rd: &mut tokio::net::tcp::OwnedReadHalf,
     upstream_wr: &mut tokio::net::tcp::OwnedWriteHalf,
-    mut data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut guest_rx: GuestRx,
+    guest_tx: GuestTx,
     cmd_tx: mpsc::UnboundedSender<StackCommand>,
 ) -> anyhow::Result<()> {
-    let cmd_tx_clone = cmd_tx.clone();
     let upstream_to_guest = async {
         let mut buf = vec![0u8; 65536];
         loop {
             match upstream_rd.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if cmd_tx_clone
-                        .send(StackCommand::Send {
-                            id,
-                            payload: buf[..n].to_vec(),
-                        })
-                        .is_err()
-                    {
+                    if guest_tx.send(&buf[..n]).await.is_err() {
                         break;
                     }
                 }
@@ -314,7 +342,7 @@ async fn blind_relay(
     };
 
     let guest_to_upstream = async {
-        while let Some(payload) = data_rx.recv().await {
+        while let Some(payload) = guest_rx.recv().await {
             if upstream_wr.write_all(&payload).await.is_err() {
                 break;
             }
@@ -336,7 +364,8 @@ async fn handle_mitm(
     dst: SocketAddr,
     domain: String,
     first_chunk: Vec<u8>,
-    data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    guest_rx: GuestRx,
+    guest_tx: GuestTx,
     cmd_tx: mpsc::UnboundedSender<StackCommand>,
     ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
     secrets: Arc<SecretResolver>,
@@ -348,7 +377,7 @@ async fn handle_mitm(
         ca.acceptor_for_domain(&domain)?
     };
 
-    let mut guest_stream = ChannelStream::new(id, data_rx, cmd_tx.clone());
+    let mut guest_stream = ChannelStream::new(guest_rx, guest_tx);
     guest_stream.prepend(first_chunk);
 
     // Client-side: rustls with our generated CA cert
@@ -356,9 +385,10 @@ async fn handle_mitm(
 
     // Upstream: BoringSSL — Chrome's TLS fingerprint passes Cloudflare
     let upstream_tcp = TcpStream::connect(dst).await?;
-    let upstream_tls = tokio_boring::connect(upstream_ssl.configure()?, &domain, upstream_tcp)
-        .await
-        .map_err(|e| anyhow::anyhow!("BoringSSL connect to {domain}: {e}"))?;
+    let upstream_tls =
+        tokio_boring::connect(upstream_ssl.configure()?, &domain, upstream_tcp)
+            .await
+            .map_err(|e| anyhow::anyhow!("BoringSSL connect to {domain}: {e}"))?;
 
     // HTTP/1.1 text-based relay with secret substitution
     let (mut guest_rd, mut guest_wr) = tokio::io::split(guest_tls);

@@ -27,6 +27,10 @@ mod guest {
     };
     use shuru_proto::{VSOCK_PORT, VSOCK_PORT_FORWARD};
 
+    /// Process groups of running execs, by the id the host started them with.
+    static EXECS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, i32>>> =
+        std::sync::LazyLock::new(Default::default);
+
     fn uptime_ms() -> f64 {
         let mut ts = libc::timespec {
             tv_sec: 0,
@@ -449,6 +453,14 @@ mod guest {
                             );
                         }
                     }
+                }
+                frame::KILL_REQ => {
+                    if let Ok(req) = serde_json::from_slice::<shuru_proto::KillRequest>(&payload) {
+                        if let Some(pgid) = EXECS.lock().unwrap().get(&req.id) {
+                            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                        }
+                    }
+                    let _ = frame::write_frame(&mut writer, frame::KILL_RESP, &[]);
                 }
                 frame::TRIM_REQ => match crate::disk::trim() {
                     Ok(resp) => {
@@ -1168,6 +1180,9 @@ mod guest {
         match cmd.spawn() {
             Ok(mut child) => {
                 let child_pid = child.id() as i32;
+                if let Some(id) = req.id {
+                    EXECS.lock().unwrap().insert(id, child_pid);
+                }
 
                 // Channel serializes all frame writes to prevent interleaving
                 let (tx, rx) = std::sync::mpsc::channel::<(u8, Vec<u8>)>();
@@ -1218,6 +1233,15 @@ mod guest {
                     }
                 });
 
+                // The input thread below can block writing to a child that
+                // never reads its stdin, and then cannot see the host hang
+                // up. Watch for that separately and kill the group.
+                let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let hangup_thread = vsock_reader.try_clone().ok().map(|conn| {
+                    let finished = finished.clone();
+                    std::thread::spawn(move || kill_on_hangup(conn, child_pid, &finished))
+                });
+
                 // Thread: vsock STDIN/KILL frames -> child stdin
                 let child_stdin = child.stdin.take().unwrap();
                 let input_thread = std::thread::spawn(move || {
@@ -1244,8 +1268,26 @@ mod guest {
                 // Wait for output to drain, then wait for child
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
+                // Forget the id once the child has exited but before it is
+                // reaped, so a late kill cannot reach a reused pid.
+                if let Some(id) = req.id {
+                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            child_pid as libc::id_t,
+                            &mut info,
+                            libc::WEXITED | libc::WNOWAIT,
+                        )
+                    };
+                    EXECS.lock().unwrap().remove(&id);
+                }
                 let status = child.wait().expect("failed to wait on child");
                 let exit_code = status.code().unwrap_or(-1);
+                finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(t) = hangup_thread {
+                    let _ = t.join();
+                }
 
                 let _ = tx.send((frame::EXIT, frame::exit_payload(exit_code).to_vec()));
                 drop(tx);
@@ -1258,6 +1300,27 @@ mod guest {
                 let msg = format!("failed to spawn: {}", e);
                 let mut w = vsock_writer;
                 let _ = frame::write_frame(&mut w, frame::ERROR, msg.as_bytes());
+            }
+        }
+    }
+
+    fn kill_on_hangup(
+        conn: std::net::TcpStream,
+        pgid: i32,
+        finished: &std::sync::atomic::AtomicBool,
+    ) {
+        use std::os::unix::io::AsRawFd;
+        let mut pfd = libc::pollfd {
+            fd: conn.as_raw_fd(),
+            events: libc::POLLRDHUP,
+            revents: 0,
+        };
+        while !finished.load(std::sync::atomic::Ordering::SeqCst) {
+            pfd.revents = 0;
+            let n = unsafe { libc::poll(&mut pfd, 1, 200) };
+            if n > 0 && pfd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                return;
             }
         }
     }

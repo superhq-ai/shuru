@@ -185,7 +185,10 @@ async function handleMessage(msg: {
 		}
 
 		case "input": {
-			// In mock, we just ignore input data
+			// In mock, the data is dropped; requests still get an answer
+			if (msg.id !== undefined) {
+				writeLine({ jsonrpc: "2.0", id: msg.id, result: {} });
+			}
 			break;
 		}
 
