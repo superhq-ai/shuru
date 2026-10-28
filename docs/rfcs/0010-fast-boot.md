@@ -1,6 +1,6 @@
 # RFC 0010: Fast boot and sealed disks
 
-- Status: Draft
+- Status: Implemented
 - Date: 2026-10-27
 - Scope: shuru-guest, shuru-proto, shuru-linux, shuru-vm, shuru-sdk, shuru-cli, `scripts/prepare-rootfs.sh`, `kernel/shuru_defconfig`, OS image
 - Depends on: nothing

@@ -1,6 +1,6 @@
 # RFC 0011: Host memory bounds
 
-- Status: Draft
+- Status: Implemented
 - Date: 2026-10-28
 - Scope: shuru-proxy, shuru-linux, shuru-vm, shuru-cli, shuru-sdk
 - Depends on: nothing
@@ -142,7 +142,9 @@ was blocked writing to the full stdin pipe and never read the next frame.
 - The guest also SIGKILLs the process group when the host hangs up on a
   piped exec, so a client that dies leaves nothing running. On macOS this
   does not fire while host data is still queued for the guest, which is why
-  the kill needs its own connection.
+  the kill needs its own connection. The watch stops through a pipe once
+  the child exits and before it is reaped, so it neither delays the exit
+  frame nor reaches a reused pid.
 
 ## Hosted: the cgroup envelope
 
