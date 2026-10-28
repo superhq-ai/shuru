@@ -24,6 +24,16 @@ pub struct ExecRequest {
     pub cols: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Names the process for a KillRequest on another connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+}
+
+/// Kill an exec by the id it was started with. Sent on its own connection,
+/// so it arrives even when the exec connection is backed up with stdin.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KillRequest {
+    pub id: u64,
 }
 
 // --- Shutdown protocol ---
@@ -31,7 +41,7 @@ pub struct ExecRequest {
 /// Reply to SHUTDOWN_REQ, sent once every guest service has exited and the
 /// disk is synced. `killed` lists services that ignored SIGTERM and were
 /// killed after their stop timeout.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShutdownResponse {
     #[serde(default)]
     pub stopped: Vec<String>,
@@ -228,6 +238,17 @@ pub mod watch_kind {
     pub const MODIFY: u8 = 0x02;
     pub const DELETE: u8 = 0x03;
     pub const RENAME: u8 = 0x04;
+
+    /// The name the stdio protocol and the SDKs use for a kind.
+    pub fn name(kind: u8) -> Option<&'static str> {
+        match kind {
+            CREATE => Some("create"),
+            MODIFY => Some("modify"),
+            DELETE => Some("delete"),
+            RENAME => Some("rename"),
+            _ => None,
+        }
+    }
 }
 
 /// A filesystem watch event. Binary format: `[u8 kind][path bytes...]`
@@ -282,4 +303,31 @@ mod tests {
         let req2: MountRequest = serde_json::from_str(&json).unwrap();
         assert!(!req2.read_only);
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SealRequest {
+    pub id: u64,
+    pub stop_services: bool,
+    pub lease_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ThawRequest {
+    pub id: u64,
+}
+
+/// `Sealed` carries what the guest stopped when the seal asked it to stop
+/// its services.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub enum SealResponse {
+    Sealed(ShutdownResponse),
+    Thawed,
+    Expired,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TrimResponse {
+    pub supported: bool,
+    pub bytes: u64,
 }

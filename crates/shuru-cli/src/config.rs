@@ -118,6 +118,9 @@ impl ShuruConfig {
     /// Reject a malformed config up front, so `shuru run` fails the same way
     /// whether or not networking is enabled.
     pub fn validate(&self) -> Result<()> {
+        if let Some(size) = self.disk_size {
+            shuru_vm::validate_disk_size(size)?;
+        }
         if let Some(ref secrets) = self.secrets {
             for (name, entry) in secrets {
                 entry.to_secret_config(name)?;

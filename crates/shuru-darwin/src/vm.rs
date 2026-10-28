@@ -324,8 +324,21 @@ impl VirtualMachine {
 
         self.queue.exec_block_async(&dispatch_block);
 
-        rx.recv()
-            .map_err(|_| VzError::new("vsock connection channel closed"))?
+        // The framework never calls the completion handler when the VM
+        // stops while a connect is pending.
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if matches!(self.state(), VmState::Stopped | VmState::Error) {
+                        return Err(VzError::new("VM stopped during vsock connect"));
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(VzError::new("vsock connection channel closed"));
+                }
+            }
+        }
     }
 
     pub fn state(&self) -> VmState {

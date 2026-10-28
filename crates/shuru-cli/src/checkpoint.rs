@@ -47,18 +47,14 @@ pub(crate) fn create_with_config(
     }
 
     let prepared = vm::prepare_vm(vm_args, cfg, from)?;
-    let result = vm::run_command(&prepared, &command)?;
-
     std::fs::create_dir_all(&checkpoints_dir)?;
-    eprintln!("shuru: saving checkpoint '{}'...", name);
-
-    if let Some(ref nbd_handle) = result.nbd_handle {
-        let index_path = format!("{}/{}.idx", checkpoints_dir, name);
-        nbd_handle.save_checkpoint(&index_path)?;
+    let ext = if vm::uses_cas(&prepared) {
+        "idx"
     } else {
-        let ext4_path = format!("{}/{}.ext4", checkpoints_dir, name);
-        prepared.work_disk.save_to(&ext4_path)?;
-    }
+        "ext4"
+    };
+    let dest = format!("{checkpoints_dir}/{name}.{ext}");
+    let result = vm::run_command(&prepared, &command, Some(&dest))?;
     eprintln!("shuru: checkpoint '{}' saved", name);
 
     drop(result.nbd_handle);
@@ -109,13 +105,12 @@ pub(crate) fn replace(name: &str, staging: &str) -> Result<()> {
     for ext in ["idx", "ext4", "json"] {
         let target = format!("{}/{}.{}", checkpoints_dir, name, ext);
         let source = format!("{}/{}.{}", checkpoints_dir, staging, ext);
-        if std::path::Path::new(&target).exists() {
-            std::fs::remove_file(&target)?;
-        }
         if std::path::Path::new(&source).exists() {
+            shuru_vm::check_checkpoint_format(&target)?;
             std::fs::rename(&source, &target)?;
         }
     }
+    std::fs::File::open(&checkpoints_dir)?.sync_all()?;
     eprintln!("shuru: checkpoint '{}' updated", name);
     Ok(())
 }

@@ -1,13 +1,13 @@
 [package]
 name = "shuru-vm"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "High-level VM management for shuru"
 license = "Apache-2.0"
 repository = "https://github.com/superhq-ai/shuru"
 
 [dependencies]
-shuru-proto = { version = "0.5.0", path = "../shuru-proto" }
+shuru-proto = { version = "0.6.0", path = "../shuru-proto" }
 anyhow = "1"
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
@@ -17,6 +17,6 @@ socket2 = "0.5"
 getrandom = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-shuru-darwin = { version = "0.2.2", path = "../shuru-darwin" }
+shuru-darwin = { version = "0.2.3", path = "../shuru-darwin" }
 [target.'cfg(target_os = "linux")'.dependencies]
-shuru-linux = { version = "0.4.0", path = "../shuru-linux" }
+shuru-linux = { version = "0.4.1", path = "../shuru-linux" }

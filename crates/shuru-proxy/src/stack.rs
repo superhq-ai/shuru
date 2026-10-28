@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::RawFd;
+use std::sync::Arc;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{self, Socket as TcpSocket};
@@ -12,7 +13,7 @@ use smoltcp::wire::{
 };
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 use crate::device::{DrainStatus, VZDevice};
@@ -23,27 +24,50 @@ const PREFIX_LEN: u8 = 24;
 /// Gateway MAC address (locally administered).
 const GATEWAY_MAC: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
 
-// Per-connection smoltcp ring buffers, allocated eagerly on every SYN the
-// guest sends. With window scaling the receive side bounds throughput at
-// roughly buffer / RTT, so 1 MiB gives about 20 MB/s at 50 ms, which keeps
-// apt and npm fast while a guest opening hundreds of connections, or
-// sending a SYN flood, costs the host 1.5 MiB per socket rather than 8.
-const TCP_RX_BUF_SIZE: usize = 1024 * 1024;
-const TCP_TX_BUF_SIZE: usize = 512 * 1024;
+// Per-connection smoltcp ring buffers, allocated on every SYN the guest
+// sends. They only span the hop between guest and host, under a millisecond;
+// the remote round trip is the host kernel socket. 512 KiB and 256 KiB
+// measured the same single-stream throughput as 1 MiB and 512 KiB (about 2
+// Gbit/s down, 9 up on an M-series Mac), 256 KiB and 128 KiB lost a fifth.
+const TCP_RX_BUF_SIZE: usize = 512 * 1024;
+const TCP_TX_BUF_SIZE: usize = 256 * 1024;
 // Hard ceiling on live TCP sockets, listening or connected. At the buffer
-// sizes above this bounds the netstack at about 768 MiB no matter what the
-// guest does; SYNs beyond it are dropped and the guest retransmits.
+// sizes above this bounds the netstack at 384 MiB no matter what the guest
+// does; SYNs beyond it are dropped and the guest retransmits.
 const MAX_TCP_SOCKETS: usize = 512;
+
+// Bytes in flight between the stack and the engine on one connection, in
+// each direction. Toward the host, the stack leaves data in smoltcp once
+// this many bytes wait on the engine, so a stalled remote closes the
+// window of the guest; each message also counts MESSAGE_COST, so trickled
+// one-byte segments cannot queue unbounded numbers of messages. Toward the
+// guest, a producer waits for permits that come back as the stack moves
+// bytes into smoltcp, so a guest that stops reading stops the upstream read.
+pub(crate) const TO_HOST_BUDGET: usize = 128 * 1024;
+pub(crate) const MESSAGE_COST: usize = 256;
+pub(crate) const TO_GUEST_BUDGET: usize = 128 * 1024;
+const RECV_CHUNK: usize = 64 * 1024;
+// DNS queries being resolved at once; more are dropped and the guest
+// resolver retries.
+const MAX_DNS_INFLIGHT: usize = 64;
+// A listener whose SYN never completes a handshake is reaped after this.
+const LISTEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// A socket the host closed is dropped once the guest is silent this long.
+const CLOSE_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(60);
 
 /// A new TCP connection from the guest, ready to be proxied.
 pub struct TcpConnection {
     pub id: ConnectionId,
     pub dst: SocketAddr,
+    /// Permits for bytes toward the guest, TO_GUEST_BUDGET in total.
+    pub to_guest: Arc<Semaphore>,
 }
 
-/// Opaque handle to a guest-side TCP connection inside smoltcp.
+/// Opaque handle to a guest-side TCP connection inside smoltcp. smoltcp
+/// reuses a handle once its socket is removed, so the serial tells a later
+/// connection apart from the one a late command was meant for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ConnectionId(SocketHandle);
+pub struct ConnectionId(SocketHandle, u64);
 
 /// Events from the network stack to the proxy engine.
 pub enum StackEvent {
@@ -53,14 +77,22 @@ pub enum StackEvent {
     Data { id: ConnectionId, payload: Vec<u8> },
     /// Guest closed the connection.
     Closed { id: ConnectionId },
-    /// A DNS query arrived on UDP port 53.
-    DnsQuery { src: IpEndpoint, payload: Vec<u8> },
+    /// A DNS query arrived on UDP port 53. The permit is held until it is
+    /// answered.
+    DnsQuery {
+        src: IpEndpoint,
+        payload: Vec<u8>,
+        permit: OwnedSemaphorePermit,
+    },
 }
 
 /// Commands from the proxy engine back to the network stack.
 pub enum StackCommand {
-    /// Send data to the guest on an established connection.
+    /// Send data to the guest on an established connection. The sender
+    /// holds a permit for each byte.
     Send { id: ConnectionId, payload: Vec<u8> },
+    /// The engine took `n` bytes of guest data off the connection.
+    Consumed { id: ConnectionId, n: usize },
     /// Close a connection from the host side.
     Close { id: ConnectionId },
     /// Send a DNS response back to the guest.
@@ -83,6 +115,16 @@ pub struct NetworkStack {
     pending_send: HashMap<SocketHandle, VecDeque<u8>>,
     /// Sockets waiting for pending_send to drain before closing.
     closing: HashSet<SocketHandle>,
+    /// Sockets the host closed, removed once smoltcp finishes with them.
+    draining: HashSet<SocketHandle>,
+    /// When each listener was created.
+    listen_since: HashMap<SocketHandle, std::time::Instant>,
+    /// Guest bytes, plus MESSAGE_COST per message, the engine has not taken.
+    to_host: HashMap<SocketHandle, usize>,
+    to_guest: HashMap<SocketHandle, Arc<Semaphore>>,
+    serials: HashMap<SocketHandle, u64>,
+    next_serial: u64,
+    dns_inflight: Arc<Semaphore>,
     /// Reusable buffer for poll_tcp_sockets recv_slice.
     recv_buf: Vec<u8>,
     /// Reusable scratch map for inspect_pending_frames.
@@ -135,7 +177,14 @@ impl NetworkStack {
             listening: HashMap::new(),
             pending_send: HashMap::new(),
             closing: HashSet::new(),
-            recv_buf: vec![0u8; TCP_RX_BUF_SIZE],
+            draining: HashSet::new(),
+            listen_since: HashMap::new(),
+            to_host: HashMap::new(),
+            to_guest: HashMap::new(),
+            serials: HashMap::new(),
+            next_serial: 0,
+            dns_inflight: Arc::new(Semaphore::new(MAX_DNS_INFLIGHT)),
+            recv_buf: vec![0u8; RECV_CHUNK],
             syn_scratch: HashMap::new(),
             event_tx,
             cmd_rx,
@@ -174,6 +223,7 @@ impl NetworkStack {
             // (Commands are drained inside the select! arm so they share a
             //  single waker; this top-of-loop drain is just for frames.)
             let drain_status = self.device.drain_recv();
+            self.reap_sockets();
             self.inspect_pending_frames();
             self.iface
                 .poll(Self::now(), &mut self.device, &mut self.sockets);
@@ -240,6 +290,15 @@ impl NetworkStack {
     }
 
     fn handle_command(&mut self, cmd: StackCommand) {
+        let id = match &cmd {
+            StackCommand::Send { id, .. }
+            | StackCommand::Consumed { id, .. }
+            | StackCommand::Close { id } => Some(*id),
+            StackCommand::DnsResponse { .. } => None,
+        };
+        if id.is_some_and(|id| self.serials.get(&id.0) != Some(&id.1)) {
+            return;
+        }
         match cmd {
             StackCommand::Send { id, payload } => {
                 // Ignore sends for connections already removed by poll_tcp_sockets
@@ -248,22 +307,24 @@ impl NetworkStack {
                 }
                 self.pending_send.entry(id.0).or_default().extend(&payload);
             }
+            StackCommand::Consumed { id, n } => {
+                if let Some(in_flight) = self.to_host.get_mut(&id.0) {
+                    *in_flight = in_flight.saturating_sub(n + MESSAGE_COST);
+                }
+            }
             StackCommand::Close { id } => {
                 // Connection may have already been cleaned up by poll_tcp_sockets
                 if !self.connections.contains_key(&id.0) {
-                    self.pending_send.remove(&id.0);
-                    self.closing.remove(&id.0);
                     return;
                 }
                 // Defer close until pending_send is drained so we don't
-                // drop data that hasn't been pushed to smoltcp yet.
-                if self.pending_send.get(&id.0).map_or(true, |p| p.is_empty()) {
-                    // Nothing pending — close immediately
-                    let socket = self.sockets.get_mut::<TcpSocket>(id.0);
-                    socket.close();
-                    self.connections.remove(&id.0);
-                    self.pending_send.remove(&id.0);
+                // drop data that has not been pushed to smoltcp yet. A guest
+                // that stops answering is timed out by smoltcp.
+                if self.pending_send.get(&id.0).is_none_or(|p| p.is_empty()) {
+                    self.close_socket(id.0);
                 } else {
+                    let socket = self.sockets.get_mut::<TcpSocket>(id.0);
+                    socket.set_timeout(Some(CLOSE_TIMEOUT));
                     self.closing.insert(id.0);
                 }
             }
@@ -320,6 +381,7 @@ impl NetworkStack {
                     continue;
                 }
                 let handle = self.sockets.add(socket);
+                self.listen_since.insert(handle, std::time::Instant::now());
                 live_sockets += 1;
                 self.listening
                     .entry((dst_ip, dst_port))
@@ -368,6 +430,9 @@ impl NetworkStack {
                         Ok(0) => break,
                         Ok(n) => {
                             pending.drain(..n);
+                            if let Some(budget) = self.to_guest.get(&handle) {
+                                budget.add_permits(n);
+                            }
                         }
                         Err(e) => {
                             warn!("failed to send to guest: {e}");
@@ -380,11 +445,8 @@ impl NetworkStack {
             }
             // If this socket was waiting to close and all data is now flushed,
             // initiate the TCP close (FIN).
-            if drained_empty && self.closing.remove(&handle) {
-                let socket = self.sockets.get_mut::<TcpSocket>(handle);
-                socket.close();
-                self.connections.remove(&handle);
-                self.pending_send.remove(&handle);
+            if drained_empty && self.closing.contains(&handle) {
+                self.close_socket(handle);
             }
         }
     }
@@ -406,9 +468,7 @@ impl NetworkStack {
                 // local_endpoint() is the destination the guest was trying to reach
                 // (because any_ip=true, smoltcp accepted it as local)
                 if let Some(local) = socket.local_endpoint() {
-                    let ipv4 = match local.addr {
-                        IpAddress::Ipv4(ip) => ip,
-                    };
+                    let IpAddress::Ipv4(ipv4) = local.addr;
                     // Remove this specific handle from the listener vec
                     if let Some(handles) = self.listening.get_mut(&(ipv4, local.port)) {
                         handles.retain(|h| *h != handle);
@@ -420,24 +480,38 @@ impl NetworkStack {
                     let actual_dst =
                         SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ipv4.octets())), local.port);
 
+                    self.listen_since.remove(&handle);
+                    self.next_serial += 1;
+                    self.serials.insert(handle, self.next_serial);
                     self.connections.insert(handle, actual_dst);
+                    self.to_host.insert(handle, 0);
+                    let to_guest = Arc::new(Semaphore::new(TO_GUEST_BUDGET));
+                    self.to_guest.insert(handle, to_guest.clone());
                     let _ = self.event_tx.send(StackEvent::NewConnection(TcpConnection {
-                        id: ConnectionId(handle),
+                        id: ConnectionId(handle, self.next_serial),
                         dst: actual_dst,
+                        to_guest,
                     }));
                 }
             }
 
-            // Read data from established connections
-            if self.connections.contains_key(&handle) && socket.can_recv() {
-                match socket.recv_slice(&mut self.recv_buf) {
-                    Ok(n) if n > 0 => {
+            // Read data from established connections, up to the budget.
+            let room = self
+                .to_host
+                .get(&handle)
+                .map_or(0, |in_flight| TO_HOST_BUDGET.saturating_sub(*in_flight));
+            if room > MESSAGE_COST && socket.can_recv() {
+                let max = (room - MESSAGE_COST).min(self.recv_buf.len());
+                if let Ok(n) = socket.recv_slice(&mut self.recv_buf[..max]) {
+                    if n > 0 {
+                        if let Some(in_flight) = self.to_host.get_mut(&handle) {
+                            *in_flight += n + MESSAGE_COST;
+                        }
                         let _ = self.event_tx.send(StackEvent::Data {
-                            id: ConnectionId(handle),
+                            id: ConnectionId(handle, self.serials[&handle]),
                             payload: self.recv_buf[..n].to_vec(),
                         });
                     }
-                    _ => {}
                 }
             }
 
@@ -447,11 +521,9 @@ impl NetworkStack {
                 && !socket.may_recv()
                 && !socket.may_send()
             {
-                self.connections.remove(&handle);
-                self.pending_send.remove(&handle);
-                let _ = self.event_tx.send(StackEvent::Closed {
-                    id: ConnectionId(handle),
-                });
+                let id = ConnectionId(handle, self.serials[&handle]);
+                self.forget(handle);
+                let _ = self.event_tx.send(StackEvent::Closed { id });
                 self.sockets.remove(handle);
             }
         }
@@ -462,15 +534,69 @@ impl NetworkStack {
         let mut buf = [0u8; 4096];
         while socket.can_recv() {
             match socket.recv_slice(&mut buf) {
-                Ok((n, meta)) => {
-                    let _ = self.event_tx.send(StackEvent::DnsQuery {
-                        src: meta.endpoint,
-                        payload: buf[..n].to_vec(),
-                    });
-                }
+                Ok((n, meta)) => match self.dns_inflight.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        let _ = self.event_tx.send(StackEvent::DnsQuery {
+                            src: meta.endpoint,
+                            payload: buf[..n].to_vec(),
+                            permit,
+                        });
+                    }
+                    Err(_) => debug!("DNS query dropped: {MAX_DNS_INFLIGHT} in flight"),
+                },
                 Err(_) => break,
             }
         }
+    }
+
+    /// Stop tracking a connection. Producers waiting to send to it fail.
+    fn forget(&mut self, handle: SocketHandle) {
+        self.connections.remove(&handle);
+        self.pending_send.remove(&handle);
+        self.closing.remove(&handle);
+        self.to_host.remove(&handle);
+        self.serials.remove(&handle);
+        if let Some(budget) = self.to_guest.remove(&handle) {
+            budget.close();
+        }
+    }
+
+    /// Start a host-side close. The socket stays in the set until smoltcp
+    /// finishes the close or the guest goes silent for CLOSE_TIMEOUT.
+    fn close_socket(&mut self, handle: SocketHandle) {
+        let socket = self.sockets.get_mut::<TcpSocket>(handle);
+        socket.set_timeout(Some(CLOSE_TIMEOUT));
+        socket.close();
+        self.forget(handle);
+        self.draining.insert(handle);
+    }
+
+    /// Remove closed sockets and listeners whose handshake never came.
+    fn reap_sockets(&mut self) {
+        let sockets = &mut self.sockets;
+        self.draining.retain(|handle| {
+            let state = sockets.get::<TcpSocket>(*handle).state();
+            let done = matches!(state, tcp::State::Closed | tcp::State::TimeWait);
+            if done {
+                sockets.remove(*handle);
+            }
+            !done
+        });
+        let since = &mut self.listen_since;
+        self.listening.retain(|_, handles| {
+            handles.retain(|handle| {
+                let stale = sockets.get::<TcpSocket>(*handle).state() == tcp::State::Listen
+                    && since
+                        .get(handle)
+                        .is_some_and(|t| t.elapsed() >= LISTEN_TIMEOUT);
+                if stale {
+                    since.remove(handle);
+                    sockets.remove(*handle);
+                }
+                !stale
+            });
+            !handles.is_empty()
+        });
     }
 
     fn now() -> Instant {

@@ -14,6 +14,7 @@ export interface StartOptions {
 	from?: string;
 	cpus?: number;
 	memory?: number;
+	/** Disk size in MB. Minimum and default: 4096. */
 	diskSize?: number;
 	allowNet?: boolean;
 	/** Allow :rw mounts to write to host filesystem. Default: false. */

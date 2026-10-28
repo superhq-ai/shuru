@@ -12,6 +12,8 @@ pub use shuru_proto::{DirEntry, ReadDirResponse, StatResponse, WatchEvent};
 pub use shuru_proxy::config::{ExposeHostMapping, NetworkConfig, ProxyConfig, SecretConfig};
 pub use shuru_vm::{default_data_dir, MountConfig};
 
+const EVENT_QUEUE: usize = 64;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -77,7 +79,7 @@ pub struct SandboxConfig {
     pub cpus: usize,
     /// Memory in MB. Default: 2048.
     pub memory_mb: u64,
-    /// Disk size in MB. Default: 4096.
+    /// Disk size in MB. Minimum and default: 4096.
     pub disk_size_mb: u64,
     /// Host → guest directory mounts (VirtioFS).
     pub mounts: Vec<MountConfig>,
@@ -166,7 +168,7 @@ impl ShellWriter {
 
 /// Reader half of a shell session. Receives output events asynchronously.
 pub struct ShellReader {
-    output_rx: mpsc::UnboundedReceiver<ShellEvent>,
+    output_rx: mpsc::Receiver<ShellEvent>,
 }
 
 impl ShellReader {
@@ -194,7 +196,7 @@ impl ShellHandle {
 
 /// Reader half of a file watch session. Receives filesystem events asynchronously.
 pub struct WatchReceiver {
-    event_rx: mpsc::UnboundedReceiver<WatchEvent>,
+    event_rx: mpsc::Receiver<WatchEvent>,
 }
 
 impl WatchReceiver {
@@ -289,6 +291,9 @@ enum SandboxCmd {
     DialGuest {
         port: u16,
         reply: oneshot::Sender<Result<TcpStream>>,
+    },
+    Trim {
+        reply: oneshot::Sender<Result<shuru_proto::TrimResponse>>,
     },
     Checkpoint {
         name: String,
@@ -420,7 +425,7 @@ impl AsyncSandbox {
         let writer_stream = stream.try_clone()?;
         let reader_stream = stream;
 
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
 
         let reader_thread = std::thread::Builder::new()
             .name("shuru-shell-reader".into())
@@ -429,18 +434,18 @@ impl AsyncSandbox {
                 loop {
                     match shuru_proto::frame::read_frame(&mut reader) {
                         Ok(Some((shuru_proto::frame::STDOUT, payload))) => {
-                            if event_tx.send(ShellEvent::Output(payload)).is_err() {
+                            if event_tx.blocking_send(ShellEvent::Output(payload)).is_err() {
                                 break;
                             }
                         }
                         Ok(Some((shuru_proto::frame::EXIT, payload))) => {
                             let code = shuru_proto::frame::parse_exit_code(&payload).unwrap_or(0);
-                            let _ = event_tx.send(ShellEvent::Exit(code));
+                            let _ = event_tx.blocking_send(ShellEvent::Exit(code));
                             break;
                         }
                         Ok(Some((shuru_proto::frame::ERROR, payload))) => {
                             let msg = String::from_utf8_lossy(&payload).to_string();
-                            let _ = event_tx.send(ShellEvent::Error(msg));
+                            let _ = event_tx.blocking_send(ShellEvent::Error(msg));
                             break;
                         }
                         Ok(Some(_)) => {} // skip unknown frame types
@@ -633,8 +638,16 @@ impl AsyncSandbox {
         Ok((reply_rx, progress_rx))
     }
 
-    /// Save the current rootfs state as a named checkpoint (CoW clone).
-    /// Future VMs can boot from this checkpoint via `SandboxConfig::from`.
+    /// Return free ext4 extents to the backing storage when discard is supported.
+    pub async fn trim(&self) -> Result<shuru_proto::TrimResponse> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SandboxCmd::Trim { reply })
+            .map_err(|_| anyhow::anyhow!("sandbox stopped"))?;
+        rx.await?
+    }
+
+    /// Save a sealed disk and resume the sandbox after the copy.
     pub async fn checkpoint(&self, name: &str) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
@@ -660,7 +673,7 @@ impl AsyncSandbox {
             .map_err(|_| anyhow::anyhow!("VM thread exited"))?;
         let stream = reply_rx.await??;
 
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
 
         let reader_thread = std::thread::Builder::new()
             .name("shuru-watch-reader".into())
@@ -670,7 +683,7 @@ impl AsyncSandbox {
                     match shuru_proto::frame::read_frame(&mut reader) {
                         Ok(Some((shuru_proto::frame::WATCH_EVENT, payload))) => {
                             if let Some(event) = WatchEvent::decode(&payload) {
-                                if event_tx.send(event).is_err() {
+                                if event_tx.blocking_send(event).is_err() {
                                     break;
                                 }
                             }
@@ -725,7 +738,8 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
     // Resolve asset paths
     let kernel_path = format!("{}/Image", data_dir);
     let rootfs_path = format!("{}/rootfs.ext4", data_dir);
-    let initrd_path_str = format!("{}/initramfs.cpio.gz", data_dir);
+    shuru_vm::validate_disk_size(config.disk_size_mb)?;
+    let initrd_path_str = format!("{}/initramfs.cpio", data_dir);
 
     if !std::path::Path::new(&kernel_path).exists() {
         bail!(
@@ -784,6 +798,12 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
     #[cfg(not(feature = "cas"))]
     let use_nbd = false;
 
+    if config.from.is_none() && !use_nbd {
+        if let Err(e) = shuru_vm::WorkDisk::prepare_base(&source) {
+            tracing::warn!("{:#}", e);
+        }
+    }
+
     // A CAS run is served over NBD, so its disk is only a placeholder.
     let work_disk = if use_nbd {
         shuru_vm::WorkDisk::empty(&data_dir)?
@@ -828,15 +848,19 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
     let initrd_path = if std::path::Path::new(&initrd_path_str).exists() {
         Some(initrd_path_str)
     } else {
-        None
+        bail!("required initramfs not found at {}", initrd_path_str);
     };
 
     // Set up proxy networking if enabled
     let (vm_fd, proxy_handle) = if config.allow_net {
-        let mut proxy_config = ProxyConfig::default();
-        proxy_config.secrets = config.secrets;
-        proxy_config.network.allow = config.allowed_hosts;
-        proxy_config.expose_host = config.expose_host;
+        let proxy_config = ProxyConfig {
+            secrets: config.secrets,
+            network: NetworkConfig {
+                allow: config.allowed_hosts,
+            },
+            expose_host: config.expose_host,
+            ..Default::default()
+        };
 
         let (vm_fd, host_fd) = shuru_proxy::create_socketpair()?;
         let handle = shuru_proxy::start(host_fd, proxy_config)?;
@@ -1058,6 +1082,9 @@ fn run_vm_loop(
             SandboxCmd::SetMemoryTarget { bytes, reply } => {
                 let _ = reply.send(sandbox.set_memory_target(bytes));
             }
+            SandboxCmd::Trim { reply } => {
+                let _ = reply.send(sandbox.trim());
+            }
             SandboxCmd::Checkpoint { name, reply } => {
                 let result = (|| -> Result<()> {
                     shuru_vm::validate_checkpoint_name(&name).map_err(|e| anyhow::anyhow!(e))?;
@@ -1068,20 +1095,18 @@ fn run_vm_loop(
                     #[cfg(feature = "cas")]
                     if let Some(ref handle) = nbd_handle {
                         let index_path = format!("{}/{}.idx", checkpoints_dir, name);
-                        if std::path::Path::new(&index_path).exists() {
-                            std::fs::remove_file(&index_path)?;
-                        }
-                        handle.save_checkpoint(&index_path)?;
+                        sandbox.save_disk(&index_path, shuru_vm::AfterSave::Thaw, |p| {
+                            handle.save_checkpoint(p)
+                        })?;
                         info!("checkpoint '{}' saved (CAS)", name);
                         return Ok(());
                     }
 
                     // Direct path: save as .ext4 via CoW clone
                     let checkpoint_path = format!("{}/{}.ext4", checkpoints_dir, name);
-                    if std::path::Path::new(&checkpoint_path).exists() {
-                        std::fs::remove_file(&checkpoint_path)?;
-                    }
-                    work_disk.save_to(&checkpoint_path)?;
+                    sandbox.save_disk(&checkpoint_path, shuru_vm::AfterSave::Thaw, |p| {
+                        work_disk.save_to(p)
+                    })?;
                     info!("checkpoint '{}' saved", name);
                     Ok(())
                 })();
@@ -1103,15 +1128,10 @@ fn exec_command(
     argv: &[String],
     env: &HashMap<String, String>,
 ) -> Result<ExecResult> {
-    let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
-    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-
-    let exit_code = sandbox.exec_with_env(&argv_refs, env, &mut stdout_buf, &mut stderr_buf)?;
-
+    let output = sandbox.exec_buffered(argv, env)?;
     Ok(ExecResult {
-        stdout: String::from_utf8_lossy(&stdout_buf).to_string(),
-        stderr: String::from_utf8_lossy(&stderr_buf).to_string(),
-        exit_code,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code: output.exit_code,
     })
 }

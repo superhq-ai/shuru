@@ -185,7 +185,10 @@ async function handleMessage(msg: {
 		}
 
 		case "input": {
-			// In mock, we just ignore input data
+			// In mock, the data is dropped; requests still get an answer
+			if (msg.id !== undefined) {
+				writeLine({ jsonrpc: "2.0", id: msg.id, result: {} });
+			}
 			break;
 		}
 
@@ -311,6 +314,10 @@ async function handleMessage(msg: {
 			break;
 		}
 
+		case "trim": {
+			writeLine({ jsonrpc: "2.0", id: msg.id, result: { supported: true, bytes: 1048576 } });
+			break;
+		}
 		case "checkpoint": {
 			writeLine({ jsonrpc: "2.0", id: msg.id, result: {} });
 			process.exit(0);

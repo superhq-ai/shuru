@@ -159,7 +159,10 @@ fn load_specs() -> Vec<Spec> {
         let name = match path.file_stem().and_then(|s| s.to_str()) {
             Some(n) if valid_name(n) => n.to_string(),
             _ => {
-                log_line(&format!("ignoring service file {}: bad name", path.display()));
+                log_line(&format!(
+                    "ignoring service file {}: bad name",
+                    path.display()
+                ));
                 continue;
             }
         };
@@ -299,10 +302,7 @@ fn watch_until_ready(spec: Spec, pid: i32) {
             }
         }
         if Instant::now() >= deadline {
-            let msg = format!(
-                "not ready after {}s",
-                spec.ready_timeout.as_secs()
-            );
+            let msg = format!("not ready after {}s", spec.ready_timeout.as_secs());
             log_line(&format!("service {} {}", spec.name, msg));
             set_state(&spec.name, State::Failed(msg));
             return;
@@ -386,13 +386,10 @@ pub fn wait_ready() -> Result<(), String> {
                 .0;
             continue;
         }
-        let failed = reg
-            .services
-            .iter()
-            .find_map(|s| match &s.state {
-                State::Failed(reason) => Some((s.name.clone(), reason.clone())),
-                _ => None,
-            });
+        let failed = reg.services.iter().find_map(|s| match &s.state {
+            State::Failed(reason) => Some((s.name.clone(), reason.clone())),
+            _ => None,
+        });
         drop(reg);
         return match failed {
             None => Ok(()),
@@ -409,7 +406,7 @@ pub fn wait_ready() -> Result<(), String> {
 }
 
 /// Stop every running service (SIGTERM, then SIGKILL to its process group
-/// after its stop timeout), then sync the disk.
+/// after its stop timeout). The disk control path handles synchronization.
 pub fn shutdown() -> ShutdownResponse {
     let targets: Vec<(String, i32, Duration)> = {
         let mut reg = registry();
@@ -482,6 +479,5 @@ pub fn shutdown() -> ShutdownResponse {
             resp.killed
         ));
     }
-    unsafe { libc::sync() };
     resp
 }

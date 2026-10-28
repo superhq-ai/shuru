@@ -1,6 +1,6 @@
 {
   "name": "@superhq/shuru",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",

@@ -179,22 +179,11 @@ impl Device for VZDevice {
     type TxToken<'a> = VZTxToken;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // First drain pre-read frames, then try reading directly from the
-        // socketpair for frames that arrived during poll. Drop ICMP in both
-        // paths to match the filter in drain_recv().
-        loop {
-            let buffer = match self.pending_rx.pop_front() {
-                Some(b) => b,
-                None => match self.recv_one_frame() {
-                    RecvOne::Frame(b) => b,
-                    RecvOne::WouldBlock | RecvOne::Error(_) => return None,
-                },
-            };
-            if Self::is_icmp(&buffer) {
-                continue;
-            }
-            return Some((VZRxToken { buffer }, VZTxToken { fd: self.fd }));
-        }
+        // Only frames pre-read by drain_recv(). The stack adds a listener for
+        // each SYN among them before smoltcp sees it, so a frame read here
+        // directly would have its SYN answered with a reset.
+        let buffer = self.pending_rx.pop_front()?;
+        Some((VZRxToken { buffer }, VZTxToken { fd: self.fd }))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
@@ -275,9 +264,8 @@ mod tests {
     impl Pair {
         fn new() -> Self {
             let mut fds = [0i32; 2];
-            let r = unsafe {
-                libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr())
-            };
+            let r =
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
             assert_eq!(r, 0, "socketpair failed");
             // Generous buffer so we can queue >MAX_PENDING_FRAMES frames.
             let bufsize: libc::c_int = 16 * 1024 * 1024;
@@ -363,7 +351,7 @@ mod tests {
     fn drain_recv_returns_hit_cap_when_pending_rx_fills() {
         let pair = Pair::new();
         let frame = make_frame(6); // TCP
-        // Send slightly more than MAX_PENDING_FRAMES so HitCap is unambiguous.
+                                   // Send slightly more than MAX_PENDING_FRAMES so HitCap is unambiguous.
         for _ in 0..(MAX_PENDING_FRAMES + 16) {
             pair.send(&frame);
         }
@@ -373,7 +361,23 @@ mod tests {
         // A second drain should pick up the rest and end at WouldBlock.
         device.pending_rx.clear();
         let status = device.drain_recv();
-        assert!(matches!(status, DrainStatus::WouldBlock | DrainStatus::HitCap));
+        assert!(matches!(
+            status,
+            DrainStatus::WouldBlock | DrainStatus::HitCap
+        ));
     }
 
+    #[test]
+    fn receive_only_yields_inspected_frames() {
+        let pair = Pair::new();
+        let frame = make_frame(6);
+        pair.send(&frame);
+        let mut device = VZDevice::new(pair.host_fd);
+        assert_eq!(device.drain_recv(), DrainStatus::WouldBlock);
+        pair.send(&frame);
+        assert!(device.receive(Instant::ZERO).is_some());
+        assert!(device.receive(Instant::ZERO).is_none());
+        assert_eq!(device.drain_recv(), DrainStatus::WouldBlock);
+        assert_eq!(device.pending_rx.len(), 1);
+    }
 }

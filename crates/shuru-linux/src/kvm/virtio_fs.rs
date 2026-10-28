@@ -12,18 +12,16 @@
 //! gracefully.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::ffi::{CString, OsStr};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
-use super::devices::{
-    avail_idx, avail_ring_entry, write_used, Interrupt, VirtioBackend, VirtioQueueState,
-};
+use super::devices::{avail_ring_entry, write_used, Interrupt, VirtioBackend, VirtioQueueState};
 
 // ===========================================================================
 // FUSE wire protocol (subset)
@@ -82,6 +80,8 @@ const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
 const FUSE_ASYNC_DIO: u32 = 1 << 15;
 
 const MAX_WRITE: u32 = 128 * 1024;
+const MAX_OPEN_FILES: usize = 512;
+const MAX_INODES: usize = 1 << 18;
 
 // ===========================================================================
 // Plain-data wire structs (repr(C, packed) so we can reinterpret raw bytes)
@@ -173,14 +173,6 @@ struct FuseAttrOut {
     attr_valid_nsec: u32,
     dummy: u32,
     attr: FuseAttr,
-}
-
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-struct FuseGetattrIn {
-    getattr_flags: u32,
-    dummy: u32,
-    fh: u64,
 }
 
 #[repr(C)]
@@ -331,20 +323,6 @@ struct FuseDirent {
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
-struct FuseGetxattrIn {
-    size: u32,
-    padding: u32,
-}
-
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-struct FuseAccessIn {
-    mask: u32,
-    padding: u32,
-}
-
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
 struct FuseFsyncIn {
     fh: u64,
     fsync_flags: u32,
@@ -374,35 +352,16 @@ struct DescSpan {
     writable: bool,
 }
 
-fn collect_desc_chain(
-    mem: &GuestMemoryMmap,
-    desc_addr: u64,
-    head: u16,
-    max_descs: u16,
-) -> Vec<DescSpan> {
-    let mut out = Vec::new();
-    let mut idx = head;
-    for _ in 0..max_descs {
-        let off = idx as u64 * 16;
-        let addr: u64 = mem.read_obj(GuestAddress(desc_addr + off)).unwrap_or(0);
-        let len: u32 = mem.read_obj(GuestAddress(desc_addr + off + 8)).unwrap_or(0);
-        let flags: u16 = mem
-            .read_obj(GuestAddress(desc_addr + off + 12))
-            .unwrap_or(0);
-        let next: u16 = mem
-            .read_obj(GuestAddress(desc_addr + off + 14))
-            .unwrap_or(0);
-        out.push(DescSpan {
-            addr,
-            len,
-            writable: flags & VRING_DESC_F_WRITE != 0,
-        });
-        if flags & VRING_DESC_F_NEXT == 0 {
-            break;
-        }
-        idx = next;
-    }
-    out
+fn collect_desc_chain(mem: &GuestMemoryMmap, q: &VirtioQueueState, head: u16) -> Vec<DescSpan> {
+    q.chain(mem, head, VRING_DESC_F_NEXT | VRING_DESC_F_WRITE)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|desc| DescSpan {
+            addr: desc.addr,
+            len: desc.len,
+            writable: desc.flags & VRING_DESC_F_WRITE != 0,
+        })
+        .collect()
 }
 
 // ===========================================================================
@@ -478,6 +437,9 @@ impl<'a> RequestReader<'a> {
             if ch[0] == 0 {
                 return CString::new(bytes).ok();
             }
+            if bytes.len() >= libc::PATH_MAX as usize {
+                return None;
+            }
             bytes.push(ch[0]);
         }
     }
@@ -516,14 +478,6 @@ impl<'a> ResponseWriter<'a> {
             span_off: 0,
             total_written: 0,
         }
-    }
-
-    fn capacity(&self) -> u32 {
-        self.spans
-            .iter()
-            .filter(|s| s.writable)
-            .map(|s| s.len)
-            .sum()
     }
 
     fn write_bytes(&mut self, input: &[u8]) -> bool {
@@ -624,13 +578,18 @@ impl InodeTable {
     }
 
     /// Ensure (dev, ino) is mapped; bump its refcount and return the nodeid.
-    fn intern(&mut self, path: PathBuf, meta: &std::fs::Metadata) -> u64 {
+    /// None once MAX_INODES are mapped and this one is not among them: the
+    /// guest holds a reference to every mapped inode until it sends FORGET.
+    fn intern(&mut self, path: PathBuf, meta: &std::fs::Metadata) -> Option<u64> {
         let key = (meta.dev(), meta.ino());
         if let Some(&id) = self.by_hostid.get(&key) {
             if let Some(entry) = self.by_id.get_mut(&id) {
                 entry.refcount = entry.refcount.saturating_add(1);
             }
-            return id;
+            return Some(id);
+        }
+        if self.full() {
+            return None;
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.by_id.insert(
@@ -643,7 +602,11 @@ impl InodeTable {
             },
         );
         self.by_hostid.insert(key, id);
-        id
+        Some(id)
+    }
+
+    fn full(&self) -> bool {
+        self.by_id.len() >= MAX_INODES
     }
 
     fn forget(&mut self, nodeid: u64, n: u64) {
@@ -686,10 +649,19 @@ impl FhTable {
         }
     }
 
-    fn insert(&mut self, file: std::fs::File) -> u64 {
+    /// None once the guest holds MAX_OPEN_FILES handles, so it cannot take
+    /// the descriptors the VMM needs for its own devices.
+    fn insert(&mut self, file: std::fs::File) -> Option<u64> {
+        if self.full() {
+            return None;
+        }
         let fh = self.next.fetch_add(1, Ordering::Relaxed);
         self.files.insert(fh, file);
-        fh
+        Some(fh)
+    }
+
+    fn full(&self) -> bool {
+        self.files.len() >= MAX_OPEN_FILES
     }
 
     fn get(&self, fh: u64) -> Option<&std::fs::File> {
@@ -775,15 +747,17 @@ impl VirtioBackend for VirtioFsBackend {
     ) -> bool {
         // Both queues (hiprio = 0, request = 1) are handled the same way.
         let q = match queues.get_mut(usize::from(queue_idx)) {
-            Some(q) if q.ready && q.size > 0 => q,
-            _ => return false,
+            Some(q) => q,
+            None => return false,
         };
-
-        let current_avail = avail_idx(mem, q.avail_addr);
+        let current_avail = match q.pending(mem) {
+            Some(idx) => idx,
+            None => return false,
+        };
         let used = q.last_avail_idx != current_avail;
         while q.last_avail_idx != current_avail {
             let head = avail_ring_entry(mem, q.avail_addr, q.size, q.last_avail_idx);
-            let spans = collect_desc_chain(mem, q.desc_addr, head, q.size);
+            let spans = collect_desc_chain(mem, q, head);
 
             let written = self.handle_request(mem, &spans);
 
@@ -958,7 +932,10 @@ impl VirtioFsBackend {
         if !inodes.contains(&child_path) {
             return (-libc::EACCES, 0);
         }
-        let nodeid = inodes.intern(child_path.clone(), &meta);
+        let nodeid = match inodes.intern(child_path.clone(), &meta) {
+            Some(id) => id,
+            None => return (-libc::ENFILE, 0),
+        };
         let out = FuseEntryOut {
             nodeid,
             generation: 0,
@@ -1027,10 +1004,10 @@ impl VirtioFsBackend {
             Err(_) => return (-libc::EINVAL, 0),
         };
 
-        if req.valid & FATTR_MODE != 0 {
-            if unsafe { libc::chmod(cpath.as_ptr(), req.mode as libc::mode_t) } < 0 {
-                return (-errno(), 0);
-            }
+        if req.valid & FATTR_MODE != 0
+            && unsafe { libc::chmod(cpath.as_ptr(), req.mode as libc::mode_t) } < 0
+        {
+            return (-errno(), 0);
         }
         if req.valid & (FATTR_UID | FATTR_GID) != 0 {
             let uid = if req.valid & FATTR_UID != 0 {
@@ -1047,10 +1024,10 @@ impl VirtioFsBackend {
                 return (-errno(), 0);
             }
         }
-        if req.valid & FATTR_SIZE != 0 {
-            if unsafe { libc::truncate(cpath.as_ptr(), req.size as libc::off_t) } < 0 {
-                return (-errno(), 0);
-            }
+        if req.valid & FATTR_SIZE != 0
+            && unsafe { libc::truncate(cpath.as_ptr(), req.size as libc::off_t) } < 0
+        {
+            return (-errno(), 0);
         }
         if req.valid & (FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW) != 0 {
             let now = libc::timespec {
@@ -1118,7 +1095,10 @@ impl VirtioFsBackend {
         drop(inodes);
         match std::fs::File::open(&path) {
             Ok(f) => {
-                let fh = self.fhs.lock().unwrap().insert(f);
+                let fh = match self.fhs.lock().unwrap().insert(f) {
+                    Some(fh) => fh,
+                    None => return (-libc::EMFILE, 0),
+                };
                 let out = FuseOpenOut {
                     fh,
                     open_flags: 0,
@@ -1177,17 +1157,7 @@ impl VirtioFsBackend {
             };
             let child_path = ent.path();
 
-            let this_nodeid = if plus {
-                let mut inodes = self.inodes.lock().unwrap();
-                if !inodes.contains(&child_path) {
-                    continue;
-                }
-                inodes.intern(child_path.clone(), &meta)
-            } else {
-                meta.ino()
-            };
-
-            let kind = mode_to_dt(meta.mode() as u32);
+            let kind = mode_to_dt(meta.mode());
             let name_bytes = name.as_bytes();
             let namelen = name_bytes.len();
             let entry_size = if plus {
@@ -1200,6 +1170,21 @@ impl VirtioFsBackend {
             if written as usize + entry_size > max as usize {
                 break;
             }
+
+            // An entry is interned only once it is sure to be reported, since
+            // the guest only forgets the nodeids it was sent.
+            let this_nodeid = if plus {
+                let mut inodes = self.inodes.lock().unwrap();
+                if !inodes.contains(&child_path) {
+                    continue;
+                }
+                match inodes.intern(child_path.clone(), &meta) {
+                    Some(id) => id,
+                    None => break,
+                }
+            } else {
+                meta.ino()
+            };
 
             if plus {
                 let e = FuseEntryOut {
@@ -1280,7 +1265,10 @@ impl VirtioFsBackend {
             return (-errno(), 0);
         }
         let file = unsafe { std::os::unix::io::FromRawFd::from_raw_fd(fd) };
-        let fh = self.fhs.lock().unwrap().insert(file);
+        let fh = match self.fhs.lock().unwrap().insert(file) {
+            Some(fh) => fh,
+            None => return (-libc::EMFILE, 0),
+        };
         let out = FuseOpenOut {
             fh,
             open_flags: 0,
@@ -1309,6 +1297,12 @@ impl VirtioFsBackend {
         let mut inodes = self.inodes.lock().unwrap();
         if inodes.read_only {
             return (-libc::EROFS, 0);
+        }
+        if inodes.full() {
+            return (-libc::ENFILE, 0);
+        }
+        if self.fhs.lock().unwrap().full() {
+            return (-libc::EMFILE, 0);
         }
         let parent_path = match inodes.path_of(parent) {
             Some(p) => p,
@@ -1342,11 +1336,12 @@ impl VirtioFsBackend {
                 return (-io_errno(&e), 0);
             }
         };
-        let nodeid = inodes.intern(child.clone(), &meta);
+        // Room for both was checked above, under the same locks' owner.
+        let nodeid = inodes.intern(child.clone(), &meta).unwrap_or(0);
         drop(inodes);
 
         let file = unsafe { std::os::unix::io::FromRawFd::from_raw_fd(fd) };
-        let fh = self.fhs.lock().unwrap().insert(file);
+        let fh = self.fhs.lock().unwrap().insert(file).unwrap_or(0);
 
         let entry = FuseEntryOut {
             nodeid,
@@ -1387,7 +1382,7 @@ impl VirtioFsBackend {
         let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(file);
         drop(fhs);
 
-        let mut buf = vec![0u8; req.size as usize];
+        let mut buf = vec![0u8; req.size.min(MAX_WRITE) as usize];
         let n = unsafe {
             libc::pread(
                 raw_fd,
@@ -1412,6 +1407,9 @@ impl VirtioFsBackend {
         };
         if self.inodes.lock().unwrap().read_only {
             return (-libc::EROFS, 0);
+        }
+        if req.size > MAX_WRITE {
+            return (-libc::EINVAL, 0);
         }
         let data = match reader.read_vec(req.size as usize) {
             Some(v) => v,
@@ -1493,11 +1491,11 @@ impl VirtioFsBackend {
             return (-errno(), 0);
         }
         let out = FuseStatfsOut {
-            blocks: stat.f_blocks as u64,
-            bfree: stat.f_bfree as u64,
-            bavail: stat.f_bavail as u64,
-            files: stat.f_files as u64,
-            ffree: stat.f_ffree as u64,
+            blocks: stat.f_blocks,
+            bfree: stat.f_bfree,
+            bavail: stat.f_bavail,
+            files: stat.f_files,
+            ffree: stat.f_ffree,
             bsize: stat.f_bsize as u32,
             namelen: stat.f_namemax as u32,
             frsize: stat.f_frsize as u32,
@@ -1584,7 +1582,10 @@ impl VirtioFsBackend {
             Ok(m) => m,
             Err(e) => return (-io_errno(&e), 0),
         };
-        let nodeid = inodes.intern(child.clone(), &meta);
+        let nodeid = match inodes.intern(child.clone(), &meta) {
+            Some(id) => id,
+            None => return (-libc::ENFILE, 0),
+        };
         let out = FuseEntryOut {
             nodeid,
             generation: 0,
@@ -1686,7 +1687,7 @@ fn attr_from_meta(ino: u64, meta: &std::fs::Metadata) -> FuseAttr {
         atimensec: meta.atime_nsec() as u32,
         mtimensec: meta.mtime_nsec() as u32,
         ctimensec: meta.ctime_nsec() as u32,
-        mode: meta.mode() as u32,
+        mode: meta.mode(),
         nlink: meta.nlink() as u32,
         uid: meta.uid(),
         gid: meta.gid(),
@@ -1697,14 +1698,14 @@ fn attr_from_meta(ino: u64, meta: &std::fs::Metadata) -> FuseAttr {
 }
 
 fn mode_to_dt(mode: u32) -> u32 {
-    match mode & libc::S_IFMT as u32 {
-        m if m == libc::S_IFREG as u32 => libc::DT_REG as u32,
-        m if m == libc::S_IFDIR as u32 => libc::DT_DIR as u32,
-        m if m == libc::S_IFLNK as u32 => libc::DT_LNK as u32,
-        m if m == libc::S_IFIFO as u32 => libc::DT_FIFO as u32,
-        m if m == libc::S_IFSOCK as u32 => libc::DT_SOCK as u32,
-        m if m == libc::S_IFCHR as u32 => libc::DT_CHR as u32,
-        m if m == libc::S_IFBLK as u32 => libc::DT_BLK as u32,
+    match mode & libc::S_IFMT {
+        m if m == libc::S_IFREG => libc::DT_REG as u32,
+        m if m == libc::S_IFDIR => libc::DT_DIR as u32,
+        m if m == libc::S_IFLNK => libc::DT_LNK as u32,
+        m if m == libc::S_IFIFO => libc::DT_FIFO as u32,
+        m if m == libc::S_IFSOCK => libc::DT_SOCK as u32,
+        m if m == libc::S_IFCHR => libc::DT_CHR as u32,
+        m if m == libc::S_IFBLK => libc::DT_BLK as u32,
         _ => libc::DT_UNKNOWN as u32,
     }
 }
@@ -1729,4 +1730,38 @@ fn errno() -> i32 {
 
 fn io_errno(e: &std::io::Error) -> i32 {
     e.raw_os_error().unwrap_or(libc::EIO)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_without_a_nul_stop_at_path_max() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        mem.write_slice(&[b'a'; 0x10000], GuestAddress(0)).unwrap();
+        // Every span aliases the same guest bytes and claims 4 GiB.
+        let spans = vec![
+            DescSpan {
+                addr: 0,
+                len: u32::MAX,
+                writable: false,
+            };
+            128
+        ];
+        assert!(RequestReader::new(&mem, &spans).read_cstr().is_none());
+    }
+
+    #[test]
+    fn open_handles_are_capped() {
+        let mut fhs = FhTable::new();
+        for _ in 0..MAX_OPEN_FILES {
+            assert!(fhs
+                .insert(std::fs::File::open("/dev/null").unwrap())
+                .is_some());
+        }
+        assert!(fhs
+            .insert(std::fs::File::open("/dev/null").unwrap())
+            .is_none());
+    }
 }

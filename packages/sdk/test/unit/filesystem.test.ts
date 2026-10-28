@@ -183,3 +183,13 @@ describe("exists", () => {
 		expect(result).toBe(false);
 	});
 });
+
+test("trim reports support and leaves the sandbox running", async () => {
+	const sb = await Sandbox.start({ shuruBin: MOCK_BIN });
+	try {
+		expect(await sb.trim()).toEqual({ supported: true, bytes: 1048576 });
+		await sb.mkdir("/tmp/after-trim");
+	} finally {
+		await sb.stop();
+	}
+});

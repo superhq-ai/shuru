@@ -77,7 +77,7 @@ const sb = await Sandbox.start({
 | `from` | `string` | Checkpoint name to start from |
 | `cpus` | `number` | Number of vCPUs |
 | `memory` | `number` | Memory in MB |
-| `diskSize` | `number` | Disk size in MB |
+| `diskSize` | `number` | Disk size in MB, minimum and default 4096 |
 | `allowNet` | `boolean` | Enable network access |
 | `ports` | `string[]` | Port forwards (`"host:guest"`) |
 | `mounts` | `Record<string, string>` | Directory mounts (`{ hostPath: guestPath }`) |
@@ -106,7 +106,7 @@ proc.on("stdout", (data: Buffer) => { /* real-time chunks */ });
 proc.on("stderr", (data: Buffer) => { /* real-time chunks */ });
 proc.on("exit", (code: number) => { /* process exited */ });
 
-proc.write("input to stdin\n"); // write to stdin
+await proc.write("input to stdin\n"); // resolves once it reaches the VM
 await proc.kill();               // send SIGTERM
 const exitCode = await proc.exited; // await completion
 console.log(proc.pid);             // process ID

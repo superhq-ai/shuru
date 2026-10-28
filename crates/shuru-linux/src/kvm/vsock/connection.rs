@@ -118,15 +118,9 @@ fn send(socket: &UnixStream, bytes: &[u8]) -> io::Result<usize> {
 }
 
 pub fn sendv(socket: &UnixStream, iov: &[libc::iovec]) -> io::Result<usize> {
-    let message = libc::msghdr {
-        msg_name: std::ptr::null_mut(),
-        msg_namelen: 0,
-        msg_iov: iov.as_ptr().cast_mut(),
-        msg_iovlen: iov.len() as _,
-        msg_control: std::ptr::null_mut(),
-        msg_controllen: 0,
-        msg_flags: 0,
-    };
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = iov.as_ptr().cast_mut();
+    message.msg_iovlen = iov.len() as _;
     let n = unsafe { libc::sendmsg(socket.as_raw_fd(), &message, libc::MSG_NOSIGNAL) };
     if n < 0 {
         Err(io::Error::last_os_error())

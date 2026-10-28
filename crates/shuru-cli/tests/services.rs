@@ -65,7 +65,11 @@ impl Checkpoint {
             args.extend(["--from", from]);
         }
         let out = shuru(&args, setup);
-        assert!(out.status.success(), "checkpoint create failed\n{}", text(&out));
+        assert!(
+            out.status.success(),
+            "checkpoint create failed\n{}",
+            text(&out)
+        );
         Checkpoint(name)
     }
 }
@@ -115,7 +119,11 @@ echo "slow-alive=$(pgrep -c -f "sleep infinity")"
     assert!(s.contains("GATED_OK"), "{}", text(&out));
     assert!(s.contains("fast-log=fast-started"), "{}", text(&out));
     assert!(s.contains("slow-alive=2"), "{}", text(&out));
-    assert!(stderr(&out).contains("stopped services: fast, slow"), "{}", text(&out));
+    assert!(
+        stderr(&out).contains("stopped services: fast, slow"),
+        "{}",
+        text(&out)
+    );
 }
 
 #[test]
@@ -132,7 +140,11 @@ fn service_that_fails_blocks_the_command_with_its_log() {
     assert!(!out.status.success(), "{}", text(&out));
     assert!(!stdout(&out).contains("SHOULD_NOT_RUN"), "{}", text(&out));
     let e = stderr(&out);
-    assert!(e.contains("service bad exited with status 3"), "{}", text(&out));
+    assert!(
+        e.contains("service bad exited with status 3"),
+        "{}",
+        text(&out)
+    );
     assert!(e.contains("giving up"), "{}", text(&out));
 }
 

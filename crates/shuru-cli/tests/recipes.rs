@@ -93,7 +93,7 @@ impl Drop for Cleanup {
 const TWO_STEP_SPEC: &str = r#"{
   "name": "NAME",
   "description": "two steps and a service",
-  "disk_size": 2048,
+  "disk_size": 4096,
   "services": {
     "hello": {
       "exec": ["sh", "-c", "touch /run/hello-ran; exec sleep infinity"],
@@ -120,22 +120,38 @@ fn show_prints_metadata_and_steps_without_booting() {
     assert!(s.contains("description: two steps and a service"), "{}", s);
     assert!(s.contains("network:     offline during build"), "{}", s);
     assert!(s.contains("services:    hello"), "{}", s);
-    assert!(s.contains("--- /etc/shuru/services/hello.json ---"), "{}", s);
+    assert!(
+        s.contains("--- /etc/shuru/services/hello.json ---"),
+        "{}",
+        s
+    );
     assert!(s.contains("--- first.sh ---"), "{}", s);
     assert!(s.contains("echo step2 >> /opt/recipe/log"), "{}", s);
 }
 
 #[test]
 fn show_rejects_bad_recipes() {
-    let bad_name = LocalRecipe::new("Bad Name", TWO_STEP_SPEC, &[("first.sh", ""), ("second.sh", "")]);
+    let bad_name = LocalRecipe::new(
+        "Bad Name",
+        TWO_STEP_SPEC,
+        &[("first.sh", ""), ("second.sh", "")],
+    );
     let out = shuru(&["recipe", "show", &bad_name.path_str()]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("must match [a-z0-9]"), "{}", text(&out));
+    assert!(
+        stderr(&out).contains("must match [a-z0-9]"),
+        "{}",
+        text(&out)
+    );
 
     let missing_step = LocalRecipe::new("ok", TWO_STEP_SPEC, &[("first.sh", "")]);
     let out = shuru(&["recipe", "show", &missing_step.path_str()]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("reading step second.sh"), "{}", text(&out));
+    assert!(
+        stderr(&out).contains("reading step second.sh"),
+        "{}",
+        text(&out)
+    );
 
     let future = LocalRecipe::new(
         "future",
@@ -144,7 +160,11 @@ fn show_rejects_bad_recipes() {
     );
     let out = shuru(&["recipe", "show", &future.path_str()]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("needs shuru 99.0.0 or newer"), "{}", text(&out));
+    assert!(
+        stderr(&out).contains("needs shuru 99.0.0 or newer"),
+        "{}",
+        text(&out)
+    );
 }
 
 #[test]
@@ -159,17 +179,41 @@ fn run_builds_once_reuses_and_rebuilds_when_the_recipe_changes() {
     );
     let check = "cat /opt/recipe/log; test -f /run/hello-ran && echo RUN_SAW_SERVICE";
 
-    let out = shuru(&["run", "--recipe", &recipe.path_str(), "--", "sh", "-c", check]);
+    let out = shuru(&[
+        "run",
+        "--recipe",
+        &recipe.path_str(),
+        "--",
+        "sh",
+        "-c",
+        check,
+    ]);
     assert!(out.status.success(), "{}", text(&out));
     let s = stdout(&out);
     let e = stderr(&out);
-    assert!(e.contains(&format!("building recipe {} from", name)), "{}", e);
+    assert!(
+        e.contains(&format!("building recipe {} from", name)),
+        "{}",
+        e
+    );
     assert!(e.contains("step 1/2: first.sh"), "{}", e);
     assert!(e.contains("step 2/2: second.sh"), "{}", e);
-    assert!(s.contains("step1\nservice-file-present\nstep2\nstep2-saw-service\n"), "{}", s);
+    assert!(
+        s.contains("step1\nservice-file-present\nstep2\nstep2-saw-service\n"),
+        "{}",
+        s
+    );
     assert!(s.contains("RUN_SAW_SERVICE"), "{}", s);
 
-    let out = shuru(&["run", "--recipe", &recipe.path_str(), "--", "sh", "-c", check]);
+    let out = shuru(&[
+        "run",
+        "--recipe",
+        &recipe.path_str(),
+        "--",
+        "sh",
+        "-c",
+        check,
+    ]);
     assert!(out.status.success(), "{}", text(&out));
     let e = stderr(&out);
     assert!(e.contains(&format!("using checkpoint {}", name)), "{}", e);
@@ -185,7 +229,15 @@ fn run_builds_once_reuses_and_rebuilds_when_the_recipe_changes() {
         format!("{}echo step2-v2 >> /opt/recipe/log\n", SECOND_STEP),
     )
     .unwrap();
-    let out = shuru(&["run", "--recipe", &recipe.path_str(), "--", "sh", "-c", check]);
+    let out = shuru(&[
+        "run",
+        "--recipe",
+        &recipe.path_str(),
+        "--",
+        "sh",
+        "-c",
+        check,
+    ]);
     assert!(out.status.success(), "{}", text(&out));
     let e = stderr(&out);
     assert!(e.contains("recipe changed"), "{}", e);
@@ -193,7 +245,11 @@ fn run_builds_once_reuses_and_rebuilds_when_the_recipe_changes() {
     assert!(stdout(&out).contains("step2-v2"), "{}", text(&out));
 
     let leftovers = stdout(&shuru(&["checkpoint", "list"]));
-    assert!(!leftovers.contains(&format!("{}-step1", name)), "{}", leftovers);
+    assert!(
+        !leftovers.contains(&format!("{}-step1", name)),
+        "{}",
+        leftovers
+    );
 }
 
 #[test]
@@ -219,7 +275,11 @@ fn bare_name_never_resolves_from_the_working_directory() {
     eprintln!("{}", text(&out));
     assert!(!out.status.success(), "{}", text(&out));
     assert!(!stdout(&out).contains("local-shadow"), "{}", text(&out));
-    assert!(stderr(&out).contains("pass ./shadow-test"), "{}", text(&out));
+    assert!(
+        stderr(&out).contains("pass ./shadow-test"),
+        "{}",
+        text(&out)
+    );
 
     let out = Command::new(shuru_bin())
         .args(["recipe", "show", "./shadow-test"])
@@ -249,19 +309,40 @@ fn run_recipe_under_a_chosen_checkpoint_name() {
         &[("build.sh", "echo named > /opt/marker\n")],
     );
 
-    let args = ["run", "--recipe", &recipe.path_str(), "--checkpoint", &name, "--", "cat", "/opt/marker"];
+    let args = [
+        "run",
+        "--recipe",
+        &recipe.path_str(),
+        "--checkpoint",
+        &name,
+        "--",
+        "cat",
+        "/opt/marker",
+    ];
     let out = shuru(&args);
     assert!(out.status.success(), "{}", text(&out));
-    assert!(stderr(&out).contains("building recipe some-recipe"), "{}", text(&out));
+    assert!(
+        stderr(&out).contains("building recipe some-recipe"),
+        "{}",
+        text(&out)
+    );
     assert!(stdout(&out).contains("named"), "{}", text(&out));
 
     let out = shuru(&args);
     assert!(out.status.success(), "{}", text(&out));
-    assert!(stderr(&out).contains(&format!("using checkpoint {}", name)), "{}", text(&out));
+    assert!(
+        stderr(&out).contains(&format!("using checkpoint {}", name)),
+        "{}",
+        text(&out)
+    );
 
     let list = stdout(&shuru(&["checkpoint", "list"]));
     assert!(list.lines().any(|l| l.starts_with(&name)), "{}", list);
-    assert!(!list.lines().any(|l| l.starts_with("some-recipe ")), "{}", list);
+    assert!(
+        !list.lines().any(|l| l.starts_with("some-recipe ")),
+        "{}",
+        list
+    );
 }
 
 #[test]
@@ -275,18 +356,39 @@ fn create_builds_under_a_chosen_name_and_refuses_a_command() {
         &[("build.sh", "echo built-by-recipe > /opt/marker\n")],
     );
 
-    let out = shuru(&["checkpoint", "create", &name, "--recipe", &recipe.path_str(), "--", "echo", "no"]);
+    let out = shuru(&[
+        "checkpoint",
+        "create",
+        &name,
+        "--recipe",
+        &recipe.path_str(),
+        "--",
+        "echo",
+        "no",
+    ]);
     assert!(!out.status.success(), "{}", text(&out));
     assert!(stderr(&out).contains("drop the command"), "{}", text(&out));
 
-    let out = shuru(&["checkpoint", "create", &name, "--recipe", &recipe.path_str()]);
+    let out = shuru(&[
+        "checkpoint",
+        "create",
+        &name,
+        "--recipe",
+        &recipe.path_str(),
+    ]);
     assert!(out.status.success(), "{}", text(&out));
 
     let out = shuru(&["run", "--from", &name, "--", "cat", "/opt/marker"]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(stdout(&out).contains("built-by-recipe"), "{}", text(&out));
 
-    let out = shuru(&["checkpoint", "create", &name, "--recipe", &recipe.path_str()]);
+    let out = shuru(&[
+        "checkpoint",
+        "create",
+        &name,
+        "--recipe",
+        &recipe.path_str(),
+    ]);
     assert!(!out.status.success(), "{}", text(&out));
     assert!(stderr(&out).contains("already exists"), "{}", text(&out));
 }
@@ -302,16 +404,32 @@ fn update_rebuilds_a_recipe_checkpoint_at_the_same_revision() {
         &[("build.sh", "date +%s%N > /opt/built\n")],
     );
 
-    let out = shuru(&["checkpoint", "create", &name, "--recipe", &recipe.path_str()]);
+    let out = shuru(&[
+        "checkpoint",
+        "create",
+        &name,
+        "--recipe",
+        &recipe.path_str(),
+    ]);
     assert!(out.status.success(), "{}", text(&out));
     let first = stdout(&shuru(&["run", "--from", &name, "--", "cat", "/opt/built"]));
     assert!(!first.trim().is_empty(), "{}", first);
 
-    let out = shuru(&["checkpoint", "update", &name, "--recipe", &recipe.path_str()]);
+    let out = shuru(&[
+        "checkpoint",
+        "update",
+        &name,
+        "--recipe",
+        &recipe.path_str(),
+    ]);
     assert!(out.status.success(), "{}", text(&out));
     let e = stderr(&out);
     assert!(e.contains("building recipe"), "{}", e);
-    assert!(e.contains(&format!("checkpoint '{}' updated", name)), "{}", e);
+    assert!(
+        e.contains(&format!("checkpoint '{}' updated", name)),
+        "{}",
+        e
+    );
     let second = stdout(&shuru(&["run", "--from", &name, "--", "cat", "/opt/built"]));
     assert_ne!(first.trim(), second.trim(), "{}", second);
 
@@ -329,15 +447,26 @@ fn failing_step_keeps_no_final_checkpoint() {
     let recipe = LocalRecipe::new(
         &name,
         r#"{"name": "NAME", "steps": ["ok.sh", "bad.sh"]}"#,
-        &[("ok.sh", "echo fine\n"), ("bad.sh", "echo boom >&2\nexit 7\n")],
+        &[
+            ("ok.sh", "echo fine\n"),
+            ("bad.sh", "echo boom >&2\nexit 7\n"),
+        ],
     );
     let out = shuru(&["run", "--recipe", &recipe.path_str(), "--", "true"]);
     assert!(!out.status.success(), "{}", text(&out));
     let e = stderr(&out);
     assert!(e.contains("step bad.sh exited with status 7"), "{}", e);
-    assert!(e.contains(&format!("intermediate checkpoint {}-step1 kept", name)), "{}", e);
+    assert!(
+        e.contains(&format!("intermediate checkpoint {}-step1 kept", name)),
+        "{}",
+        e
+    );
     let list = stdout(&shuru(&["checkpoint", "list"]));
-    assert!(!list.lines().any(|l| l.starts_with(&format!("{} ", name))), "{}", list);
+    assert!(
+        !list.lines().any(|l| l.starts_with(&format!("{} ", name))),
+        "{}",
+        list
+    );
 }
 
 #[test]
@@ -349,7 +478,10 @@ fn browser_recipe_serves_cdp_inside_and_through_a_forwarded_port() {
         eprintln!("skipped: set SHURU_BROWSER_RECIPE to the browser recipe directory");
         return;
     };
-    if !std::env::var("SHURU_TEST_NET").map(|v| v == "1").unwrap_or(false) {
+    if !std::env::var("SHURU_TEST_NET")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         eprintln!("skipped: set SHURU_TEST_NET=1");
         return;
     }
@@ -358,11 +490,23 @@ fn browser_recipe_serves_cdp_inside_and_through_a_forwarded_port() {
 
     let out = shuru(&["checkpoint", "create", &name, "--recipe", &dir]);
     assert!(out.status.success(), "{}", text(&out));
-    assert!(stderr(&out).contains("step 2/2: check.sh"), "{}", text(&out));
+    assert!(
+        stderr(&out).contains("step 2/2: check.sh"),
+        "{}",
+        text(&out)
+    );
     assert!(stdout(&out).contains("screenshot ok"), "{}", text(&out));
 
     // Inside the VM the service is ready before the command runs.
-    let out = shuru(&["run", "--from", &name, "--", "sh", "-c", "id -un; curl -sf http://127.0.0.1:9222/json/version"]);
+    let out = shuru(&[
+        "run",
+        "--from",
+        &name,
+        "--",
+        "sh",
+        "-c",
+        "id -un; curl -sf http://127.0.0.1:9222/json/version",
+    ]);
     assert!(out.status.success(), "{}", text(&out));
     let s = stdout(&out);
     assert!(s.contains("Chrome/"), "{}", s);
@@ -371,7 +515,16 @@ fn browser_recipe_serves_cdp_inside_and_through_a_forwarded_port() {
     // Through -p the host reaches the same endpoint, which is how CDP clients attach.
     let port = 19000 + (std::process::id() % 1000) as u16;
     let mut child = Command::new(shuru_bin())
-        .args(["run", "--from", &name, "-p", &format!("{}:9222", port), "--", "sleep", "30"])
+        .args([
+            "run",
+            "--from",
+            &name,
+            "-p",
+            &format!("{}:9222", port),
+            "--",
+            "sleep",
+            "30",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -396,7 +549,12 @@ fn browser_recipe_serves_cdp_inside_and_through_a_forwarded_port() {
     }
     let _ = child.kill();
     let _ = child.wait();
-    assert!(body.contains("Chrome/"), "no CDP answer on host port {}: {:?}", port, body);
+    assert!(
+        body.contains("Chrome/"),
+        "no CDP answer on host port {}: {:?}",
+        port,
+        body
+    );
 }
 
 #[test]
@@ -406,7 +564,10 @@ fn docker_recipe_builds_and_runs_a_container() {
         eprintln!("skipped: set SHURU_DOCKER_RECIPE to the docker recipe directory");
         return;
     };
-    if !std::env::var("SHURU_TEST_NET").map(|v| v == "1").unwrap_or(false) {
+    if !std::env::var("SHURU_TEST_NET")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         eprintln!("skipped: set SHURU_TEST_NET=1");
         return;
     }
@@ -414,7 +575,13 @@ fn docker_recipe_builds_and_runs_a_container() {
     let name = unique("shuru-test-recipe-docker");
     let _cleanup = Cleanup(vec![name.clone()]);
 
-    let out = shuru(&["checkpoint", "create", &name, "--recipe", dir.to_str().unwrap()]);
+    let out = shuru(&[
+        "checkpoint",
+        "create",
+        &name,
+        "--recipe",
+        dir.to_str().unwrap(),
+    ]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(stderr(&out).contains("step 2/2: pull.sh"), "{}", text(&out));
 

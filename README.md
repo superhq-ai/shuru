@@ -53,6 +53,12 @@ shuru run --allow-net --dns-resolver 1.1.1.1 -- curl https://example.com
 shuru run --cpus 4 --memory 4096 --disk-size 8192 -- make -j4
 ```
 
+Disks default to 4096 MB, which is also the minimum. Larger disks grow in
+the guest at boot and cannot shrink below their source image. Sparse files
+and reflinks keep unused capacity from becoming an allocation. Checkpoints
+freeze ext4 before copying and replace the saved disk only after the seal
+is confirmed.
+
 ### Directory mounts
 
 Share host directories into the VM using VirtioFS. By default the host directory is read-only; guest writes go to a tmpfs overlay layer (discarded when the VM exits). Append `:rw` to make the mount read-write — guest writes go directly to the host filesystem.
