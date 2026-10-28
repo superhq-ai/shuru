@@ -107,6 +107,18 @@ loop of short connections failed with "Connection refused" somewhere between
 150 and 475 connections in. smoltcp now only sees inspected frames, and 600
 back to back connections succeed.
 
+### Linux: the guest console works
+
+The Linux backend emulates a PL011 serial port and boots the guest with
+`console=ttyAMA0`, but the kernel was built without the PL011 driver, so a
+Linux guest printed nothing, `--verbose` showed no kernel log and
+`--console` had no console to attach to. The driver is now built in.
+
+The Linux bootloader also dropped `quiet` from every command line. With a
+working console that would print the whole kernel log through the emulated
+UART on every boot, about 230 ms on a1.metal, only to discard it. Linux now
+keeps `quiet` unless `--verbose` is set, as macOS does.
+
 ### Checkpoint saves report stopped services again
 
 `shuru checkpoint create --verbose` prints the services that were stopped

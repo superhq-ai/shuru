@@ -127,6 +127,9 @@ CONFIG_TTY=y
 CONFIG_VT=y
 CONFIG_SERIAL_EARLYCON=y
 CONFIG_HVC_DRIVER=y
+# The Linux backend emulates a PL011 and boots with console=ttyAMA0
+CONFIG_SERIAL_AMBA_PL011=y
+CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
 CONFIG_PRINTK=y
 
 # PTY support (for shell/TTY exec)
