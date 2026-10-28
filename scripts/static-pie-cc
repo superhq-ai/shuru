@@ -1,0 +1,14 @@
+#!/bin/sh
+# Linker for the jailed node binaries. rustc links crt-static aarch64
+# Linux executables with -static -no-pie, since its target specs do not
+# enable static-pie, and gcc then starts them from the non-relocating
+# crt1.o. Dropping both flags for -static-pie gives rcrt1.o, so the binary
+# relocates itself and loads at a random address.
+for arg do
+  shift
+  case $arg in
+    -static | -no-pie) continue ;;
+  esac
+  set -- "$@" "$arg"
+done
+exec "${CC:-cc}" -static-pie "$@"
