@@ -487,6 +487,7 @@ fn restore(
     }
     for (vcpu, saved) in vcpus.iter().zip(&state.vcpus) {
         vcpu_init(vm_fd, vcpu, false).map_err(|e| io::Error::other(e.to_string()))?;
+        snapshot::check_cpu(vcpu, saved)?;
         snapshot::restore_vcpu(vcpu, saved)?;
     }
     snapshot::restore_gic(gic, &state.gic, &state.vcpus)?;

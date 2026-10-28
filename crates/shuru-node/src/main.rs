@@ -22,7 +22,7 @@ use shuru_node::cgroup::{Limits, Sandbox};
 use shuru_node::control::{self, Boot, Disk, NetdConfig, Request, Response, Secret, VmmConfig};
 use shuru_node::firewall::{self, NETD_UID_BASE};
 use shuru_node::jail::{self, Handoff, Jail};
-use shuru_proto::hello::{Identity, Restore};
+use shuru_proto::hello::{Identity, Restore, PROTOCOL_VERSION};
 use shuru_proto::{frame, ExecRequest};
 
 const RUN_DIR: &str = "/run/shuru";
@@ -133,6 +133,9 @@ struct RestoreArgs {
     /// Its memory starts as a copy of the restored one.
     #[arg(long)]
     snapshot_to: Option<PathBuf>,
+    /// Do not read the saved memory ahead; pages load on first touch only.
+    #[arg(long)]
+    no_prefetch: bool,
     #[command(flatten)]
     common: Common,
     #[arg(last = true, required = true)]
@@ -488,6 +491,7 @@ fn print_times(sandbox: &Sandbox, times: &[(&str, Duration)]) {
 fn run(args: RunArgs) -> Result<i32> {
     let started = Instant::now();
     let host = Host::open(&args.common)?;
+    snapshot_target(args.snapshot_to.as_deref())?;
     let kernel = open(&args.kernel)?;
     let initrd = open(&args.initrd)?;
     let disk = OpenOptions::new()
@@ -581,6 +585,8 @@ fn run(args: RunArgs) -> Result<i32> {
     ];
     if let Some(to) = &args.snapshot_to {
         let info = SnapshotInfo {
+            release: RELEASE.into(),
+            protocol: PROTOCOL_VERSION,
             cpus: args.cpus,
             memory_bytes: args.memory << 20,
             token: hex(&identity.token),
@@ -608,10 +614,13 @@ fn run(args: RunArgs) -> Result<i32> {
 }
 
 /// What a snapshot directory holds besides the memory, state and disk:
-/// the VM shape and the guest identity at the snapshot, which every
-/// restore replaces.
+/// what took it, the VM shape and the guest identity at the snapshot,
+/// which every restore replaces.
 #[derive(Serialize, Deserialize)]
 struct SnapshotInfo {
+    release: String,
+    /// The guest protocol of the agent running in the saved memory.
+    protocol: u32,
     cpus: usize,
     memory_bytes: u64,
     token: String,
@@ -629,6 +638,7 @@ struct SavedNetwork {
 }
 
 const SNAPSHOT_INFO: &str = "node.json";
+const RELEASE: &str = env!("CARGO_PKG_VERSION");
 
 /// A file only root can read, which must not exist yet.
 fn create_private(path: &Path) -> Result<File> {
@@ -642,17 +652,30 @@ fn create_private(path: &Path) -> Result<File> {
 }
 
 /// `dst` gets the blocks of `src`, shared when the filesystem can.
-fn clone_file(src: &Path, dst: &Path) -> Result<()> {
+fn clone_file(src: &Path, dst: &Path) -> Result<File> {
     let from = open(src)?;
     let to = create_private(dst)?;
     if !shuru_linux::reflink(&to, &from)? {
         io::copy(&mut &from, &mut &to)?;
     }
-    Ok(())
+    Ok(to)
 }
 
-/// Saves the VM into the new directory `dir`. A restored VM passes the
-/// memory it was restored from as `base`; it only writes what changed.
+/// Refuses a snapshot directory that exists before the VM starts, rather
+/// than after the command ran.
+fn snapshot_target(dir: Option<&Path>) -> Result<()> {
+    match dir {
+        Some(dir) if fs::symlink_metadata(dir).is_ok() => {
+            bail!("{} already exists", dir.display())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Saves the VM into `dir`, which must not exist. A restored VM passes the
+/// memory it was restored from as `base`; it only writes what changed. The
+/// files are written and synced under another name, then renamed into
+/// place, so a crash never leaves a directory that looks complete.
 fn save_snapshot(
     vmm: &Jailed,
     dir: &Path,
@@ -660,10 +683,53 @@ fn save_snapshot(
     info: &SnapshotInfo,
     base: Option<&Path>,
 ) -> Result<()> {
+    snapshot_target(Some(dir))?;
+    let name = dir
+        .file_name()
+        .context("the snapshot directory needs a name")?;
+    let parent = match dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let staging = parent.join(format!(".{}.partial", name.to_string_lossy()));
+    // What an earlier crash left behind.
+    let _ = fs::remove_dir_all(&staging);
     fs::DirBuilder::new()
         .mode(0o700)
-        .create(dir)
-        .with_context(|| format!("{}", dir.display()))?;
+        .create(&staging)
+        .with_context(|| format!("{}", staging.display()))?;
+    if let Err(e) = write_snapshot(vmm, &staging, disk, info, base) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    let from = CString::new(staging.as_os_str().as_bytes())?;
+    let to = CString::new(dir.as_os_str().as_bytes())?;
+    let renamed = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if renamed != 0 {
+        let error = io::Error::last_os_error();
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error).with_context(|| format!("{}", dir.display()));
+    }
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn write_snapshot(
+    vmm: &Jailed,
+    dir: &Path,
+    disk: &Path,
+    info: &SnapshotInfo,
+    base: Option<&Path>,
+) -> Result<()> {
     let memory_path = dir.join("memory");
     let memory = match base {
         Some(base) => {
@@ -685,16 +751,57 @@ fn save_snapshot(
     )
     .context("snapshot failed")?;
     // The VM is paused, so the disk is as the saved guest left it.
-    clone_file(disk, &dir.join("disk"))?;
-    serde_json::to_writer(create_private(&dir.join(SNAPSHOT_INFO))?, info)?;
+    let disk = clone_file(disk, &dir.join("disk"))?;
+    let node = create_private(&dir.join(SNAPSHOT_INFO))?;
+    serde_json::to_writer(&node, info)?;
+    for file in [&memory, &state, &disk, &node] {
+        file.sync_all()?;
+    }
+    File::open(dir)?.sync_all()?;
     Ok(())
+}
+
+/// Starts reading the saved pages of `memory` into the page cache, so a
+/// restored guest finds them there instead of faulting each one in from
+/// the disk. Only the data ranges are read; holes are pages the guest
+/// never touched.
+fn prefetch(memory: File) {
+    let read_ahead = move || {
+        let fd = memory.as_raw_fd();
+        let mut offset = 0;
+        loop {
+            let data = unsafe { libc::lseek(fd, offset, libc::SEEK_DATA) };
+            if data < 0 {
+                return;
+            }
+            let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+            if hole <= data {
+                return;
+            }
+            unsafe { libc::posix_fadvise(fd, data, hole - data, libc::POSIX_FADV_WILLNEED) };
+            offset = hole;
+        }
+    };
+    let _ = std::thread::Builder::new()
+        .name("prefetch".into())
+        .spawn(read_ahead);
 }
 
 fn restore(args: RestoreArgs) -> Result<i32> {
     let started = Instant::now();
     let host = Host::open(&args.common)?;
+    snapshot_target(args.snapshot_to.as_deref())?;
     let info: SnapshotInfo = serde_json::from_reader(open(&args.from.join(SNAPSHOT_INFO))?)
         .context("reading the snapshot")?;
+    // The agent in the saved memory answers only its own protocol.
+    if info.protocol != PROTOCOL_VERSION {
+        bail!(
+            "the snapshot was taken by shuru-node {} with guest protocol {}; this one speaks {}",
+            info.release,
+            info.protocol,
+            PROTOCOL_VERSION
+        );
+    }
     let identity = Identity {
         token: unhex(&info.token)?,
         instance: unhex(&info.instance)?,
@@ -702,6 +809,9 @@ fn restore(args: RestoreArgs) -> Result<i32> {
     clone_file(&args.from.join("disk"), &args.disk)?;
     let disk = OpenOptions::new().read(true).write(true).open(&args.disk)?;
     let memory = open(&args.from.join("memory"))?;
+    if !args.no_prefetch {
+        prefetch(memory.try_clone()?);
+    }
     let state = open(&args.from.join("state"))?;
     let cloned = started.elapsed();
 
@@ -772,6 +882,7 @@ fn restore(args: RestoreArgs) -> Result<i32> {
     ];
     if let Some(to) = &args.snapshot_to {
         let info = SnapshotInfo {
+            release: RELEASE.into(),
             token: hex(&identity.token),
             instance: hex(&identity.instance),
             ..info

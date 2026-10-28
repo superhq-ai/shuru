@@ -246,8 +246,49 @@ const fn sysreg(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
     (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
 }
 
-/// `MPIDR_EL1` as a 64-bit KVM system register.
-const MPIDR_EL1: u64 = 0x6030_0000_0013_0000 | sysreg(3, 0, 0, 0, 5);
+/// A 64-bit KVM system register.
+const fn sysreg64(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
+    0x6030_0000_0013_0000 | sysreg(op0, op1, crn, crm, op2)
+}
+
+const MPIDR_EL1: u64 = sysreg64(3, 0, 0, 0, 5);
+
+/// What the guest saw of the CPU: its identity and the features it chose
+/// code paths for at boot.
+const CPU_ID_REGS: [(&str, u64); 11] = [
+    ("MIDR_EL1", sysreg64(3, 0, 0, 0, 0)),
+    ("REVIDR_EL1", sysreg64(3, 0, 0, 0, 6)),
+    ("ID_AA64PFR0_EL1", sysreg64(3, 0, 0, 4, 0)),
+    ("ID_AA64PFR1_EL1", sysreg64(3, 0, 0, 4, 1)),
+    ("ID_AA64DFR0_EL1", sysreg64(3, 0, 0, 5, 0)),
+    ("ID_AA64ISAR0_EL1", sysreg64(3, 0, 0, 6, 0)),
+    ("ID_AA64ISAR1_EL1", sysreg64(3, 0, 0, 6, 1)),
+    ("ID_AA64ISAR2_EL1", sysreg64(3, 0, 0, 6, 2)),
+    ("ID_AA64MMFR0_EL1", sysreg64(3, 0, 0, 7, 0)),
+    ("ID_AA64MMFR1_EL1", sysreg64(3, 0, 0, 7, 1)),
+    ("ID_AA64MMFR2_EL1", sysreg64(3, 0, 0, 7, 2)),
+];
+
+/// Refuses a snapshot taken on a CPU that differs from what `vcpu`, newly
+/// initialised, offers here.
+pub fn check_cpu(vcpu: &VcpuFd, state: &VcpuState) -> io::Result<()> {
+    for (name, id) in CPU_ID_REGS {
+        let Some(&(_, saved)) = state.regs.iter().find(|(reg, _)| *reg == id) else {
+            continue;
+        };
+        let mut bytes = [0u8; 8];
+        let here = vcpu
+            .get_one_reg(id, &mut bytes)
+            .map(|_| u64::from_le_bytes(bytes) as u128);
+        if here.ok() != Some(saved) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the snapshot was taken on another CPU: {name} was {saved:#x}"),
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn reg_size(id: u64) -> usize {
     1 << ((id & KVM_REG_SIZE_MASK) >> KVM_REG_SIZE_SHIFT)
@@ -510,6 +551,8 @@ mod tests {
     #[test]
     fn register_encodings() {
         assert_eq!(MPIDR_EL1, 0x6030_0000_0013_c005);
+        assert_eq!(CPU_ID_REGS[0].1, 0x6030_0000_0013_c000);
+        assert_eq!(CPU_ID_REGS[2].1, 0x6030_0000_0013_c020);
         assert_eq!(reg_size(MPIDR_EL1), 8);
         assert_eq!(reg_size(0x6040_0000_0010_0054), 16);
         assert_eq!(ICC_SRE_EL1, 0xc665);
