@@ -1236,11 +1236,14 @@ mod guest {
                 // The input thread below can block writing to a child that
                 // never reads its stdin, and then cannot see the host hang
                 // up. Watch for that separately and kill the group.
-                let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let hangup_thread = vsock_reader.try_clone().ok().map(|conn| {
-                    let finished = finished.clone();
-                    std::thread::spawn(move || kill_on_hangup(conn, child_pid, &finished))
-                });
+                let hangup_watch = match (vsock_reader.try_clone(), std::io::pipe()) {
+                    (Ok(conn), Ok((done_rx, done_tx))) => {
+                        let t =
+                            std::thread::spawn(move || kill_on_hangup(conn, child_pid, done_rx));
+                        Some((t, done_tx))
+                    }
+                    _ => None,
+                };
 
                 // Thread: vsock STDIN/KILL frames -> child stdin
                 let child_stdin = child.stdin.take().unwrap();
@@ -1268,26 +1271,27 @@ mod guest {
                 // Wait for output to drain, then wait for child
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
-                // Forget the id once the child has exited but before it is
-                // reaped, so a late kill cannot reach a reused pid.
+                // Forget the id and stop the hangup watch once the child has
+                // exited but before it is reaped, so a late kill cannot reach
+                // a reused pid.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child_pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
                 if let Some(id) = req.id {
-                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                    unsafe {
-                        libc::waitid(
-                            libc::P_PID,
-                            child_pid as libc::id_t,
-                            &mut info,
-                            libc::WEXITED | libc::WNOWAIT,
-                        )
-                    };
                     EXECS.lock().unwrap().remove(&id);
+                }
+                if let Some((t, done_tx)) = hangup_watch {
+                    drop(done_tx);
+                    let _ = t.join();
                 }
                 let status = child.wait().expect("failed to wait on child");
                 let exit_code = status.code().unwrap_or(-1);
-                finished.store(true, std::sync::atomic::Ordering::SeqCst);
-                if let Some(t) = hangup_thread {
-                    let _ = t.join();
-                }
 
                 let _ = tx.send((frame::EXIT, frame::exit_payload(exit_code).to_vec()));
                 drop(tx);
@@ -1304,21 +1308,34 @@ mod guest {
         }
     }
 
-    fn kill_on_hangup(
-        conn: std::net::TcpStream,
-        pgid: i32,
-        finished: &std::sync::atomic::AtomicBool,
-    ) {
+    /// Kill the group when the host hangs up. Returns without killing once
+    /// the write end of `done` is closed.
+    fn kill_on_hangup(conn: std::net::TcpStream, pgid: i32, done: std::io::PipeReader) {
         use std::os::unix::io::AsRawFd;
-        let mut pfd = libc::pollfd {
-            fd: conn.as_raw_fd(),
-            events: libc::POLLRDHUP,
-            revents: 0,
-        };
-        while !finished.load(std::sync::atomic::Ordering::SeqCst) {
-            pfd.revents = 0;
-            let n = unsafe { libc::poll(&mut pfd, 1, 200) };
-            if n > 0 && pfd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
+        let mut fds = [
+            libc::pollfd {
+                fd: done.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: conn.as_raw_fd(),
+                events: libc::POLLRDHUP,
+                revents: 0,
+            },
+        ];
+        loop {
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if n < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return;
+            }
+            if fds[0].revents != 0 {
+                return;
+            }
+            if fds[1].revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
                 unsafe { libc::kill(-pgid, libc::SIGKILL) };
                 return;
             }
