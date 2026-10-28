@@ -833,7 +833,7 @@ pub fn write_used(
 // Virtio block backend (device ID 2)
 // ===========================================================================
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 #[path = "block_ranges.rs"]
@@ -850,8 +850,7 @@ pub struct BlockBackend {
 }
 
 impl BlockBackend {
-    pub fn new(path: &str, read_only: bool) -> std::io::Result<Self> {
-        let disk = OpenOptions::new().read(true).write(!read_only).open(path)?;
+    pub fn new(disk: File, read_only: bool) -> std::io::Result<Self> {
         let capacity = disk.metadata()?.len() / 512;
         Ok(BlockBackend {
             disk,
@@ -1311,16 +1310,17 @@ mod block_tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let file = OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&path)
             .unwrap();
+        std::fs::remove_file(path).unwrap();
         file.set_len(16384).unwrap();
         file.write_all_at(&vec![7; 16384], 0).unwrap();
-        let mut disk = BlockBackend::new(path.to_str().unwrap(), false).unwrap();
+        let mut disk = BlockBackend::new(file, false).unwrap();
         disk.features_ok(disk.device_features());
-        std::fs::remove_file(path).unwrap();
         disk
     }
 

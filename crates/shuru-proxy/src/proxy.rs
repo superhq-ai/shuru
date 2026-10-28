@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use boring::ssl::{SslConnector, SslMethod};
+use boring::x509::store::X509StoreBuilder;
+use boring::x509::X509;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -67,13 +69,8 @@ impl ProxyEngine {
         ca: CertificateAuthority,
         placeholders: HashMap<String, String>,
         allowed_ips: AllowedIps,
+        upstream_ssl: SslConnector,
     ) -> Self {
-        // BoringSSL upstream connector — Chrome's TLS stack so Cloudflare
-        // doesn't reject our MITM connections based on JA3/JA4 fingerprint.
-        let mut builder = SslConnector::builder(SslMethod::tls()).expect("SslConnector");
-        builder.set_alpn_protos(b"\x08http/1.1").expect("ALPN");
-        let upstream_ssl = builder.build();
-
         let config = Arc::new(config);
         let secrets = SecretResolver::new(config.clone(), placeholders);
 
@@ -151,6 +148,25 @@ impl ProxyEngine {
     }
 }
 
+/// Upstream TLS goes through BoringSSL, the TLS stack of Chrome, so Cloudflare
+/// does not reject relayed connections by their JA3/JA4 fingerprint.
+pub fn upstream_connector(config: &ProxyConfig) -> anyhow::Result<SslConnector> {
+    let mut builder = SslConnector::builder(SslMethod::tls())?;
+    builder.set_alpn_protos(b"\x08http/1.1")?;
+    if let Some(pem) = &config.upstream_roots {
+        let certs = X509::stack_from_pem(pem)?;
+        if certs.is_empty() {
+            anyhow::bail!("no certificates in the upstream roots");
+        }
+        let mut store = X509StoreBuilder::new()?;
+        for cert in certs {
+            store.add_cert(cert)?;
+        }
+        builder.set_cert_store_builder(store);
+    }
+    Ok(builder.build())
+}
+
 /// Handle a single proxied TCP connection.
 async fn handle_connection(
     mut guest: Guest,
@@ -158,6 +174,12 @@ async fn handle_connection(
     shared: &Shared,
 ) -> anyhow::Result<()> {
     let config = &shared.config;
+    if config.public_only && !crate::config::is_public(dst.ip()) {
+        guest.close();
+        return Err(anyhow::anyhow!(
+            "connection to {dst} blocked: not a public address"
+        ));
+    }
     // Check if this is a connection to an exposed host port (host.shuru.internal).
     if let std::net::IpAddr::V4(ipv4) = dst.ip() {
         if let Some(host_port) = config.exposed_host_port(ipv4, dst.port()) {
@@ -507,5 +529,20 @@ mod tests {
     fn test_extract_sni_none_for_non_tls() {
         assert_eq!(extract_sni(b"GET / HTTP/1.1\r\n"), None);
         assert_eq!(extract_sni(&[]), None);
+    }
+
+    #[test]
+    fn upstream_roots_must_parse() {
+        let pem = CertificateAuthority::new().unwrap().ca_cert_pem();
+        let config = ProxyConfig {
+            upstream_roots: Some(pem),
+            ..Default::default()
+        };
+        assert!(upstream_connector(&config).is_ok());
+        let config = ProxyConfig {
+            upstream_roots: Some(b"not a certificate".to_vec()),
+            ..Default::default()
+        };
+        assert!(upstream_connector(&config).is_err());
     }
 }

@@ -13,7 +13,8 @@ pub const MAX_PACKET: usize = 64 * 1024;
 // One connection reads at most this much per turn before the next one goes.
 const MAX_TURN: usize = 128 * 1024;
 pub const MAX_CONNECTIONS: usize = 1024;
-const MAX_RESETS: usize = MAX_CONNECTIONS + 256;
+// Pending resets on top of the connection cap.
+const MAX_PENDING_RESETS: usize = 256;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const HOST_CID: u64 = 2;
 pub const GUEST_CID: u64 = 3;
@@ -176,13 +177,22 @@ impl Payload for [u8] {
     }
 }
 
+/// Who learns that the guest accepted a host connect.
+pub enum Opener {
+    /// A caller waiting on the channel.
+    Caller(SyncSender<io::Result<()>>),
+    /// A client of the unix listener, told with `OK <host port>\n` on its
+    /// socket before any guest data.
+    Listener,
+}
+
 // Host to guest data stays in the host socket until the guest posts an rx
 // buffer, so every packet is sized to the buffer that carries it.
 pub struct Connection {
     socket: UnixStream,
     guest_port: u32,
     host_port: u32,
-    reply: Option<SyncSender<io::Result<()>>>,
+    opener: Option<Opener>,
     established: bool,
     readable: bool,
     writable: bool,
@@ -247,10 +257,16 @@ impl Connection {
             }
             self.established = true;
             self.deadline = None;
-            return self
-                .reply
-                .take()
-                .is_some_and(|reply| reply.send(Ok(())).is_ok());
+            return match self.opener.take() {
+                Some(Opener::Caller(reply)) => reply.send(Ok(())).is_ok(),
+                // The socket is fresh, so a short write means the client is
+                // gone or misbehaving.
+                Some(Opener::Listener) => {
+                    let greeting = format!("OK {}\n", self.host_port);
+                    send(&self.socket, greeting.as_bytes()).is_ok_and(|n| n == greeting.len())
+                }
+                None => false,
+            };
         }
         match header.op {
             RW => {
@@ -412,7 +428,7 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        if let Some(reply) = self.reply.take() {
+        if let Some(Opener::Caller(reply)) = self.opener.take() {
             let _ = reply.send(Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "guest connection reset",
@@ -424,15 +440,22 @@ impl Drop for Connection {
 
 pub struct Mux {
     connections: BTreeMap<u32, Connection>,
+    max_connections: usize,
     resets: VecDeque<Header>,
     next_port: u32,
     last_port: u32,
 }
 
 impl Mux {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_limit(MAX_CONNECTIONS)
+    }
+
+    pub fn with_limit(max_connections: usize) -> Self {
         Self {
             connections: BTreeMap::new(),
+            max_connections,
             resets: VecDeque::new(),
             next_port: 1024,
             last_port: 0,
@@ -445,14 +468,9 @@ impl Mux {
         self.last_port = 0;
     }
 
-    pub fn add(
-        &mut self,
-        socket: UnixStream,
-        guest_port: u32,
-        reply: SyncSender<io::Result<()>>,
-    ) -> io::Result<u32> {
-        if self.connections.len() >= MAX_CONNECTIONS
-            || self.connections.len() + self.resets.len() >= MAX_RESETS
+    pub fn add(&mut self, socket: UnixStream, guest_port: u32, opener: Opener) -> io::Result<u32> {
+        if self.connections.len() >= self.max_connections
+            || self.connections.len() + self.resets.len() >= self.max_resets()
         {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
@@ -472,7 +490,7 @@ impl Mux {
                 socket,
                 host_port: port,
                 guest_port,
-                reply: Some(reply),
+                opener: Some(opener),
                 established: false,
                 readable: true,
                 writable: true,
@@ -494,12 +512,16 @@ impl Mux {
         Ok(port)
     }
 
+    fn max_resets(&self) -> usize {
+        self.max_connections + MAX_PENDING_RESETS
+    }
+
     pub fn can_receive(&self) -> bool {
-        self.resets.len() + self.connections.len() < MAX_RESETS
+        self.resets.len() + self.connections.len() < self.max_resets()
     }
 
     fn reset(&mut self, header: Header) {
-        if self.resets.len() + self.connections.len() < MAX_RESETS {
+        if self.resets.len() + self.connections.len() < self.max_resets() {
             self.resets.push_back(header);
         }
     }
@@ -641,7 +663,7 @@ mod tests {
         let (host, device) = UnixStream::pair().unwrap();
         host.set_nonblocking(true).unwrap();
         let (tx, rx) = mpsc::sync_channel(1);
-        let port = mux.add(device, 1024, tx).unwrap();
+        let port = mux.add(device, 1024, Opener::Caller(tx)).unwrap();
         (port, host, rx)
     }
 
@@ -1001,11 +1023,11 @@ mod tests {
         while mux.can_receive() {
             mux.receive(guest(9999, REQUEST), &[][..]);
         }
-        assert_eq!(mux.resets.len(), MAX_RESETS);
+        assert_eq!(mux.resets.len(), mux.max_resets());
         for _ in 0..100 {
             mux.receive(guest(9999, REQUEST), &[][..]);
         }
-        assert_eq!(mux.resets.len(), MAX_RESETS);
+        assert_eq!(mux.resets.len(), mux.max_resets());
     }
 
     #[test]
@@ -1260,5 +1282,52 @@ mod tests {
             .map(|_| packet(&mut mux).unwrap().0.src_port)
             .collect();
         assert_eq!(order, [a, b, a, b, a, b]);
+    }
+
+    #[test]
+    fn a_listener_client_hears_ok_before_guest_data() {
+        let mut mux = Mux::new();
+        let (mut host, device) = UnixStream::pair().unwrap();
+        let port = mux.add(device, 1024, Opener::Listener).unwrap();
+        assert_eq!(packet(&mut mux).unwrap().0.op, REQUEST);
+        mux.receive(guest(port, RESPONSE), &[][..]);
+        guest_data(&mut mux, port, b"hello");
+        let greeting = format!("OK {port}\n");
+        let mut bytes = vec![0; greeting.len() + 5];
+        host.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [greeting.as_bytes(), b"hello"].concat());
+    }
+
+    #[test]
+    fn a_refused_listener_client_sees_the_socket_close() {
+        let mut mux = Mux::new();
+        let (mut host, device) = UnixStream::pair().unwrap();
+        let port = mux.add(device, 1024, Opener::Listener).unwrap();
+        mux.receive(guest(port, RST), &[][..]);
+        assert!(mux.connections.is_empty());
+        let mut bytes = Vec::new();
+        assert_eq!(host.read_to_end(&mut bytes).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_listener_client_that_left_is_reset() {
+        let mut mux = Mux::new();
+        let (host, device) = UnixStream::pair().unwrap();
+        let port = mux.add(device, 1024, Opener::Listener).unwrap();
+        assert_eq!(packet(&mut mux).unwrap().0.op, REQUEST);
+        drop(host);
+        mux.receive(guest(port, RESPONSE), &[][..]);
+        assert!(mux.connections.is_empty());
+        assert_eq!(packet(&mut mux).unwrap().0.op, RST);
+    }
+
+    #[test]
+    fn connections_past_the_limit_are_refused() {
+        let mut mux = Mux::with_limit(2);
+        let (_a, _host_a, _reply_a) = pending(&mut mux);
+        let (_b, _host_b, _reply_b) = pending(&mut mux);
+        let (_host, device) = UnixStream::pair().unwrap();
+        let error = mux.add(device, 1024, Opener::Listener).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
     }
 }

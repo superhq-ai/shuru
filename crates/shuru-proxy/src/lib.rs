@@ -133,6 +133,7 @@ pub fn start(host_fd: RawFd, config: ProxyConfig) -> anyhow::Result<ProxyHandle>
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let ca = CertificateAuthority::new()?;
+    let upstream_ssl = proxy::upstream_connector(&config)?;
     let ca_cert_pem = ca.ca_cert_pem();
 
     // Generate placeholder tokens for each secret
@@ -175,6 +176,7 @@ pub fn start(host_fd: RawFd, config: ProxyConfig) -> anyhow::Result<ProxyHandle>
                     ca,
                     proxy_placeholders,
                     proxy_allowed_ips,
+                    upstream_ssl,
                 );
                 engine.run().await;
             });

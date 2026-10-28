@@ -1042,7 +1042,7 @@ impl VirtioFsBackend {
                 now
             } else if req.valid & FATTR_ATIME != 0 {
                 libc::timespec {
-                    tv_sec: req.atime as libc::time_t,
+                    tv_sec: req.atime as _,
                     tv_nsec: req.atimensec as i64,
                 }
             } else {
@@ -1052,7 +1052,7 @@ impl VirtioFsBackend {
                 now
             } else if req.valid & FATTR_MTIME != 0 {
                 libc::timespec {
-                    tv_sec: req.mtime as libc::time_t,
+                    tv_sec: req.mtime as _,
                     tv_nsec: req.mtimensec as i64,
                 }
             } else {

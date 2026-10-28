@@ -463,8 +463,13 @@ impl NetworkStack {
         for handle in handles {
             let socket = self.sockets.get_mut::<TcpSocket>(handle);
 
-            // LISTEN → ESTABLISHED transition
-            if socket.is_active() && !self.connections.contains_key(&handle) {
+            // Handed to the proxy once the handshake completes. A socket
+            // closed in SYN-RECEIVED never sends its FIN.
+            let connected = matches!(
+                socket.state(),
+                tcp::State::Established | tcp::State::CloseWait
+            );
+            if connected && !self.connections.contains_key(&handle) {
                 // local_endpoint() is the destination the guest was trying to reach
                 // (because any_ip=true, smoltcp accepted it as local)
                 if let Some(local) = socket.local_endpoint() {
@@ -585,7 +590,8 @@ impl NetworkStack {
         let since = &mut self.listen_since;
         self.listening.retain(|_, handles| {
             handles.retain(|handle| {
-                let stale = sockets.get::<TcpSocket>(*handle).state() == tcp::State::Listen
+                let state = sockets.get::<TcpSocket>(*handle).state();
+                let stale = matches!(state, tcp::State::Listen | tcp::State::SynReceived)
                     && since
                         .get(handle)
                         .is_some_and(|t| t.elapsed() >= LISTEN_TIMEOUT);

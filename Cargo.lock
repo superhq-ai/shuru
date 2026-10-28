@@ -1547,6 +1547,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1689,6 +1698,23 @@ dependencies = [
  "vm-fdt",
  "vm-memory",
  "vmm-sys-util",
+]
+
+[[package]]
+name = "shuru-node"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "getrandom 0.3.4",
+ "kvm-bindings",
+ "libc",
+ "seccompiler",
+ "serde",
+ "serde_json",
+ "shuru-linux",
+ "shuru-proto",
+ "shuru-proxy",
 ]
 
 [[package]]

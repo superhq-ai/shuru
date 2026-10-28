@@ -4,6 +4,7 @@ members = [
     "crates/shuru-cli",
     "crates/shuru-darwin",
     "crates/shuru-linux",
+    "crates/shuru-node",
     "crates/shuru-proto",
     "crates/shuru-proxy",
     "crates/shuru-sdk",
@@ -12,8 +13,9 @@ members = [
     "crates/shuru-guest",
 ]
 # shuru-darwin and shuru-linux are platform-specific — only pulled in
-# transitively via shuru-vm's cfg'd deps. Excluded from default builds
-# so `cargo check` doesn't fail on the wrong OS.
+# transitively via shuru-vm's cfg'd deps. shuru-node runs on Linux nodes
+# only. Excluded from default builds so `cargo check` doesn't fail on the
+# wrong OS.
 default-members = [
     "crates/shuru-cli",
     "crates/shuru-proto",

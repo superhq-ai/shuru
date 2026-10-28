@@ -28,4 +28,4 @@ pub use storage::{
     DiskImageAttachment, DiskImageCachingMode, DiskImageSynchronizationMode, NbdAttachment,
     StorageAttachment, StorageDevice, VirtioBlockDevice,
 };
-pub use vm::{VirtualMachine, VmState};
+pub use vm::{VirtualMachine, VmDescriptors, VmState};

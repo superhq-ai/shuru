@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -29,6 +29,14 @@ pub struct ProxyConfig {
     /// holding the resolved shuru.json, so relative paths in a config behave
     /// the same wherever shuru is invoked from. None inherits the process cwd.
     pub config_dir: Option<PathBuf>,
+    /// Refuse connections to anything but public addresses: no loopback,
+    /// private, link-local or shared ranges, so a guest on a shared host
+    /// cannot reach the host, its network or a metadata service. Turns
+    /// `expose_host` off.
+    pub public_only: bool,
+    /// PEM roots for verifying upstream servers when relaying secrets.
+    /// None reads the system store from disk.
+    pub upstream_roots: Option<Vec<u8>>,
 }
 
 impl Default for ProxyConfig {
@@ -39,6 +47,8 @@ impl Default for ProxyConfig {
             network: NetworkConfig::default(),
             expose_host: Vec::new(),
             config_dir: None,
+            public_only: false,
+            upstream_roots: None,
         }
     }
 }
@@ -132,6 +142,37 @@ impl ProxyConfig {
     }
 }
 
+/// False for loopback, private, link-local, shared, multicast, documentation
+/// and reserved addresses.
+pub fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            !(a == 0
+                || a == 10
+                || a == 127
+                || (a == 100 && (64..128).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..32).contains(&b))
+                || (a == 192 && b == 0 && (c == 0 || c == 2))
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 192 && b == 168)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+                || a >= 224)
+        }
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(v4) => is_public(IpAddr::V4(v4)),
+            // Global unicast, minus the IANA special block and documentation.
+            None => {
+                let [a, b, ..] = ip.segments();
+                a & 0xe000 == 0x2000 && !(a == 0x2001 && (b < 0x0200 || b == 0x0db8))
+            }
+        },
+    }
+}
+
 /// Simple wildcard domain matching.
 /// "*" matches any domain (catch-all).
 /// "*.example.com" matches "api.example.com" but not "example.com".
@@ -210,6 +251,43 @@ mod tests {
             allow: vec!["api.example.com".into()],
         };
         assert!(with_entries.has_allowlist());
+    }
+
+    #[test]
+    fn public_addresses() {
+        for public in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "100.128.0.1",
+            "172.32.0.1",
+            "2606:4700::1111",
+            "2001:4860::8888",
+        ] {
+            assert!(is_public(public.parse().unwrap()), "{public}");
+        }
+        for private in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.0.0.170",
+            "192.168.1.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fe80::1",
+            "fd00:ec2::254",
+            "::ffff:169.254.169.254",
+            "2001:db8::1",
+            "ff02::1",
+        ] {
+            assert!(!is_public(private.parse().unwrap()), "{private}");
+        }
     }
 
     #[test]

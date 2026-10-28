@@ -35,6 +35,12 @@ shell:
 # Full setup from scratch: rootfs + build
 setup: prepare-rootfs build
 
+# Build shuru-node, shuru-vmm and shuru-netd as static PIE, on aarch64 Linux
+build-node:
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER={{ justfile_directory() }}/scripts/static-pie-cc \
+    RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=pie" \
+    cargo build --release -p shuru-node --target aarch64-unknown-linux-gnu
+
 # Check all crates compile (host targets only)
 check:
     cargo check --workspace
