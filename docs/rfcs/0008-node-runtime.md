@@ -1,8 +1,8 @@
 # RFC 0008: Linux node runtime
 
-- Status: Draft. The vsock device and the connection hello shipped in 0.10.0 (PR #56); host memory bounds in 0.11.0 (RFC 0011).
+- Status: Draft. The vsock device and the connection hello shipped in 0.10.0 (PR #56); host memory bounds in 0.11.0 (RFC 0011); the jail, `shuru-vmm` and `shuru-netd` in PR #60, driven by a one-shot `shuru-node run` until the agent exists.
 - Date: 2026-10-27, updated 2026-10-28
-- Scope: shuru-linux, shuru-proto, shuru-guest, new `shuru-vmm` and `shuru-node` binaries
+- Scope: shuru-linux, shuru-proto, shuru-guest, shuru-proxy, new `shuru-vmm`, `shuru-netd` and `shuru-node` binaries
 - Depends on: nothing
 - Required by: hosted Shuru, RFC 0009 (Linux VM snapshots)
 
@@ -82,7 +82,8 @@ shuru-node (root, one per host)
       |           net socketpair end, vsock listener, control listener
       |
       +-- shuru-netd     uid 200000 + slot, own cgroup
-          seccomp: socket I/O only, no exec, no open
+          namespaces: mnt pid ipc uts cgroup, host network
+          seccomp: deny list, IP sockets only, no exec, no open
           fds in: the other net socketpair end, egress policy, secrets
 ```
 
@@ -136,24 +137,34 @@ For each sandbox the agent:
    - `cpu.max` = vCPU count times the period, and a `cpu.weight` by plan.
    - `pids.max` sized to the vCPU and device threads.
    - `io.max` on the node data device, by plan.
-3. Forks the VMM child, which unshares mount, pid, network, ipc, uts and
-   cgroup namespaces, pivots into an empty tmpfs root holding only the
-   read-only VMM binary, sets `no_new_privs`, drops every capability from
+3. Clones the VMM child into new mount, pid, network, ipc and uts
+   namespaces. The child joins its cgroup, unshares the cgroup namespace,
+   pivots into an empty read-only tmpfs root, drops every capability from
    all sets including the bounding set, sets rlimits (`NOFILE`, `NPROC`,
-   `CORE` = 0), switches to the slot uid, closes every descriptor not on
-   the hand-off list and executes the VMM.
+   `CORE` = 0), switches to the slot uid, sets `no_new_privs`, closes every
+   descriptor not on the hand-off list and executes the VMM binary from a
+   descriptor with `execveat`, so the root stays empty. The binaries are
+   static PIE: rustc links crt-static aarch64 executables without PIE, so
+   `scripts/static-pie-cc` relinks them with `-static-pie`.
 4. The VMM installs its seccomp filter on all threads (`TSYNC`) after
    building the VM and before the first `KVM_RUN`. The filter is an
    allowlist built with the rust-vmm `seccompiler` crate: `ioctl` limited to
    the KVM requests in use, `read`, `write`, `epoll`, `eventfd`, `futex`,
-   `mmap` and `munmap` on existing descriptors, `madvise` with
-   `MADV_DONTNEED` only, `accept4` on the handed-over listeners, signal and
-   exit calls. `open`, `openat`, `socket`, `connect`, `execve`, `ptrace`
-   and everything else kill the process. A development build can run the
-   filter in log mode to find missing calls.
-5. Starts the proxy child the same way with its own uid and cgroup. It
-   keeps network access, because it is the egress path, and its filter
-   denies `execve`, `open` and `ptrace`.
+   `mmap` and `mprotect` without `PROT_EXEC`, `madvise` with
+   `MADV_DONTNEED` only, `clone` with `CLONE_THREAD` only, `accept4` on the
+   handed-over listeners, signal and exit calls. `clone3` gets `ENOSYS`, so
+   the C library falls back to `clone`, whose flags a filter can read.
+   `openat` gets `EPERM`: glibc opens `/sys/devices/system/cpu/online` on
+   its own when a thread adds a malloc arena, and the root is empty anyway.
+   `socket`, `connect`, `execve`, `ptrace` and everything else kill the
+   process. `--seccomp-log` runs the filters in log mode to find missing
+   calls.
+5. Starts the proxy child the same way with its own uid and cgroup, but in
+   the host network namespace, because it is the egress path. It runs
+   tokio and two TLS libraries, so its filter is a deny list: `execve`,
+   namespaces, `mount`, `ptrace`, `bpf`, `perf_event_open`, `io_uring`,
+   module and key calls and uid changes kill it, `openat` and sockets
+   other than IPv4 and IPv6 get `EPERM`.
 
 User namespaces are not used. The agent is root on a machine dedicated to
 this, real uids are simpler to reason about, and unprivileged user
@@ -178,9 +189,11 @@ VMM, replacing vhost-vsock everywhere, including local Linux runs.
   guest credit allows.
 - Under `shuru-vmm` the agent is a different process, so the VMM also
   takes a listening unix socket. A client connects, writes
-  `CONNECT <port>\n`, and gets `OK\n` once the guest accepted, after which
-  the stream carries bytes in both directions. This is the convention
-  Firecracker uses, so existing tooling understands it.
+  `CONNECT <port>\n`, and gets `OK <host port>\n` once the guest
+  accepted, after which the stream carries bytes in both directions. This
+  is the convention Firecracker uses, so existing tooling understands it.
+  Each client reads its line on its own thread, with at most 16 waiting,
+  so a client that never writes holds up nobody.
 - Guest-initiated connections to the host are refused with a reset.
   Nothing uses them today, and a guest has no business opening one.
 - Connections are capped per VM: 1024 locally, 128 on a hosted node,
@@ -226,12 +239,21 @@ sandbox. The VMM holds one end of the frame socketpair and never sees a
 secret value. The proxy holds the other end, the egress policy and the
 secrets bound to this sandbox only.
 
-Egress is enforced twice. The proxy refuses link-local, loopback, private
-and VPC ranges after resolving a name, so a guest cannot reach the
-instance metadata service, the agent, or other nodes. The host firewall
-(nftables) drops the same ranges by the proxy uid (`meta skuid`), which
-also gives per-sandbox byte counters and rate limits without any proxy
-code.
+Egress is enforced twice. The proxy refuses every destination that is
+not a public address (`public_only`, which also turns off host exposure),
+so a guest cannot reach the instance metadata service, the agent, or
+other nodes. The host firewall (nftables, table `inet shuru`) drops the
+same IPv4 ranges and all IPv6 from the proxy uid range (`meta skuid`),
+which also gives per-sandbox byte counters and rate limits without any
+proxy code.
+
+The agent sends the proxy its configuration with the frame socket:
+the domain allowlist, the DNS resolver, secret values with their hosts,
+and the root certificates for checking upstream TLS, so the proxy reads
+nothing from disk and no secret passes through an environment or a
+command. The proxy answers with the placeholders and its CA; the agent
+installs the CA in the guest and puts the placeholders in the command
+environment.
 
 On a laptop the proxy stays in process; the secrets it holds belong to
 the person running it.
@@ -267,11 +289,29 @@ Measured for RFC 0011: host overhead per VM is 6 to 11 MB outside guest
 RAM in every pressure scenario except 400 stalled connections (about 200
 MB), and a sandbox in the cgroup envelope above survives its worst case.
 
+Measured on a1.metal for PR #60, every filter in kill mode:
+
+- Boot to exec ready: `shuru-node run -- true` 372 to 416 ms against 414
+  to 427 ms for the CLI; the jail itself costs 6 to 17 ms. The proxy adds
+  about 30 ms, and installing its CA in the guest about 1.7 s when a
+  secret is bound.
+- Exec, disk writes, 64 MiB over vsock, https through `shuru-netd` and
+  stop with no kill; log mode logs nothing.
+- From `/proc`: both processes on their slot uid with every capability
+  set empty, `NoNewPrivs`, the filters in place, an empty root, and own
+  namespaces except user (and network for the proxy).
+- The guest reaches public addresses; the metadata service, the host
+  private address and the gateway are refused, and so is a name outside
+  the allowlist. A secret goes out real to its bound host and as the
+  placeholder elsewhere. The firewall drops the same addresses for a
+  proxy uid outside any jail.
+- 1.5 GiB written in a 2 GiB guest peaks at 1621 MiB in the sandbox
+  cgroup, so guest memory is charged to it.
+- 100 MB download: 23 MB/s through the proxy, 40 MB/s on the host.
+
 Still to measure, before hosted ships:
 
-- Boot to exec ready, jailed against unjailed. Target: within 20 ms.
-- The full SDK test suite with the seccomp filter in log mode, then in
-  kill mode.
+- The full SDK test suite against a jailed VM.
 - Density: idle 256 MB sandboxes on one host until memory runs out, with
   free page reporting on (RFC 0006).
 
