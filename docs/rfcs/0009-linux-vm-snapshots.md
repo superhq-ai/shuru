@@ -71,9 +71,10 @@ snap-<id>/
   state       vCPU, interrupt controller and device state, JSON with a
               format version
   disk        the working disk, a reflink clone
-  node.json   what the node needs to restore: vCPU count, memory size,
-              the guest identity, and for a networked VM the egress
-              policy, the guest MAC and the proxy session
+  node.json   what the node needs to restore: the release and guest
+              protocol that took it, vCPU count, memory size, the guest
+              identity, and for a networked VM the egress policy, the
+              guest MAC and the proxy session
 ```
 
 `memory` and `disk` are reflink clones where possible, so a snapshot of a
@@ -82,10 +83,13 @@ with its parent on disk.
 
 `state` is JSON. It is a few tens of kilobytes (19 KB for 2 vCPUs and five
 devices), so encoding size and speed do not matter, and a readable format
-makes a mismatch after an upgrade easy to see. Its version field is checked
-on restore. The fuller manifest below (release, guest protocol version,
-CPU fingerprint, image hashes) is not built yet; until it is, the node only
-restores snapshots taken by the same build on the same hardware.
+makes a mismatch after an upgrade easy to see. Besides the registers a
+restore writes back, it holds the CPU ID registers each vCPU saw:
+`MIDR_EL1`, `REVIDR_EL1` and the `ID_AA64` processor, debug, instruction
+set and memory model feature registers. The guest picked code paths from
+those at boot. A restore refuses a snapshot whose state format, guest
+protocol or CPU ID registers differ from what this node offers, and says
+which. Image hashes are not recorded.
 
 A snapshot holds everything the guest held: its memory, its identity and,
 for a networked VM, the proxy CA key. Anyone who can read it can resume the
@@ -274,17 +278,25 @@ disk-only checkpoints take (RFC 0010): a checkpoint keeps the disk and
 drops memory, so the filesystem must be consistent on its own; a snapshot
 keeps both.
 
-Still to come: `fsync` of the files and a staging directory renamed into
-place, so a crash mid-snapshot leaves nothing that looks complete.
+The files go into a staging directory beside the target, `.NAME.partial`.
+Each file and the directory are synced, the directory is renamed into
+place with `RENAME_NOREPLACE`, and the parent is synced. A crash
+mid-snapshot leaves only the staging directory, which the next snapshot to
+that name removes, so a directory under the final name is always complete.
+A target that already exists is refused before the VM starts, not after
+the command ran. The sync is most of the time a snapshot takes on EBS (see
+below); the VM is already stopped or resumed by then, so it delays only
+the reply.
 
 ### Restoring
 
-1. Read `node.json` and `state`; check the format version and that the
-   shape matches.
+1. Read `node.json` and `state`; check the guest protocol, the format
+   version and that the shape matches. Start reading `memory` ahead.
 2. Map `memory` private, reflink `disk` into a new working disk.
 3. For a networked VM, start the network process with the saved session.
-4. Create the VM and vCPUs, restore GIC and vCPU state, restore devices,
-   raise the vmgenid interrupt.
+4. Create the VM and vCPUs, check the CPU ID registers against the saved
+   ones, restore GIC and vCPU state, restore devices, raise the vmgenid
+   interrupt.
 5. Start the vCPUs. Connect over vsock with the saved identity and send
    the restore frame: new identity, time, seed.
 
@@ -297,9 +309,11 @@ one, so it has to read the old device state and talk to the old agent.
 Refusing every snapshot from an earlier release would make each upgrade
 break every template and every paused sandbox. Instead:
 
-- The manifest records the release and the guest protocol version.
-  `state` is versioned, and the VMM reads the encodings of the last few
-  releases (four to start) and refuses older ones.
+- `node.json` records the release and the guest protocol version, and
+  `state` is versioned. Today a restore refuses any other guest protocol
+  or state format; the window here is what replaces that refusal. The VMM
+  reads the encodings of the last few releases (four to start) and
+  refuses older ones.
 - The host keeps speaking the guest protocol versions of those releases.
   The hello reply gains the guest protocol version, and the host uses the
   matching framing on that connection. Until now a protocol change could
@@ -312,7 +326,8 @@ break every template and every paused sandbox. Instead:
 - Past the window, or on a CPU fingerprint mismatch, a resume becomes a
   cold boot of the snapshot `disk` with the current kernel and image.
   Files survive; processes and memory do not. The host reports it as a
-  reboot with the reason, never as a successful restore.
+  reboot with the reason, never as a successful restore. The node itself
+  only refuses, with the reason; the cold boot is up to its caller.
 
 Disks need none of this. A working disk is a block level clone, so
 replacing the base image never changes a disk cloned from it, and an old
@@ -332,14 +347,27 @@ the local version is the one to measure first.
 
 ### Prefetching the working set
 
-Pages loaded on first touch cost a page fault each, and E2B documents that
-templates restore faster than live snapshots because they prefetch. For
-templates, the agent records which pages a restored VM touches in its
-first second (`mincore` on the mapping), stores that list beside the
-snapshot, and asks the kernel to read those ranges ahead
-(`MADV_WILLNEED`) at the next restore. It is an optimisation and lands
-only if the measurements show page faults matter. The cold page cache
-numbers below say they do when the snapshot is not cached.
+Pages loaded on first touch cost a page fault each, and when the snapshot
+is not in the page cache each fault waits on a read from the volume. E2B
+documents that templates restore faster than live snapshots because they
+prefetch.
+
+A restore reads the saved memory ahead. A thread in the node walks the
+data ranges of `memory` (`SEEK_DATA` and `SEEK_HOLE`, so pages the guest
+never touched are skipped) and calls `posix_fadvise(POSIX_FADV_WILLNEED)`
+on each, so the guest finds its pages in the page cache instead of faulting
+each one in from the volume. `--no-prefetch` turns it off. With the page
+cache dropped it brings the first answer from 171 to 197 ms down to 142 to
+149 ms; with the snapshot cached it changes nothing. It also delays the
+restore of VM state by about 30 ms, because the reads compete with reading
+`state` and the VMM binary. Starting it once the VMM has read `state` may
+win that back; it is not measured yet.
+
+Reading every saved page is right while the saved memory is about what a
+restore touches. For a template whose saved memory is much larger than its
+working set, the node would record which pages a restored VM touches in
+its first second (`mincore` on the mapping), store that list beside the
+snapshot, and read those ranges first.
 
 ## Measured so far
 
@@ -351,24 +379,35 @@ of `shuru-node` to the guest answering its first connection, unless noted.
 |---|---|
 | cold boot, main and this branch, same instance, same kernel and agent | 328 to 338 ms and 330 to 341 ms |
 | cold boot with the vmgenid kernel | 326 to 338 ms |
-| snapshot of a cold-booted guest after one command | 35 ms, 67 MB written |
+| snapshot of a cold-booted guest after one command | 35 ms, 67 MB written; 176 to 186 ms (one 418 ms) once the files are synced and renamed into place |
+| snapshot into a directory that exists | refused in 17 ms, before the VM starts |
+| restore of a snapshot with another guest protocol, or with `MIDR_EL1` edited in `state` | refused with the reason; the untouched snapshot still restores |
 | restore, snapshot in the page cache | VM restored 13 to 19 ms, guest answered 26 to 30 ms, identity rotated 1 ms later, `true` done 55 to 58 ms |
 | restore, page cache dropped | 210 to 300 ms; 40 ms with only `memory` cached; the first restore after the instance came up took 1.85 s |
 | snapshot of a restored guest | 15 to 64 ms, changed pages only |
 | restore from the third generation | memory-only state (a file in `/dev/shm`) intact through each generation |
 | restore of a networked guest | network process with the saved session 45 to 53 ms, guest answered 65 to 72 ms; TLS through the reloaded CA and secret substitution work, and a secret changed between restores reaches the guest |
 | restore peak cgroup memory | 5 to 9 MiB warm, 20 to 32 MiB cold |
+| restore, page cache dropped, prefetch against `--no-prefetch`, alternating, four each | guest answered 142 to 149 ms against 171 to 197 ms; `true` done 203 to 205 ms (one 337 ms) against 240 to 265 ms; no difference when cached |
+| warm template: Python with numpy 2.2.4 imported, waiting on a FIFO, 104 MB of saved memory | restore to the computed answer 93 to 97 ms, 122 to 133 ms wall; cold boot plus the same import and sum 1.12 s (2.04 s uncached) |
+| 50 concurrent restores from one snapshot, each running `sleep 3`, two runs | all 50 answered, median 122 and 143 ms, slowest 199 and 225 ms; wall 3.3 s; host available memory down 64 and 217 MiB |
+| 50 concurrent cold boots, same command | all 50 answered, median 1.56 s, slowest 1.86 s; wall 5.0 s; host available memory down 3.3 GiB |
 
 A bare base snapshot restores more than ten times faster than a cold boot
-when it is in the page cache. Uncached, the reads from the volume decide
-the time, which is what prefetching is for.
+when it is in the page cache, and a template with its work loaded restores
+in under a tenth of what it takes to boot and load it. Fifty restores share
+one copy of the saved pages in the page cache, so together they cost the
+host about a fifteenth of the memory of fifty cold boots. Uncached, the
+reads from the volume decide the time, which prefetching shortens.
+
+In the template restore, 39 ms of the 93 is the reflink of a disk that apt
+wrote to, which has many more extents than the base image.
 
 ## What will be measured
 
 | case | measured as | target |
 |---|---|---|
-| restore of a warm template (Python with numpy imported, a Node dev server listening, a headless browser started) | restore call to the warm work answering | under 150 ms, against cold boot plus setup |
-| 50 concurrent restores from one snapshot | wall time, host memory used | shared pages counted once |
+| restore of a warm template with a Node dev server listening, or a headless browser started | restore call to the warm work answering | under 150 ms, against cold boot plus setup |
 | pause of a cold-booted 2 GB guest using 300 MB | bytes written, time | about 300 MB |
 | restore of a snapshot taken by the previous release | restore call to first exec reply | same as a same-release restore |
 | resume of a snapshot past the window | what the caller sees | a reported reboot from its disk, files intact |
