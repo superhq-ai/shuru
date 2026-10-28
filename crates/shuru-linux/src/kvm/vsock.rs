@@ -6,7 +6,7 @@ use std::io::{self, Read};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,9 @@ const KICK: u64 = 1 << 40;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 // "CONNECT 4294967295\n" with room to spare.
 const MAX_CONNECT_LINE: usize = 32;
+// Listener clients that have not sent their CONNECT line yet. More are
+// closed at once.
+const MAX_HANDSHAKES: usize = 16;
 
 /// Splits a descriptor chain into its header bytes and the payload after.
 fn split<'a>(
@@ -347,6 +350,7 @@ pub struct VsockControl {
     epoll: OwnedFd,
     stopping: AtomicBool,
     listeners: Mutex<Vec<Arc<UnixListener>>>,
+    handshakes: AtomicUsize,
 }
 
 impl VsockControl {
@@ -435,7 +439,7 @@ impl VsockControl {
         Ok(())
     }
 
-    fn accept(&self, listener: &UnixListener) {
+    fn accept(self: &Arc<Self>, listener: &UnixListener) {
         loop {
             let stream = match listener.accept() {
                 Ok((stream, _)) => stream,
@@ -450,8 +454,23 @@ impl VsockControl {
                     _ => return,
                 },
             };
-            if let Ok(port) = read_connect(&stream) {
-                let _ = self.attach(stream, port, Opener::Listener);
+            if self.handshakes.fetch_add(1, Ordering::AcqRel) >= MAX_HANDSHAKES {
+                self.handshakes.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
+            // Each client gets its own thread, so a silent one holds up
+            // nobody else.
+            let control = self.clone();
+            let handshake = std::thread::Builder::new()
+                .name("shuru-vsock-connect".into())
+                .spawn(move || {
+                    if let Ok(port) = read_connect(&stream) {
+                        let _ = control.attach(stream, port, Opener::Listener);
+                    }
+                    control.handshakes.fetch_sub(1, Ordering::AcqRel);
+                });
+            if handshake.is_err() {
+                self.handshakes.fetch_sub(1, Ordering::AcqRel);
             }
         }
     }
@@ -504,6 +523,7 @@ impl VsockBackend {
             epoll: unsafe { OwnedFd::from_raw_fd(fd) },
             stopping: AtomicBool::new(false),
             listeners: Mutex::new(Vec::new()),
+            handshakes: AtomicUsize::new(0),
         });
         control.register(control.wake.as_raw_fd(), 0, libc::EPOLLIN)?;
         let worker_control = control.clone();
@@ -892,10 +912,18 @@ mod tests {
         let acceptor = Arc::downgrade(&control.listeners.lock().unwrap()[0]);
 
         let mut client = UnixStream::connect(&path).unwrap();
-        std::fs::remove_file(&path).unwrap();
         client.write_all(b"CONNECT 1024\n").unwrap();
         let mut reply = Vec::new();
         assert_eq!(client.read_to_end(&mut reply).unwrap(), 0);
+
+        // A client that never sends its line holds up nobody else.
+        let _silent = UnixStream::connect(&path).unwrap();
+        let mut next = UnixStream::connect(&path).unwrap();
+        let started = Instant::now();
+        next.write_all(b"CONNECT 1024\n").unwrap();
+        assert_eq!(next.read_to_end(&mut reply).unwrap(), 0);
+        assert!(started.elapsed() < CONNECT_TIMEOUT / 2);
+        std::fs::remove_file(&path).unwrap();
 
         drop(control);
         drop(backend);
