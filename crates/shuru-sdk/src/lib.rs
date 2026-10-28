@@ -77,7 +77,7 @@ pub struct SandboxConfig {
     pub cpus: usize,
     /// Memory in MB. Default: 2048.
     pub memory_mb: u64,
-    /// Disk size in MB. Default: 4096.
+    /// Disk size in MB. Minimum and default: 4096.
     pub disk_size_mb: u64,
     /// Host → guest directory mounts (VirtioFS).
     pub mounts: Vec<MountConfig>,
@@ -289,6 +289,9 @@ enum SandboxCmd {
     DialGuest {
         port: u16,
         reply: oneshot::Sender<Result<TcpStream>>,
+    },
+    Trim {
+        reply: oneshot::Sender<Result<shuru_proto::TrimResponse>>,
     },
     Checkpoint {
         name: String,
@@ -633,8 +636,16 @@ impl AsyncSandbox {
         Ok((reply_rx, progress_rx))
     }
 
-    /// Save the current rootfs state as a named checkpoint (CoW clone).
-    /// Future VMs can boot from this checkpoint via `SandboxConfig::from`.
+    /// Return free ext4 extents to the backing storage when discard is supported.
+    pub async fn trim(&self) -> Result<shuru_proto::TrimResponse> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SandboxCmd::Trim { reply })
+            .map_err(|_| anyhow::anyhow!("sandbox stopped"))?;
+        rx.await?
+    }
+
+    /// Save a sealed disk and resume the sandbox after the copy.
     pub async fn checkpoint(&self, name: &str) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
@@ -725,7 +736,8 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
     // Resolve asset paths
     let kernel_path = format!("{}/Image", data_dir);
     let rootfs_path = format!("{}/rootfs.ext4", data_dir);
-    let initrd_path_str = format!("{}/initramfs.cpio.gz", data_dir);
+    shuru_vm::validate_disk_size(config.disk_size_mb)?;
+    let initrd_path_str = format!("{}/initramfs.cpio", data_dir);
 
     if !std::path::Path::new(&kernel_path).exists() {
         bail!(
@@ -784,6 +796,12 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
     #[cfg(not(feature = "cas"))]
     let use_nbd = false;
 
+    if config.from.is_none() && !use_nbd {
+        if let Err(e) = shuru_vm::WorkDisk::prepare_base(&source) {
+            tracing::warn!("{:#}", e);
+        }
+    }
+
     // A CAS run is served over NBD, so its disk is only a placeholder.
     let work_disk = if use_nbd {
         shuru_vm::WorkDisk::empty(&data_dir)?
@@ -828,7 +846,7 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
     let initrd_path = if std::path::Path::new(&initrd_path_str).exists() {
         Some(initrd_path_str)
     } else {
-        None
+        bail!("required initramfs not found at {}", initrd_path_str);
     };
 
     // Set up proxy networking if enabled
@@ -1058,6 +1076,9 @@ fn run_vm_loop(
             SandboxCmd::SetMemoryTarget { bytes, reply } => {
                 let _ = reply.send(sandbox.set_memory_target(bytes));
             }
+            SandboxCmd::Trim { reply } => {
+                let _ = reply.send(sandbox.trim());
+            }
             SandboxCmd::Checkpoint { name, reply } => {
                 let result = (|| -> Result<()> {
                     shuru_vm::validate_checkpoint_name(&name).map_err(|e| anyhow::anyhow!(e))?;
@@ -1068,20 +1089,18 @@ fn run_vm_loop(
                     #[cfg(feature = "cas")]
                     if let Some(ref handle) = nbd_handle {
                         let index_path = format!("{}/{}.idx", checkpoints_dir, name);
-                        if std::path::Path::new(&index_path).exists() {
-                            std::fs::remove_file(&index_path)?;
-                        }
-                        handle.save_checkpoint(&index_path)?;
+                        sandbox.save_disk(&index_path, shuru_vm::AfterSave::Thaw, |p| {
+                            handle.save_checkpoint(p)
+                        })?;
                         info!("checkpoint '{}' saved (CAS)", name);
                         return Ok(());
                     }
 
                     // Direct path: save as .ext4 via CoW clone
                     let checkpoint_path = format!("{}/{}.ext4", checkpoints_dir, name);
-                    if std::path::Path::new(&checkpoint_path).exists() {
-                        std::fs::remove_file(&checkpoint_path)?;
-                    }
-                    work_disk.save_to(&checkpoint_path)?;
+                    sandbox.save_disk(&checkpoint_path, shuru_vm::AfterSave::Thaw, |p| {
+                        work_disk.save_to(p)
+                    })?;
                     info!("checkpoint '{}' saved", name);
                     Ok(())
                 })();

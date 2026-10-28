@@ -42,7 +42,7 @@ jobs:
           DATA_DIR="${HOME}/.local/share/shuru"
           tar czf "shuru-os-${VERSION}-aarch64.tar.gz" \
             -C "${DATA_DIR}" \
-            Image initramfs.cpio.gz rootfs.ext4
+            Image initramfs.cpio rootfs.ext4
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

@@ -67,7 +67,7 @@ fn main() -> Result<()> {
             } else if console {
                 run_console(&prepared)
             } else {
-                vm::run_command(&prepared, &command).map(|r| r.exit_code)
+                vm::run_command(&prepared, &command, None).map(|r| r.exit_code)
             };
 
             process::exit(result?);

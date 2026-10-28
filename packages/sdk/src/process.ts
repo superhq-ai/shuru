@@ -111,20 +111,24 @@ export class ShuruProcess {
 
 		const reader = this.proc.stdout.getReader();
 		const decoder = new TextDecoder();
-		let remainder = "";
+		// A file read arrives as one line of tens of megabytes, so only the
+		// newest chunk is searched for the newline.
+		let parts: string[] = [];
 
 		try {
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) break;
 
-				remainder += decoder.decode(value, { stream: true });
-
-				while (true) {
-					const newlineIdx = remainder.indexOf("\n");
-					if (newlineIdx === -1) break;
-					const line = remainder.slice(0, newlineIdx);
-					remainder = remainder.slice(newlineIdx + 1);
+				const text = decoder.decode(value, { stream: true });
+				let start = 0;
+				let newlineIdx = text.indexOf("\n");
+				while (newlineIdx !== -1) {
+					parts.push(text.slice(start, newlineIdx));
+					const line = parts.join("");
+					parts = [];
+					start = newlineIdx + 1;
+					newlineIdx = text.indexOf("\n", start);
 
 					if (!line) continue;
 
@@ -135,6 +139,7 @@ export class ShuruProcess {
 						// malformed line
 					}
 				}
+				if (start < text.length) parts.push(text.slice(start));
 			}
 		} catch {
 			// stream closed

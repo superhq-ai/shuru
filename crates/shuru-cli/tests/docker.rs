@@ -43,7 +43,9 @@ fn image() -> String {
 }
 
 fn net_tests_enabled() -> bool {
-    std::env::var("SHURU_TEST_NET").map(|v| v == "1").unwrap_or(false)
+    std::env::var("SHURU_TEST_NET")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// Build the guest command: the script is base64 encoded so no quoting
@@ -68,7 +70,12 @@ fn shuru_run(extra: &[&str], script: &str) -> Output {
     cmd.args(guest_cmd(script));
     cmd.stdin(Stdio::null());
     let out = cmd.output().expect("failed to spawn shuru");
-    eprintln!("$ shuru run --from {} {}\n{}", checkpoint(), extra.join(" "), text(&out));
+    eprintln!(
+        "$ shuru run --from {} {}\n{}",
+        checkpoint(),
+        extra.join(" "),
+        text(&out)
+    );
     out
 }
 
@@ -138,7 +145,11 @@ docker rm -f web > /dev/null
     assert!(s.contains("storage=overlayfs"), "{}", s);
     assert!(s.contains("name=seccomp,profile=builtin"), "{}", s);
     assert!(s.contains("name=no-new-privileges"), "{}", s);
-    assert!(s.contains("digest=nginxinc/nginx-unprivileged@sha256:a8cb0f33"), "{}", s);
+    assert!(
+        s.contains("digest=nginxinc/nginx-unprivileged@sha256:a8cb0f33"),
+        "{}",
+        s
+    );
     assert!(s.contains("user=101"), "{}", s);
     assert!(s.contains("\nuid=101\n"), "{}", s);
     assert!(s.contains("nginx-master-Uid: 101 101 101 101"), "{}", s);
@@ -172,7 +183,14 @@ echo STOPPED
     );
 
     let child = Command::new(shuru_bin())
-        .args(["run", "--from", &checkpoint(), "-p", &format!("{}:8080", port), "--"])
+        .args([
+            "run",
+            "--from",
+            &checkpoint(),
+            "-p",
+            &format!("{}:8080", port),
+            "--",
+        ])
         .args(guest_cmd(&script))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -193,12 +211,23 @@ echo STOPPED
     }
     let _ = http_get(port, "/done");
     let out = child.wait_with_output().unwrap();
-    eprintln!("$ shuru run --from {} -p {}:8080\n{}", checkpoint(), port, text(&out));
+    eprintln!(
+        "$ shuru run --from {} -p {}:8080\n{}",
+        checkpoint(),
+        port,
+        text(&out)
+    );
     if let Some(b) = &body {
         eprintln!("$ GET http://127.0.0.1:{}/\n{}", port, b);
     }
 
-    let body = body.unwrap_or_else(|| panic!("no HTTP response with token on host port {}\n{}", port, text(&out)));
+    let body = body.unwrap_or_else(|| {
+        panic!(
+            "no HTTP response with token on host port {}\n{}",
+            port,
+            text(&out)
+        )
+    });
     assert!(body.starts_with("HTTP/1.1 200"), "{}", body);
     assert!(body.contains("Server: nginx"), "{}", body);
     assert!(stdout(&out).contains("STOPPED"), "{}", text(&out));
@@ -217,7 +246,11 @@ docker run --rm IMAGE sh -c "nslookup example.com 2>&1 | tail -n 1; wget -T 5 -q
 "#,
     );
     let s = stdout(&out);
-    assert!(s.contains("guest-eth0=Device \"eth0\" does not exist"), "{}", text(&out));
+    assert!(
+        s.contains("guest-eth0=Device \"eth0\" does not exist"),
+        "{}",
+        text(&out)
+    );
     assert!(s.contains("EGRESS_BLOCKED"), "{}", text(&out));
     assert!(s.contains("IP_BLOCKED"), "{}", text(&out));
     assert!(!s.contains("EGRESS_OK"), "{}", text(&out));
@@ -269,7 +302,12 @@ docker run --rm IMAGE sh -c "wget -T 5 -qO- http://host.shuru.internal:{port}/ >
         let out = shuru_run(extra, &script);
         let s = stdout(&out);
         assert!(s.contains("GATEWAY_BLOCKED"), "{:?}\n{}", extra, text(&out));
-        assert!(s.contains("HOSTNAME_BLOCKED"), "{:?}\n{}", extra, text(&out));
+        assert!(
+            s.contains("HOSTNAME_BLOCKED"),
+            "{:?}\n{}",
+            extra,
+            text(&out)
+        );
         assert!(!s.contains("REACHED"), "{:?}\n{}", extra, text(&out));
     }
     assert!(
@@ -346,8 +384,16 @@ echo "after-new-container=$(docker run --rm -v vdata:/tmp IMAGE cat /tmp/marker)
     let out = shuru_run(&[], &script);
     assert!(out.status.success(), "{}", text(&out));
     let s = stdout(&out);
-    assert!(s.contains(&format!("after-container-restart={}", token)), "{}", s);
-    assert!(s.contains(&format!("after-new-container={}", token)), "{}", s);
+    assert!(
+        s.contains(&format!("after-container-restart={}", token)),
+        "{}",
+        s
+    );
+    assert!(
+        s.contains(&format!("after-new-container={}", token)),
+        "{}",
+        s
+    );
 }
 
 /// Shuru resets the disk on every run, so persistence across a VM stop and
@@ -369,7 +415,15 @@ docker run --rm -v vdata:/tmp IMAGE sh -c "echo {token} > /tmp/marker"
 "#
     );
     let create = Command::new(shuru_bin())
-        .args(["checkpoint", "create", &name, "--verbose", "--from", &checkpoint(), "--"])
+        .args([
+            "checkpoint",
+            "create",
+            &name,
+            "--verbose",
+            "--from",
+            &checkpoint(),
+            "--",
+        ])
         .args(guest_cmd(&write))
         .stdin(Stdio::null())
         .output()
@@ -388,7 +442,12 @@ docker run --rm -v vdata:/tmp IMAGE sh -c "echo {token} > /tmp/marker"
     let _ = Command::new(shuru_bin())
         .args(["checkpoint", "delete", &name])
         .output();
-    eprintln!("$ shuru checkpoint create {} --verbose --from {}\n{}", name, checkpoint(), text(&create));
+    eprintln!(
+        "$ shuru checkpoint create {} --verbose --from {}\n{}",
+        name,
+        checkpoint(),
+        text(&create)
+    );
     eprintln!("$ shuru run --from {}\n{}", name, text(&read));
 
     assert!(

@@ -12,7 +12,7 @@ pub(crate) struct VmArgs {
     #[arg(long)]
     pub memory: Option<u64>,
 
-    /// Disk size in MB (default: 4096)
+    /// Disk size in MB (minimum and default: 4096)
     #[arg(long)]
     pub disk_size: Option<u64>,
 
@@ -24,7 +24,7 @@ pub(crate) struct VmArgs {
     #[arg(long, env = "SHURU_ROOTFS")]
     pub rootfs: Option<String>,
 
-    /// Path to initramfs (for loading VirtIO modules)
+    /// Path to the uncompressed initramfs containing the guest agent
     #[arg(long, env = "SHURU_INITRD")]
     pub initrd: Option<String>,
 

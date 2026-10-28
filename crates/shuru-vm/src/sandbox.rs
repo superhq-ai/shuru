@@ -27,8 +27,8 @@ use shuru_proto::{
     frame, ChmodRequest, CopyRequest, DiscardRequest, ExecRequest, ForwardRequest, ForwardResponse,
     FsOkResponse, MkdirRequest, MountRequest, MountResponse, PortMapping, ReadDirRequest,
     ReadDirResponse, ReadFileRequest, RemoveRequest, RenameRequest, ShutdownResponse, StatRequest,
-    StatResponse,
-    WatchRequest, WriteFileRequest, WriteFileResponse, VSOCK_PORT, VSOCK_PORT_FORWARD,
+    StatResponse, WatchRequest, WriteFileRequest, WriteFileResponse, VSOCK_PORT,
+    VSOCK_PORT_FORWARD,
 };
 
 // --- Mount types ---
@@ -138,9 +138,11 @@ impl VmConfigBuilder {
         }
 
         let boot_loader = LinuxBootLoader::new_with_kernel(&kernel_path);
-        if let Some(ref initrd) = self.initrd {
-            boot_loader.set_initrd(initrd);
-        }
+        boot_loader.set_initrd(
+            self.initrd
+                .as_ref()
+                .context("image initramfs is required")?,
+        );
 
         let mut identity = shuru_proto::hello::Identity {
             token: [0; 32],
@@ -153,9 +155,9 @@ impl VmConfigBuilder {
         let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let token = hex(&identity.token);
         let cmdline = if self.verbose {
-            "console=hvc0 root=/dev/vda rw init=/usr/bin/shuru-init"
+            "console=hvc0 root=/dev/vda rw"
         } else {
-            "console=hvc0 root=/dev/vda rw init=/usr/bin/shuru-init quiet"
+            "console=hvc0 root=/dev/vda rw quiet"
         };
         boot_loader.set_command_line(&format!(
             "{cmdline} shuru.token={token} shuru.instance={}",
@@ -253,15 +255,23 @@ impl VmConfigBuilder {
                 _serial_output: serial_output,
             }),
             mounts: Mutex::new(mount_requests),
+            disk_operation: Mutex::new(()),
         })
     }
 }
 
 // --- Sandbox ---
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum AfterSave {
+    Thaw,
+    PowerOff,
+}
+
 pub struct Sandbox {
     vm: Arc<GuestVm>,
     mounts: Mutex<Vec<MountRequest>>,
+    disk_operation: Mutex<()>,
 }
 
 impl Sandbox {
@@ -273,6 +283,87 @@ impl Sandbox {
         self.vm
             .start()
             .map_err(|e| anyhow::anyhow!("Failed to start VM: {}", e))
+    }
+
+    fn disk_request<T: serde::de::DeserializeOwned>(&self, kind: u8, payload: &[u8]) -> Result<T> {
+        let mut stream = self.connect_vsock()?;
+        stream.set_read_timeout(Some(SHUTDOWN_TIMEOUT))?;
+        stream.set_write_timeout(Some(SHUTDOWN_TIMEOUT))?;
+        frame::write_frame(&mut stream, kind, payload)?;
+        match frame::read_frame(&mut stream)? {
+            Some((k, data)) if k == kind + 1 => Ok(serde_json::from_slice(&data)?),
+            Some((frame::ERROR, data)) => bail!(
+                "guest disk operation failed: {}",
+                String::from_utf8_lossy(&data)
+            ),
+            _ => bail!("guest did not acknowledge disk operation"),
+        }
+    }
+
+    pub fn trim(&self) -> Result<shuru_proto::TrimResponse> {
+        let _guard = self.disk_operation.lock().unwrap();
+        self.disk_request(frame::TRIM_REQ, &[])
+    }
+
+    /// Save a sealed disk through a file clone or a CAS index writer.
+    /// The writer must create the supplied path and finish before returning.
+    /// Returns the services the guest stopped, which only a PowerOff save
+    /// asks for.
+    pub fn save_disk(
+        &self,
+        dest: &str,
+        after: AfterSave,
+        copy: impl FnOnce(&str) -> Result<()>,
+    ) -> Result<ShutdownResponse> {
+        let _guard = self.disk_operation.lock().unwrap();
+        crate::checkpoint::check_format(dest)?;
+        let mut bytes = [0; 8];
+        getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("generate seal id"))?;
+        let id = u64::from_ne_bytes(bytes);
+        let req = shuru_proto::SealRequest {
+            id,
+            stop_services: after == AfterSave::PowerOff,
+            lease_ms: 300_000,
+        };
+        let sealed = self
+            .disk_request(frame::SEAL_REQ, &serde_json::to_vec(&req)?)
+            .and_then(|response| match response {
+                shuru_proto::SealResponse::Sealed(services) => Ok(services),
+                _ => Err(anyhow::anyhow!("guest did not seal root")),
+            });
+        let services = match sealed {
+            Ok(services) => services,
+            Err(e) => {
+                if after == AfterSave::PowerOff {
+                    let _ = self.kill();
+                }
+                return Err(e);
+            }
+        };
+        let thaw = || -> Result<()> {
+            let resp: shuru_proto::SealResponse = self.disk_request(
+                frame::THAW_REQ,
+                &serde_json::to_vec(&shuru_proto::ThawRequest { id })?,
+            )?;
+            if resp != shuru_proto::SealResponse::Thawed {
+                bail!("seal expired before checkpoint copy completed");
+            }
+            Ok(())
+        };
+        let result = crate::checkpoint::publish(dest, copy, || {
+            thaw()?;
+            if after == AfterSave::PowerOff {
+                self.kill()?;
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            let _ = thaw();
+            if after == AfterSave::PowerOff {
+                let _ = self.kill();
+            }
+        }
+        result.map(|()| services)
     }
 
     /// Ask the guest to stop its services and sync the disk (RFC 0004).
@@ -310,6 +401,9 @@ impl Sandbox {
     /// Power off without asking the guest. Services get no SIGTERM and the
     /// disk is not synced.
     pub fn kill(&self) -> Result<()> {
+        if matches!(self.vm.state(), VmState::Stopped) {
+            return Ok(());
+        }
         self.vm
             .stop()
             .map_err(|e| anyhow::anyhow!("Failed to stop VM: {}", e))
@@ -440,18 +534,24 @@ impl Sandbox {
         };
         frame::send_json(&mut writer, frame::READ_FILE_REQ, &req)?;
 
-        match frame::read_frame(&mut reader).context("reading read_file response")? {
-            Some((frame::READ_FILE_RESP, payload)) => Ok(payload),
-            Some((frame::ERROR, payload)) => {
-                bail!("{}", String::from_utf8_lossy(&payload));
+        let mut data = Vec::new();
+        loop {
+            match frame::read_frame(&mut reader).context("reading read_file response")? {
+                Some((frame::READ_FILE_RESP, chunk)) if chunk.is_empty() => return Ok(data),
+                Some((frame::READ_FILE_RESP, chunk)) => {
+                    data.extend_from_slice(&chunk);
+                }
+                Some((frame::ERROR, payload)) => {
+                    bail!("{}", String::from_utf8_lossy(&payload));
+                }
+                Some((other, _)) => {
+                    bail!(
+                        "unexpected frame type 0x{:02x} in read_file response",
+                        other
+                    );
+                }
+                None => bail!("guest closed connection during read_file"),
             }
-            Some((other, _)) => {
-                bail!(
-                    "unexpected frame type 0x{:02x} in read_file response",
-                    other
-                );
-            }
-            None => bail!("guest closed connection during read_file"),
         }
     }
 
@@ -467,7 +567,9 @@ impl Sandbox {
             len: content.len() as u64,
         };
         frame::send_json(&mut writer, frame::WRITE_FILE_REQ, &req)?;
-        frame::write_frame(&mut writer, frame::WRITE_FILE_DATA, content)?;
+        for chunk in content.chunks(frame::FILE_CHUNK) {
+            frame::write_frame(&mut writer, frame::WRITE_FILE_DATA, chunk)?;
+        }
 
         let (_msg_type, payload) = frame::read_frame(&mut reader)
             .context("reading write_file response")?
@@ -986,6 +1088,9 @@ impl GuestVm {
         let state_rx = self.machine.state_channel();
         let attempts = if port == VSOCK_PORT { 1000 } else { 1 };
         for attempt in 1..=attempts {
+            if matches!(self.machine.state(), VmState::Stopped | VmState::Error) {
+                bail!("VM stopped before guest connection");
+            }
             // Check if VM died (e.g. guest mount failure -> reboot POWER_OFF)
             if let Ok(state) = state_rx.try_recv() {
                 match state {
@@ -1041,7 +1146,10 @@ fn shutdown_handshake(stream: TcpStream) -> Result<ShutdownResponse> {
                 return serde_json::from_slice(&payload).context("parsing shutdown response");
             }
             Some((frame::ERROR, payload)) => {
-                bail!("guest refused shutdown: {}", String::from_utf8_lossy(&payload))
+                bail!(
+                    "guest refused shutdown: {}",
+                    String::from_utf8_lossy(&payload)
+                )
             }
             Some(_) => {}
             None => bail!("guest closed the connection before answering shutdown"),
@@ -1121,3 +1229,7 @@ fn relay(a: TcpStream, b: TcpStream) {
     let _ = t1.join();
     let _ = t2.join();
 }
+
+#[cfg(test)]
+#[path = "disk_tests.rs"]
+mod disk_tests;

@@ -28,8 +28,8 @@ impl WorkDisk {
     /// Clone `base` into an anonymous file on the filesystem holding `dir`,
     /// grown to `size_mb` if that is larger than the base.
     pub fn clone_from(base: &str, dir: &str, size_mb: u64) -> Result<Self> {
+        let target = crate::validate_disk_size(size_mb)?;
         let disk = Self::clone_anonymous(base, dir)?;
-        let target = size_mb * 1024 * 1024;
         let current = disk.file.metadata()?.len();
         if target < current {
             bail!(
@@ -42,6 +42,26 @@ impl WorkDisk {
             disk.file.set_len(target)?;
         }
         Ok(disk)
+    }
+
+    /// Lay a base image out for cheap clones, once. On APFS, growing a
+    /// clone or writing into its new space costs time in proportion to the
+    /// extent count of its source, and an image produced by build tools has
+    /// thousands of extents: half a second to two seconds on every boot. A
+    /// sequential copy already at the minimum disk size leaves clones
+    /// nothing to grow. A base at least that size is taken as prepared.
+    pub fn prepare_base(path: &str) -> Result<()> {
+        let target = crate::validate_disk_size(crate::MIN_DISK_MB)?;
+        if std::fs::metadata(path)?.len() >= target {
+            return Ok(());
+        }
+        let tmp = format!("{}.prepare-{}", path, random_hex());
+        let written = rewrite_sequential(path, &tmp, target)
+            .and_then(|()| std::fs::rename(&tmp, path).map_err(Into::into));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written.with_context(|| format!("preparing {}", path))
     }
 
     /// An empty anonymous file, for a VM whose disk is served some other
@@ -140,6 +160,28 @@ fn anonymous_file(dir: &str) -> Result<File> {
     Ok(opened?)
 }
 
+/// A plain read and write loop: `io::copy` may reflink on Linux, which
+/// would carry the source extents over.
+fn rewrite_sequential(src: &str, dst: &str, len: u64) -> Result<()> {
+    use std::io::{Read, Write};
+    let mut input = File::open(src)?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+    let mut buf = vec![0u8; 8 << 20];
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        output.write_all(&buf[..n])?;
+    }
+    output.set_len(len)?;
+    output.sync_all()?;
+    Ok(())
+}
+
 /// Copy by offset so neither descriptor's position is touched.
 #[cfg(not(target_os = "macos"))]
 fn copy_contents(src: &File, dst: &File) -> Result<()> {
@@ -149,9 +191,11 @@ fn copy_contents(src: &File, dst: &File) -> Result<()> {
     while off < len {
         let n = src.read_at(&mut buf, off)?;
         if n == 0 {
-            break;
+            bail!("unexpected end of disk during checkpoint copy");
         }
-        dst.write_all_at(&buf[..n], off)?;
+        if buf[..n].iter().any(|b| *b != 0) {
+            dst.write_all_at(&buf[..n], off)?;
+        }
         off += n as u64;
     }
     dst.set_len(len)?;
@@ -201,13 +245,13 @@ mod tests {
             .write_all(b"base image bytes")
             .unwrap();
 
-        let disk = WorkDisk::clone_from(&base, &dir, 1).unwrap();
+        let disk = WorkDisk::clone_from(&base, &dir, 4096).unwrap();
         assert_eq!(names_in(&dir), vec!["base.img".to_string()]);
 
         let mut head = [0u8; 16];
         disk.file.read_exact_at(&mut head, 0).unwrap();
         assert_eq!(&head, b"base image bytes");
-        assert_eq!(disk.file.metadata().unwrap().len(), 1024 * 1024);
+        assert_eq!(disk.file.metadata().unwrap().len(), 4096 * 1024 * 1024);
         assert!(disk.attach_path().ends_with(&disk.as_raw_fd().to_string()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -221,7 +265,7 @@ mod tests {
             .write_all(b"original")
             .unwrap();
 
-        let disk = WorkDisk::clone_from(&base, &dir, 1).unwrap();
+        let disk = WorkDisk::clone_from(&base, &dir, 4096).unwrap();
         disk.file.write_all_at(b"changed!", 0).unwrap();
         assert_eq!(std::fs::read(&base).unwrap(), b"original");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -236,16 +280,42 @@ mod tests {
             .write_all(&vec![7u8; 4096])
             .unwrap();
 
-        let disk = WorkDisk::clone_from(&base, &dir, 1).unwrap();
+        let disk = WorkDisk::clone_from(&base, &dir, 4096).unwrap();
         disk.file.write_all_at(b"saved state", 100).unwrap();
         let dest = format!("{}/snap.img", dir);
         disk.save_to(&dest).unwrap();
 
-        let saved = std::fs::read(&dest).unwrap();
-        assert_eq!(saved.len(), 1024 * 1024);
+        let file = File::open(&dest).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 4096 * 1024 * 1024);
+        let mut saved = [0; 4096];
+        file.read_exact_at(&mut saved, 0).unwrap();
         assert_eq!(&saved[100..111], b"saved state");
         assert_eq!(saved[0], 7);
         assert!(disk.save_to(&dest).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn prepare_base_grows_the_base_once_and_keeps_its_contents() {
+        let dir = temp_dir();
+        let base = format!("{}/base.img", dir);
+        std::fs::File::create(&base)
+            .unwrap()
+            .write_all(b"base image bytes")
+            .unwrap();
+
+        WorkDisk::prepare_base(&base).unwrap();
+        let file = File::open(&base).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 4096 * 1024 * 1024);
+        let mut head = [0u8; 16];
+        file.read_exact_at(&mut head, 0).unwrap();
+        assert_eq!(&head, b"base image bytes");
+        assert_eq!(names_in(&dir), vec!["base.img".to_string()]);
+
+        let inode = std::os::unix::fs::MetadataExt::ino(&file.metadata().unwrap());
+        WorkDisk::prepare_base(&base).unwrap();
+        let again = std::fs::metadata(&base).unwrap();
+        assert_eq!(std::os::unix::fs::MetadataExt::ino(&again), inode);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -255,9 +325,9 @@ mod tests {
         let base = format!("{}/base.img", dir);
         std::fs::File::create(&base)
             .unwrap()
-            .set_len(3 * 1024 * 1024)
+            .set_len(4097 * 1024 * 1024)
             .unwrap();
-        assert!(WorkDisk::clone_from(&base, &dir, 2).is_err());
+        assert!(WorkDisk::clone_from(&base, &dir, 4096).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

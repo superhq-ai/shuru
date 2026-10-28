@@ -14,7 +14,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub fn assets_ready(data_dir: &str) -> bool {
     let kernel = format!("{}/Image", data_dir);
     let rootfs = format!("{}/rootfs.ext4", data_dir);
-    let initramfs = format!("{}/initramfs.cpio.gz", data_dir);
+    let initramfs = format!("{}/initramfs.cpio", data_dir);
 
     if !Path::new(&kernel).exists()
         || !Path::new(&rootfs).exists()
@@ -72,6 +72,8 @@ fn download_os_image_version(data_dir: &str, version: &str) -> Result<()> {
         .context("failed to extract OS image")?;
 
     eprintln!(); // newline after progress
+
+    shuru_vm::WorkDisk::prepare_base(&format!("{}/rootfs.ext4", data_dir))?;
 
     // Write VERSION file
     let version_file = format!("{}/VERSION", data_dir);

@@ -68,28 +68,75 @@ fn update_creates_replaces_layers_and_keeps_the_old_one_on_failure() {
     let _cleanup = Cleanup(vec![name.clone(), format!("{}.update", name)]);
 
     // Missing checkpoint: update behaves like create.
-    let out = shuru(&["checkpoint", "update", &name, "--", "sh", "-c", "mkdir -p /opt/m && touch /opt/m/one"]);
+    let out = shuru(&[
+        "checkpoint",
+        "update",
+        &name,
+        "--",
+        "sh",
+        "-c",
+        "mkdir -p /opt/m && touch /opt/m/one",
+    ]);
     assert!(out.status.success(), "{}", text(&out));
-    assert!(stderr(&out).contains(&format!("checkpoint '{}' saved", name)), "{}", text(&out));
+    assert!(
+        stderr(&out).contains(&format!("checkpoint '{}' saved", name)),
+        "{}",
+        text(&out)
+    );
     assert_eq!(files_in(&name), "one");
 
     // Plain update starts from the base image again.
-    let out = shuru(&["checkpoint", "update", &name, "--", "sh", "-c", "mkdir -p /opt/m && touch /opt/m/two"]);
+    let out = shuru(&[
+        "checkpoint",
+        "update",
+        &name,
+        "--",
+        "sh",
+        "-c",
+        "mkdir -p /opt/m && touch /opt/m/two",
+    ]);
     assert!(out.status.success(), "{}", text(&out));
-    assert!(stderr(&out).contains(&format!("checkpoint '{}' updated", name)), "{}", text(&out));
+    assert!(
+        stderr(&out).contains(&format!("checkpoint '{}' updated", name)),
+        "{}",
+        text(&out)
+    );
     assert_eq!(files_in(&name), "two");
 
     // --from NAME layers the command on top of the existing checkpoint.
-    let out = shuru(&["checkpoint", "update", &name, "--from", &name, "--", "touch", "/opt/m/three"]);
+    let out = shuru(&[
+        "checkpoint",
+        "update",
+        &name,
+        "--from",
+        &name,
+        "--",
+        "touch",
+        "/opt/m/three",
+    ]);
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(files_in(&name), "three\ntwo");
 
     // A failing command leaves the old checkpoint in place and no staging copy.
-    let out = shuru(&["checkpoint", "update", &name, "--from", &name, "--", "sh", "-c", "touch /opt/m/four; exit 3"]);
+    let out = shuru(&[
+        "checkpoint",
+        "update",
+        &name,
+        "--from",
+        &name,
+        "--",
+        "sh",
+        "-c",
+        "touch /opt/m/four; exit 3",
+    ]);
     assert!(!out.status.success(), "{}", text(&out));
     let e = stderr(&out);
     assert!(e.contains("exited with status 3"), "{}", e);
-    assert!(e.contains(&format!("checkpoint '{}' unchanged", name)), "{}", e);
+    assert!(
+        e.contains(&format!("checkpoint '{}' unchanged", name)),
+        "{}",
+        e
+    );
     assert_eq!(files_in(&name), "three\ntwo");
     let list = stdout(&shuru(&["checkpoint", "list"]));
     assert!(!list.contains(&format!("{}.update", name)), "{}", list);
@@ -97,5 +144,9 @@ fn update_creates_replaces_layers_and_keeps_the_old_one_on_failure() {
     // create still refuses to overwrite and points at update.
     let out = shuru(&["checkpoint", "create", &name, "--", "true"]);
     assert!(!out.status.success(), "{}", text(&out));
-    assert!(stderr(&out).contains("shuru checkpoint update"), "{}", text(&out));
+    assert!(
+        stderr(&out).contains("shuru checkpoint update"),
+        "{}",
+        text(&out)
+    );
 }

@@ -46,6 +46,7 @@ pub(crate) fn prepare_vm(vm: &VmArgs, cfg: &ShuruConfig, from: Option<&str>) -> 
     let cpus = vm.cpus.or(cfg.cpus).unwrap_or(2);
     let memory = vm.memory.or(cfg.memory).unwrap_or(2048);
     let disk_size = vm.disk_size.or(cfg.disk_size).unwrap_or(4096);
+    shuru_vm::validate_disk_size(disk_size)?;
     let allow_net = vm.allow_net || cfg.allow_net.unwrap_or(false);
     let allow_host_writes = vm.allow_host_writes || cfg.allow_host_writes.unwrap_or(false);
     let verbose = vm.verbose;
@@ -138,7 +139,7 @@ pub(crate) fn prepare_vm(vm: &VmArgs, cfg: &ShuruConfig, from: Option<&str>) -> 
     let initrd_path_str = vm
         .initrd
         .clone()
-        .unwrap_or_else(|| format!("{}/initramfs.cpio.gz", data_dir));
+        .unwrap_or_else(|| format!("{}/initramfs.cpio", data_dir));
 
     if !std::path::Path::new(&kernel_path).exists() {
         bail!(
@@ -178,6 +179,11 @@ pub(crate) fn prepare_vm(vm: &VmArgs, cfg: &ShuruConfig, from: Option<&str>) -> 
 
     trace_boot("prepare: config + assets checked");
     // A CAS checkpoint is served over NBD, so its disk is only a placeholder.
+    if from.is_none() && vm.rootfs.is_none() {
+        if let Err(e) = shuru_vm::WorkDisk::prepare_base(&source) {
+            eprintln!("shuru: note: {:#}", e);
+        }
+    }
     let work_disk = if cas_index.is_none() {
         if verbose {
             eprintln!("shuru: creating working copy...");
@@ -191,11 +197,7 @@ pub(crate) fn prepare_vm(vm: &VmArgs, cfg: &ShuruConfig, from: Option<&str>) -> 
     let initrd_path = if std::path::Path::new(&initrd_path_str).exists() {
         Some(initrd_path_str)
     } else {
-        eprintln!(
-            "shuru: warning: initramfs not found at {}, booting without it",
-            initrd_path_str
-        );
-        None
+        bail!("required initramfs not found at {}", initrd_path_str);
     };
 
     trace_boot("prepare_vm done (disk cloned + extended)");
@@ -252,10 +254,13 @@ pub(crate) fn build_sandbox(
 /// default; CAS is opt-in via SHURU_STORAGE=cas. Booting from a CAS
 /// checkpoint always uses NBD since the chunk store is the only place its
 /// content exists.
+pub(crate) fn uses_cas(prepared: &PreparedVm) -> bool {
+    prepared.cas_index.is_some()
+        || matches!(std::env::var("SHURU_STORAGE").as_deref(), Ok("cas" | "nbd"))
+}
+
 pub(crate) fn start_nbd(prepared: &PreparedVm) -> Result<Option<shuru_store::NbdHandle>> {
-    let storage = std::env::var("SHURU_STORAGE").unwrap_or_default();
-    let want_cas = storage == "cas" || storage == "nbd";
-    if prepared.cas_index.is_none() && !want_cas {
+    if !uses_cas(prepared) {
         return Ok(None);
     }
     let data_dir = shuru_vm::default_data_dir();
@@ -288,7 +293,11 @@ pub(crate) struct RunResult {
     pub nbd_handle: Option<shuru_store::NbdHandle>,
 }
 
-pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<RunResult> {
+pub(crate) fn run_command(
+    prepared: &PreparedVm,
+    command: &[String],
+    checkpoint: Option<&str>,
+) -> Result<RunResult> {
     if prepared.verbose {
         eprintln!("shuru: kernel={}", prepared.kernel_path);
         eprintln!(
@@ -376,26 +385,24 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<R
     };
     trace_boot("command done");
 
-    // Graceful shutdown: guest services get SIGTERM and the disk is synced
-    // before power off, so a checkpoint clone sees a consistent image.
-    match sandbox.shutdown() {
-        Ok(report) => {
-            if prepared.verbose && !report.stopped.is_empty() {
-                eprintln!("shuru: stopped services: {}", report.stopped.join(", "));
+    if let Some(dest) = checkpoint {
+        let report = sandbox.save_disk(dest, shuru_vm::AfterSave::PowerOff, |path| {
+            if let Some(ref handle) = nbd_handle {
+                handle.save_checkpoint(path)
+            } else {
+                prepared.work_disk.save_to(path)
             }
-            if !report.killed.is_empty() {
-                eprintln!(
-                    "shuru: services ignored SIGTERM and were killed: {}",
-                    report.killed.join(", ")
-                );
-            }
+        })?;
+        report_services(&report, prepared.verbose);
+    } else {
+        match sandbox.shutdown() {
+            Ok(report) => report_services(&report, prepared.verbose),
+            Err(e) => eprintln!("shuru: guest shutdown failed, powering off: {}", e),
         }
-        Err(e) => eprintln!("shuru: guest shutdown failed, powering off: {}", e),
+        trace_boot("guest shut down");
+        sandbox.kill()?;
     }
-    trace_boot("guest shut down");
-
     drop(proxy_handle);
-    let _ = sandbox.kill();
     Ok(RunResult {
         exit_code,
         nbd_handle,
@@ -435,6 +442,18 @@ fn parse_mount_spec(s: &str) -> Result<MountConfig> {
     let mode = parts.get(2).copied();
 
     parse_mount_parts(&host_path, guest, mode)
+}
+
+fn report_services(report: &shuru_proto::ShutdownResponse, verbose: bool) {
+    if verbose && !report.stopped.is_empty() {
+        eprintln!("shuru: stopped services: {}", report.stopped.join(", "));
+    }
+    if !report.killed.is_empty() {
+        eprintln!(
+            "shuru: services ignored SIGTERM and were killed: {}",
+            report.killed.join(", ")
+        );
+    }
 }
 
 fn validate_mounts(mounts: &[MountConfig], allow_host_writes: bool) -> Result<()> {

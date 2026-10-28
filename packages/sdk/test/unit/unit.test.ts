@@ -41,6 +41,12 @@ describe("buildArgs", () => {
 		]);
 	});
 
+	test("invalid disk sizes", () => {
+		for (const diskSize of [0, 1024, 4095, 4096.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1]) {
+			expect(() => buildArgs("shuru", { diskSize })).toThrow();
+		}
+	});
+
 	test("disk size", () => {
 		const args = buildArgs("shuru", { diskSize: 8192 });
 		expect(args).toEqual(["shuru", "run", "--stdio", "--disk-size", "8192"]);

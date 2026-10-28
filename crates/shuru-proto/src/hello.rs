@@ -4,7 +4,7 @@ use subtle::ConstantTimeEq;
 
 use crate::frame;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Clone, Copy)]
 pub struct Identity {
@@ -37,13 +37,16 @@ impl Identity {
         if !bool::from(self.token.ct_eq(&token)) {
             return Err(rejected());
         }
-        frame::write_frame(stream, frame::HELLO_OK, &self.instance)
+        let mut reply = [0; 20];
+        reply[..16].copy_from_slice(&self.instance);
+        reply[16..].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        frame::write_frame(stream, frame::HELLO_OK, &reply)
     }
 
     pub fn connect(&self, stream: &mut (impl Read + Write)) -> io::Result<()> {
         frame::write_frame(stream, frame::HELLO, &self.token)?;
-        let instance = read_hello::<16>(stream, frame::HELLO_OK)?;
-        if instance != self.instance {
+        let reply = read_hello::<20>(stream, frame::HELLO_OK)?;
+        if reply[..16] != self.instance || reply[16..] != PROTOCOL_VERSION.to_le_bytes() {
             return Err(rejected());
         }
         Ok(())
@@ -120,6 +123,20 @@ mod tests {
         let mut peer = stream(frame::HELLO, &ID.token);
         peer.input.get_mut().pop();
         assert!(ID.accept(&mut peer).is_err());
+    }
+
+    #[test]
+    fn reject_old_agent_and_wrong_protocol() {
+        assert!(ID
+            .connect(&mut stream(frame::HELLO_OK, &ID.instance))
+            .is_err());
+        let mut reply = [0; 20];
+        reply[..16].copy_from_slice(&ID.instance);
+        reply[16..].copy_from_slice(&(PROTOCOL_VERSION - 1).to_le_bytes());
+        assert!(ID.connect(&mut stream(frame::HELLO_OK, &reply)).is_err());
+        reply[16..].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        reply[0] ^= 1;
+        assert!(ID.connect(&mut stream(frame::HELLO_OK, &reply)).is_err());
     }
 
     #[test]

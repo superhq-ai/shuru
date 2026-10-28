@@ -1,5 +1,80 @@
 # Changelog
 
+## Unreleased
+
+### Fast boot
+
+`shuru run -- true` on an M-series Mac goes from about 300 ms to about 160
+ms. The guest agent is now `/init` in an uncompressed initramfs and mounts
+the root itself. The old initramfs gunzip, `e2fsck` and offline
+`resize2fs` are gone from the boot path. The kernel replays an old journal
+when it mounts, and a larger disk grows online with `EXT4_IOC_RESIZE_FS`.
+Networking is configured by the agent. The rootfs no longer carries a copy
+of the agent.
+
+The kernel tick goes from 100 Hz to 1000 Hz. virtio_pci_modern sleeps one
+millisecond at a time while a device resets, and on the asynchronous Apple
+reset each of those sleeps cost two jiffies, 10 to 20 ms per device at 100
+Hz. Guest uptime when the command starts drops from 150 ms to 70 ms.
+
+On APFS, growing a clone of a fragmented file costs time in proportion to
+its extent count, 0.5 to 1.5 s for the base image built by
+`prepare-rootfs.sh`. The base is now rewritten sequentially and extended to
+4096 MB once, after download or on the first boot that finds it short, and
+a clone then costs well under a millisecond.
+
+### Sealed checkpoints
+
+Every checkpoint path now freezes ext4 in the guest before the host copies
+the disk, so a saved disk is clean and needs no journal replay. A seal
+carries an id and a lease; the guest thaws itself when the lease runs out,
+and the host publishes the copy only after a matching thaw. A failed save
+keeps the previous checkpoint. A save that died leaves a staging directory
+that the next save of the same name reuses. CAS checkpoints are written as
+standalone indexes, so replacing one cannot form a parent cycle or depend
+on the base image path.
+
+The root is mounted `errors=remount-ro`. A disk with recorded ext4 errors
+refuses to boot and refuses to seal.
+
+### Freed space goes back to the host
+
+A seal runs `FITRIM` for free extents of 1 MiB and up, and `trim` is
+available on a running sandbox from the CLI stdio protocol and both SDKs.
+The Linux block device supports discard and write zeroes, mapped to
+`fallocate` hole punching, with every range bounds checked.
+
+### Disk size
+
+Disks default to 4096 MB, which is now also the minimum. A disk never
+shrinks below its source.
+
+### macOS: a VM that powers off during boot no longer hangs the host
+
+Connecting to the guest waited forever if the VM stopped while the connect
+was pending, because the framework never calls the completion handler. It
+now notices the stopped VM and fails.
+
+### Watch events carry their names again
+
+`file_change` notifications sent `"2"` and `"3"` instead of `"modify"` and
+`"delete"`, and the guest reported every new file as modified. Events are
+`create`, `modify`, `delete` and `rename` again, a rename arrives once for
+each path, and `shuru_proto::watch_kind::name` maps a kind to its name.
+
+### Files of 1 MB and up can be read and written
+
+`read_file` and `write_file` sent the whole file in one frame, and frames
+stop at 1 MB, so larger files failed with a broken pipe. Contents now
+travel in 256 KiB frames. A failed write reports the guest error, and the
+TypeScript SDK no longer rescans a long response line for every chunk it
+receives, which made a 64 MB read take 1.7 s instead of 0.5 s.
+
+### Checkpoint saves report stopped services again
+
+`shuru checkpoint create --verbose` prints the services that were stopped
+before the save, and every save prints services that ignored SIGTERM.
+
 ## 0.10.0
 
 ### Linux: a VM can no longer reach another VM

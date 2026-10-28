@@ -180,9 +180,7 @@ fn http_get(url: &str, accept: &str) -> Result<String> {
             }
         }
     }
-    let mut resp = req
-        .call()
-        .with_context(|| format!("GET {} failed", url))?;
+    let mut resp = req.call().with_context(|| format!("GET {} failed", url))?;
     resp.body_mut()
         .read_to_string()
         .with_context(|| format!("reading {}", url))
@@ -197,14 +195,23 @@ fn resolve_sha(owner: &str, repo: &str, reference: &str) -> Result<String> {
         .with_context(|| format!("resolving {}/{}@{}", owner, repo, reference))?;
     let sha = sha.trim().to_string();
     if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("unexpected commit id from GitHub for {}/{}@{}: {}", owner, repo, reference, sha);
+        bail!(
+            "unexpected commit id from GitHub for {}/{}@{}: {}",
+            owner,
+            repo,
+            reference,
+            sha
+        );
     }
     Ok(sha)
 }
 
 fn raw_url(owner: &str, repo: &str, sha: &str, path: &str, file: &str) -> String {
     if path.is_empty() {
-        format!("https://raw.githubusercontent.com/{}/{}/{}/{}", owner, repo, sha, file)
+        format!(
+            "https://raw.githubusercontent.com/{}/{}/{}/{}",
+            owner, repo, sha, file
+        )
     } else {
         format!(
             "https://raw.githubusercontent.com/{}/{}/{}/{}/{}",
@@ -214,8 +221,8 @@ fn raw_url(owner: &str, repo: &str, sha: &str, path: &str, file: &str) -> String
 }
 
 fn parse_spec(text: &str, origin: &str) -> Result<RecipeSpec> {
-    let spec: RecipeSpec = serde_json::from_str(text)
-        .with_context(|| format!("invalid recipe.json in {}", origin))?;
+    let spec: RecipeSpec =
+        serde_json::from_str(text).with_context(|| format!("invalid recipe.json in {}", origin))?;
     validate_spec(&spec, origin)?;
     Ok(spec)
 }
@@ -227,11 +234,18 @@ fn valid_name(name: &str, allow_dots: bool) -> bool {
         _ => return false,
     }
     chars.all(|c| {
-        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || (allow_dots && c == '.')
+        c.is_ascii_lowercase()
+            || c.is_ascii_digit()
+            || c == '-'
+            || c == '_'
+            || (allow_dots && c == '.')
     })
 }
 
 fn validate_spec(spec: &RecipeSpec, origin: &str) -> Result<()> {
+    if let Some(size) = spec.disk_size {
+        shuru_vm::validate_disk_size(size)?;
+    }
     if !valid_name(&spec.name, true) {
         bail!(
             "{}: recipe name {:?} must match [a-z0-9][a-z0-9._-]*",
@@ -244,19 +258,28 @@ fn validate_spec(spec: &RecipeSpec, origin: &str) -> Result<()> {
     }
     for step in &spec.steps {
         if step.contains('/') || step.contains("..") || step.is_empty() {
-            bail!("{}: step {:?} must be a file name in the recipe directory", origin, step);
+            bail!(
+                "{}: step {:?} must be a file name in the recipe directory",
+                origin,
+                step
+            );
         }
     }
     for (name, value) in &spec.services {
         if !valid_name(name, false) {
-            bail!("{}: service name {:?} must match [a-z0-9][a-z0-9-]*", origin, name);
+            bail!(
+                "{}: service name {:?} must match [a-z0-9][a-z0-9-]*",
+                origin,
+                name
+            );
         }
         if !value.is_object() {
             bail!("{}: service {} must be a JSON object", origin, name);
         }
     }
     if let Some(ref from) = spec.from {
-        shuru_vm::validate_checkpoint_name(from).map_err(|e| anyhow::anyhow!("{}: {}", origin, e))?;
+        shuru_vm::validate_checkpoint_name(from)
+            .map_err(|e| anyhow::anyhow!("{}: {}", origin, e))?;
     }
     if let Some(ref min) = spec.min_shuru_version {
         let need = parse_version(min)
@@ -318,8 +341,11 @@ fn load_github(owner: &str, repo: &str, path: &str, reference: &str) -> Result<R
     } else {
         format!("{}/{}/{}", owner, repo, path)
     };
-    let spec_text = http_get(&raw_url(owner, repo, &sha, path, "recipe.json"), "text/plain")
-        .with_context(|| format!("fetching recipe.json for {}@{}", origin, &sha[..7]))?;
+    let spec_text = http_get(
+        &raw_url(owner, repo, &sha, path, "recipe.json"),
+        "text/plain",
+    )
+    .with_context(|| format!("fetching recipe.json for {}@{}", origin, &sha[..7]))?;
     let spec = parse_spec(&spec_text, &origin)?;
     let mut steps = Vec::new();
     for step in &spec.steps {
@@ -356,7 +382,12 @@ fn print_summary(recipe: &Recipe, out: &mut impl Write) -> std::io::Result<()> {
     if !recipe.spec.description.is_empty() {
         writeln!(out, "description: {}", recipe.spec.description)?;
     }
-    writeln!(out, "source:      {}@{}", recipe.source, recipe.short_revision())?;
+    writeln!(
+        out,
+        "source:      {}@{}",
+        recipe.source,
+        recipe.short_revision()
+    )?;
     if let Some(ref from) = recipe.spec.from {
         writeln!(out, "from:        checkpoint {}", from)?;
     }
@@ -473,7 +504,12 @@ pub(crate) fn list(refresh: bool) -> Result<()> {
         eprintln!("No recipes published yet.");
         return Ok(());
     }
-    let width = entries.iter().map(|e| e.name.len()).max().unwrap_or(4).max(4);
+    let width = entries
+        .iter()
+        .map(|e| e.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
     println!("{:<width$}  DESCRIPTION", "NAME", width = width);
     for e in &entries {
         println!("{:<width$}  {}", e.name, e.description, width = width);
@@ -586,7 +622,8 @@ pub(crate) fn build(name: &str, recipe: &Recipe, vm: &VmArgs) -> Result<()> {
         };
         eprintln!("shuru: step {}/{}: {}", i + 1, total, step_name);
         let command = step_command(recipe, i, script)?;
-        let code = checkpoint::create_with_config(target.clone(), &args, &cfg, from.as_deref(), command)?;
+        let code =
+            checkpoint::create_with_config(target.clone(), &args, &cfg, from.as_deref(), command)?;
         if code != 0 {
             let _ = checkpoint::delete(&target);
             if let Some(kept) = intermediates.last() {

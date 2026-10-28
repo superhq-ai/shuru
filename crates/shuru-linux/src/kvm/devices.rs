@@ -4,7 +4,7 @@ use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kvm_ioctls::{IoEventAddress, VmFd};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::layout;
@@ -305,6 +305,10 @@ const VIRTIO_STATUS_FEATURES_OK: u32 = 8;
 const VIRTIO_STATUS_DRIVER_OK: u32 = 4;
 const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
 
+/// Upper bound for every device's queue size, so chain walks can track
+/// visited descriptors in a fixed array.
+const MAX_QUEUE_SIZE: u16 = 256;
+
 #[derive(Clone)]
 pub struct VirtioQueueState {
     pub max_size: u16,
@@ -318,6 +322,7 @@ pub struct VirtioQueueState {
 
 impl VirtioQueueState {
     fn new(max_size: u16) -> Self {
+        assert!(max_size <= MAX_QUEUE_SIZE);
         VirtioQueueState {
             max_size,
             size: 0,
@@ -326,6 +331,56 @@ impl VirtioQueueState {
             avail_addr: 0,
             used_addr: 0,
             last_avail_idx: 0,
+        }
+    }
+
+    /// The avail index to process up to, or None when the queue is not set
+    /// up in a way the device can use: size outside 1..=max_size, rings
+    /// outside guest memory, or an avail index more than one ring ahead.
+    pub fn pending(&self, mem: &GuestMemoryMmap) -> Option<u16> {
+        if !self.ready || self.size == 0 || self.size > self.max_size {
+            return None;
+        }
+        let size = self.size as usize;
+        if !mem.check_range(GuestAddress(self.desc_addr), size * 16)
+            || !mem.check_range(GuestAddress(self.avail_addr), 6 + size * 2)
+            || !mem.check_range(GuestAddress(self.used_addr), 6 + size * 8)
+        {
+            return None;
+        }
+        let current = avail_idx(mem, self.avail_addr);
+        if current.wrapping_sub(self.last_avail_idx) > self.size {
+            return None;
+        }
+        Some(current)
+    }
+
+    /// The descriptors of the chain at `head`, or None if it leaves the
+    /// table, loops, or carries a flag outside `flags`. Only valid after
+    /// `pending` accepted the queue.
+    pub(super) fn chain(
+        &self,
+        mem: &GuestMemoryMmap,
+        head: u16,
+        flags: u16,
+    ) -> Option<Vec<VringDesc>> {
+        let mut chain = Vec::new();
+        let mut seen = [false; MAX_QUEUE_SIZE as usize];
+        let mut next = head;
+        loop {
+            if next >= self.size || seen[next as usize] {
+                return None;
+            }
+            seen[next as usize] = true;
+            let desc = read_desc(mem, self.desc_addr, next);
+            if desc.flags & !flags != 0 {
+                return None;
+            }
+            chain.push(desc);
+            if desc.flags & VRING_DESC_F_NEXT == 0 {
+                return Some(chain);
+            }
+            next = desc.next;
         }
     }
 
@@ -716,7 +771,7 @@ impl MmioHandler for VirtioMmioDevice {
 // ===========================================================================
 
 pub(super) const VRING_DESC_F_NEXT: u16 = 1;
-const VRING_DESC_F_WRITE: u16 = 2;
+pub(super) const VRING_DESC_F_WRITE: u16 = 2;
 
 #[derive(Clone, Copy)]
 pub(super) struct VringDesc {
@@ -777,16 +832,16 @@ pub fn write_used(
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 
-const VIRTIO_BLK_T_IN: u32 = 0;
-const VIRTIO_BLK_T_OUT: u32 = 1;
-const VIRTIO_BLK_S_OK: u8 = 0;
-const VIRTIO_BLK_S_IOERR: u8 = 1;
+#[path = "block_ranges.rs"]
+mod block_ranges;
+use block_ranges::*;
 pub(super) const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
 pub struct BlockBackend {
     disk: File,
     capacity: u64,
     read_only: bool,
+    negotiated: u64,
     buf: Vec<u8>,
 }
 
@@ -798,8 +853,110 @@ impl BlockBackend {
             disk,
             capacity,
             read_only,
+            negotiated: 0,
             buf: vec![0u8; 65536],
         })
+    }
+    fn request(&mut self, mem: &GuestMemoryMmap, chain: &[VringDesc]) -> Result<u32, u8> {
+        let fail = VIRTIO_BLK_S_IOERR;
+        if chain.len() < 2 {
+            return Err(fail);
+        }
+        let header = &chain[0];
+        if header.len != 16 || header.flags & VRING_DESC_F_WRITE != 0 {
+            return Err(fail);
+        }
+        let mut bytes = [0; 16];
+        mem.read_slice(&mut bytes, GuestAddress(header.addr))
+            .map_err(|_| fail)?;
+        let kind = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        let sector = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+        let data = &chain[1..chain.len() - 1];
+        let mut total = 0usize;
+        for desc in data {
+            if (desc.flags & VRING_DESC_F_WRITE != 0) != (kind == VIRTIO_BLK_T_IN) {
+                return Err(fail);
+            }
+            if desc.len > 1024 * 1024
+                || !mem.check_range(GuestAddress(desc.addr), desc.len as usize)
+            {
+                return Err(fail);
+            }
+            total = total.checked_add(desc.len as usize).ok_or(fail)?;
+        }
+        match kind {
+            VIRTIO_BLK_T_DISCARD | VIRTIO_BLK_T_WRITE_ZEROES => {
+                if self.read_only
+                    || total == 0
+                    || total > MAX_RANGES * 16
+                    || total % 16 != 0
+                    || sector != 0
+                {
+                    return Err(fail);
+                }
+                let feature = if kind == VIRTIO_BLK_T_DISCARD { 13 } else { 14 };
+                if self.negotiated & (1 << feature) == 0 {
+                    return Err(VIRTIO_BLK_S_UNSUPP);
+                }
+                let mut payload = [0u8; MAX_RANGES * 16];
+                let mut at = 0;
+                for desc in data {
+                    let end = at + desc.len as usize;
+                    mem.read_slice(&mut payload[at..end], GuestAddress(desc.addr))
+                        .map_err(|_| fail)?;
+                    at = end;
+                }
+                let ranges = decode_ranges(&payload[..total], self.capacity, kind)?;
+                for (offset, len, unmap) in ranges {
+                    if len == 0 {
+                        continue;
+                    }
+                    let mode = if kind == VIRTIO_BLK_T_DISCARD || unmap {
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE
+                    } else {
+                        libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE
+                    };
+                    if unsafe { libc::fallocate(self.disk.as_raw_fd(), mode, offset, len) } < 0 {
+                        return Err(fail);
+                    }
+                }
+                Ok(0)
+            }
+            VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT => {
+                if kind == VIRTIO_BLK_T_OUT && self.read_only {
+                    return Err(fail);
+                }
+                if total % 512 != 0
+                    || sector > self.capacity
+                    || total as u64 / 512 > self.capacity - sector
+                {
+                    return Err(fail);
+                }
+                self.disk
+                    .seek(SeekFrom::Start(sector.checked_mul(512).ok_or(fail)?))
+                    .map_err(|_| fail)?;
+                let mut written = 0;
+                for desc in data {
+                    let mut at = 0usize;
+                    while at < desc.len as usize {
+                        let n = self.buf.len().min(desc.len as usize - at);
+                        let buf = &mut self.buf[..n];
+                        let addr = GuestAddress(desc.addr.checked_add(at as u64).ok_or(fail)?);
+                        if kind == VIRTIO_BLK_T_IN {
+                            self.disk.read_exact(buf).map_err(|_| fail)?;
+                            mem.write_slice(buf, addr).map_err(|_| fail)?;
+                            written += n as u32;
+                        } else {
+                            mem.read_slice(buf, addr).map_err(|_| fail)?;
+                            self.disk.write_all(buf).map_err(|_| fail)?;
+                        }
+                        at += n;
+                    }
+                }
+                Ok(written)
+            }
+            _ => Err(VIRTIO_BLK_S_UNSUPP),
+        }
     }
 }
 
@@ -809,9 +966,11 @@ impl VirtioBackend for BlockBackend {
     }
 
     fn device_features(&self) -> u64 {
-        let mut f = VIRTIO_F_VERSION_1;
+        let mut f = VIRTIO_F_VERSION_1 | (1 << 1) | (1 << 2);
         if self.read_only {
             f |= 1 << 5;
+        } else {
+            f |= (1 << 13) | (1 << 14);
         }
         f
     }
@@ -827,11 +986,21 @@ impl VirtioBackend for BlockBackend {
         match offset {
             0 => self.capacity as u32,
             4 => (self.capacity >> 32) as u32,
+            8 => 1024 * 1024,
+            12 => 254,
+            36 | 48 if !self.read_only => MAX_RANGE_SECTORS,
+            40 | 52 if !self.read_only => MAX_RANGES as u32,
+            44 if !self.read_only => 8,
+            56 if !self.read_only => 1,
             _ => 0,
         }
     }
 
     fn config_write(&mut self, _: u64, _: u32) {}
+
+    fn features_ok(&mut self, features: u64) {
+        self.negotiated = features;
+    }
 
     fn activate(&mut self, _: &[VirtioQueueState], _: &GuestMemoryMmap, _: Arc<Interrupt>) {}
 
@@ -842,78 +1011,37 @@ impl VirtioBackend for BlockBackend {
         mem: &GuestMemoryMmap,
     ) -> bool {
         let q = match queues.get_mut(0) {
-            Some(q) if q.ready => q,
-            _ => return false,
+            Some(q) => q,
+            None => return false,
         };
-
-        let current_avail = avail_idx(mem, q.avail_addr);
+        let current_avail = match q.pending(mem) {
+            Some(idx) => idx,
+            None => return false,
+        };
         let used = q.last_avail_idx != current_avail;
-
         while q.last_avail_idx != current_avail {
             let head = avail_ring_entry(mem, q.avail_addr, q.size, q.last_avail_idx);
-
-            let header_desc = read_desc(mem, q.desc_addr, head);
-            let req_type = mem
-                .read_obj::<u32>(GuestAddress(header_desc.addr))
-                .unwrap_or(u32::MAX);
-            let sector = mem
-                .read_obj::<u64>(GuestAddress(header_desc.addr + 8))
-                .unwrap_or(0);
-
-            // Walk the descriptor chain inline — no Vec allocation.
-            // Chain: header → data desc(s) → status (last, no NEXT flag).
-            let mut disk_offset = sector * 512;
-            let mut total_data_len: u32 = 0;
-            let mut status = VIRTIO_BLK_S_OK;
-            let mut status_addr: Option<u64> = None;
-            let mut next = header_desc.next;
-            let mut has_next = header_desc.flags & VRING_DESC_F_NEXT != 0;
-
-            while has_next {
-                let desc = read_desc(mem, q.desc_addr, next);
-                let is_last = desc.flags & VRING_DESC_F_NEXT == 0;
-
-                if is_last {
-                    status_addr = Some(desc.addr);
-                } else if status == VIRTIO_BLK_S_OK {
-                    let len = desc.len as usize;
-                    if self.buf.len() < len {
-                        self.buf.resize(len, 0);
+            let chain = q
+                .chain(mem, head, VRING_DESC_F_NEXT | VRING_DESC_F_WRITE)
+                .unwrap_or_default();
+            let status_desc = chain.last().filter(|d| {
+                chain.len() >= 2
+                    && d.flags == VRING_DESC_F_WRITE
+                    && d.len >= 1
+                    && mem.check_range(GuestAddress(d.addr), 1)
+            });
+            let mut used_len = 0;
+            if let Some(desc) = status_desc {
+                let result = self.request(mem, &chain);
+                let status = match result {
+                    Ok(n) => {
+                        used_len = n;
+                        VIRTIO_BLK_S_OK
                     }
-                    let buf = &mut self.buf[..len];
-
-                    match req_type {
-                        VIRTIO_BLK_T_IN => {
-                            if self.disk.seek(SeekFrom::Start(disk_offset)).is_err()
-                                || self.disk.read_exact(buf).is_err()
-                            {
-                                status = VIRTIO_BLK_S_IOERR;
-                            } else {
-                                let _ = mem.write_slice(buf, GuestAddress(desc.addr));
-                            }
-                        }
-                        VIRTIO_BLK_T_OUT if !self.read_only => {
-                            if mem.read_slice(buf, GuestAddress(desc.addr)).is_err()
-                                || self.disk.seek(SeekFrom::Start(disk_offset)).is_err()
-                                || self.disk.write_all(buf).is_err()
-                            {
-                                status = VIRTIO_BLK_S_IOERR;
-                            }
-                        }
-                        _ => {
-                            status = VIRTIO_BLK_S_IOERR;
-                        }
-                    }
-                    disk_offset += len as u64;
-                    total_data_len += desc.len;
-                }
-
-                next = desc.next;
-                has_next = !is_last;
-            }
-
-            if let Some(addr) = status_addr {
-                let _ = mem.write_obj(status, GuestAddress(addr));
+                    Err(status) => status,
+                };
+                let _ = mem.write_obj(status, GuestAddress(desc.addr));
+                used_len += 1;
             }
             write_used(
                 mem,
@@ -921,14 +1049,16 @@ impl VirtioBackend for BlockBackend {
                 q.size,
                 q.last_avail_idx,
                 head as u32,
-                total_data_len + 1,
+                used_len,
             );
             q.last_avail_idx = q.last_avail_idx.wrapping_add(1);
         }
         used
     }
 
-    fn reset(&mut self) {}
+    fn reset(&mut self) {
+        self.negotiated = 0;
+    }
 }
 
 // ===========================================================================
@@ -1144,3 +1274,129 @@ fn net_rx_loop(
         }
     }
 }
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+    use std::os::unix::fs::FileExt;
+
+    fn backend() -> BlockBackend {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "shuru-block-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(16384).unwrap();
+        file.write_all_at(&vec![7; 16384], 0).unwrap();
+        let mut disk = BlockBackend::new(path.to_str().unwrap(), false).unwrap();
+        disk.features_ok(disk.device_features());
+        std::fs::remove_file(path).unwrap();
+        disk
+    }
+
+    fn request(mem: &GuestMemoryMmap, kind: u32, ranges: &[(u64, u32, u32)]) -> Vec<VringDesc> {
+        mem.write_obj(kind.to_le(), GuestAddress(0x1000)).unwrap();
+        mem.write_obj(0u64, GuestAddress(0x1008)).unwrap();
+        for (i, (sector, count, flags)) in ranges.iter().enumerate() {
+            let at = 0x2000 + i as u64 * 16;
+            mem.write_obj(sector.to_le(), GuestAddress(at)).unwrap();
+            mem.write_obj(count.to_le(), GuestAddress(at + 8)).unwrap();
+            mem.write_obj(flags.to_le(), GuestAddress(at + 12)).unwrap();
+        }
+        vec![
+            VringDesc {
+                addr: 0x1000,
+                len: 16,
+                flags: 1,
+                next: 1,
+            },
+            VringDesc {
+                addr: 0x2000,
+                len: ranges.len() as u32 * 16,
+                flags: 1,
+                next: 2,
+            },
+            VringDesc {
+                addr: 0x3000,
+                len: 1,
+                flags: 2,
+                next: 0,
+            },
+        ]
+    }
+
+    #[test]
+    fn invalid_later_range_leaves_disk_untouched() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 65536)]).unwrap();
+        let mut disk = backend();
+        let chain = request(&mem, VIRTIO_BLK_T_DISCARD, &[(0, 8, 0), (31, 2, 0)]);
+        assert_eq!(disk.request(&mem, &chain), Err(VIRTIO_BLK_S_IOERR));
+        let mut bytes = [0; 16384];
+        disk.disk.read_exact_at(&mut bytes, 0).unwrap();
+        assert!(bytes.iter().all(|b| *b == 7));
+    }
+
+    #[test]
+    fn discard_and_both_zero_modes_preserve_size_and_neighbors() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 65536)]).unwrap();
+        for (kind, flags) in [
+            (VIRTIO_BLK_T_DISCARD, 0),
+            (VIRTIO_BLK_T_WRITE_ZEROES, 0),
+            (VIRTIO_BLK_T_WRITE_ZEROES, 1),
+        ] {
+            let mut disk = backend();
+            let chain = request(&mem, kind, &[(8, 8, flags)]);
+            assert_eq!(disk.request(&mem, &chain), Ok(0));
+            let mut bytes = [0; 16384];
+            disk.disk.read_exact_at(&mut bytes, 0).unwrap();
+            assert!(bytes[..4096].iter().all(|b| *b == 7));
+            assert!(bytes[4096..8192].iter().all(|b| *b == 0));
+            assert!(bytes[8192..].iter().all(|b| *b == 7));
+            assert_eq!(disk.disk.metadata().unwrap().len(), 16384);
+        }
+    }
+
+    #[test]
+    fn descriptor_cycles_and_bad_heads_finish_without_io() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 65536)]).unwrap();
+        let mut disk = backend();
+        let mut q = VirtioQueueState::new(8);
+        q.size = 8;
+        q.ready = true;
+        q.desc_addr = 0x1000;
+        q.avail_addr = 0x2000;
+        q.used_addr = 0x3000;
+        mem.write_obj(1u16, GuestAddress(q.desc_addr + 12)).unwrap();
+        mem.write_obj(0u16, GuestAddress(q.desc_addr + 14)).unwrap();
+        mem.write_obj(2u16, GuestAddress(q.avail_addr + 2)).unwrap();
+        mem.write_obj(0u16, GuestAddress(q.avail_addr + 4)).unwrap();
+        mem.write_obj(100u16, GuestAddress(q.avail_addr + 6))
+            .unwrap();
+        assert!(disk.process_queue(0, std::slice::from_mut(&mut q), &mem));
+        assert_eq!(q.last_avail_idx, 2);
+        assert_eq!(
+            mem.read_obj::<u16>(GuestAddress(q.used_addr + 2)).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn readonly_and_bad_data_direction_are_rejected() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 65536)]).unwrap();
+        let mut disk = backend();
+        let mut chain = request(&mem, VIRTIO_BLK_T_DISCARD, &[(0, 8, 0)]);
+        chain[1].flags |= VRING_DESC_F_WRITE;
+        assert_eq!(disk.request(&mem, &chain), Err(VIRTIO_BLK_S_IOERR));
+        chain[1].flags &= !VRING_DESC_F_WRITE;
+        disk.read_only = true;
+        assert_eq!(disk.request(&mem, &chain), Err(VIRTIO_BLK_S_IOERR));
+        assert_eq!(disk.device_features() & ((1 << 13) | (1 << 14)), 0);
+    }
+}
+

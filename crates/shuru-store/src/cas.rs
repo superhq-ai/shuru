@@ -40,15 +40,29 @@ impl ChunkStore for LocalChunkStore {
         let hash = blake3::hash(data);
         let hex = hash.to_hex().to_string();
         let path = self.chunk_path(&hex);
-        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut f) => {
-                use std::io::Write;
-                f.write_all(data)
-                    .with_context(|| format!("failed to write chunk {}", hex))?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e).with_context(|| format!("failed to create chunk {}", hex)),
+        if path.exists() {
+            return Ok(hex);
         }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let partial = self
+            .chunks_dir
+            .join(format!(".partial-{}-{seq}", std::process::id()));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)?;
+        let result = (|| -> Result<()> {
+            file.write_all(data)?;
+            file.sync_all()?;
+            fs::rename(&partial, &path)?;
+            fs::File::open(&self.chunks_dir)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&partial);
+        }
+        result?;
         Ok(hex)
     }
 
@@ -109,8 +123,8 @@ impl ChunkIndex {
         if let Some(parent) = Path::new(path).parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut f = fs::File::create(path)
-            .with_context(|| format!("failed to create index: {}", path))?;
+        let mut f =
+            fs::File::create(path).with_context(|| format!("failed to create index: {}", path))?;
         // Header: disk_size, num_chunks, parent_path, fallback_path
         f.write_all(&self.disk_size.to_le_bytes())?;
         f.write_all(&(self.hashes.len() as u64).to_le_bytes())?;
@@ -131,8 +145,8 @@ impl ChunkIndex {
 
     /// Load index from a file.
     pub fn load(path: &str) -> Result<Self> {
-        let mut f = fs::File::open(path)
-            .with_context(|| format!("failed to open index: {}", path))?;
+        let mut f =
+            fs::File::open(path).with_context(|| format!("failed to open index: {}", path))?;
         let mut buf8 = [0u8; 8];
         f.read_exact(&mut buf8)?;
         let disk_size = u64::from_le_bytes(buf8);
@@ -143,7 +157,10 @@ impl ChunkIndex {
         anyhow::ensure!(
             num_chunks == expected_chunks,
             "index {}: chunk count {} does not match disk_size {} (expected {})",
-            path, num_chunks, disk_size, expected_chunks,
+            path,
+            num_chunks,
+            disk_size,
+            expected_chunks,
         );
 
         // Parent path
@@ -177,7 +194,12 @@ impl ChunkIndex {
             hashes.push(String::from_utf8(hash_bytes)?);
         }
 
-        Ok(ChunkIndex { hashes, disk_size, parent_path, fallback_path })
+        Ok(ChunkIndex {
+            hashes,
+            disk_size,
+            parent_path,
+            fallback_path,
+        })
     }
 
     /// Validate that the given backing store size does not exceed disk_size.
@@ -186,7 +208,9 @@ impl ChunkIndex {
         anyhow::ensure!(
             backend_size <= self.disk_size,
             "{} size ({}) exceeds index disk_size ({})",
-            label, backend_size, self.disk_size,
+            label,
+            backend_size,
+            self.disk_size,
         );
         Ok(())
     }
@@ -201,8 +225,6 @@ pub struct CasBackend {
     parents: RwLock<Vec<ChunkIndex>>,
     /// Optional flat file for lazy ingestion at the bottom of the chain.
     fallback: Option<crate::backend::FlatFileBackend>,
-    /// The index path we booted from (becomes the parent when saving a checkpoint).
-    pub source_index_path: Option<String>,
 }
 
 impl CasBackend {
@@ -215,11 +237,14 @@ impl CasBackend {
             dirty: RwLock::new(HashMap::new()),
             parents: RwLock::new(parents),
             fallback: None,
-            source_index_path: None,
         }
     }
 
-    pub fn with_fallback(store: Box<dyn ChunkStore>, index: ChunkIndex, fallback: crate::backend::FlatFileBackend) -> Self {
+    pub fn with_fallback(
+        store: Box<dyn ChunkStore>,
+        index: ChunkIndex,
+        fallback: crate::backend::FlatFileBackend,
+    ) -> Self {
         let parents = Self::load_parent_chain(&index);
         CasBackend {
             store,
@@ -227,7 +252,6 @@ impl CasBackend {
             dirty: RwLock::new(HashMap::new()),
             parents: RwLock::new(parents),
             fallback: Some(fallback),
-            source_index_path: None,
         }
     }
 
@@ -327,29 +351,50 @@ impl CasBackend {
         let mut dirty = self.dirty.write().unwrap();
         let mut index = self.index.write().unwrap();
 
-        for (chunk_idx, data) in dirty.drain() {
-            let hash = self.store.put(&data).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-            })?;
+        for (&chunk_idx, data) in dirty.iter() {
+            let hash = self
+                .store
+                .put(data)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
             index.set_hash(chunk_idx, hash);
         }
+        dirty.clear();
 
         Ok(())
     }
 
-    /// Save the current index as a checkpoint. Only writes the delta — ZERO entries
-    /// resolve through the parent chain at read time. Instant regardless of disk size.
+    /// Save a standalone index so replacing a checkpoint cannot create a parent cycle.
+    /// The caller holds the guest seal throughout this operation.
     pub fn save_index(&self, path: &str) -> Result<()> {
         self.flush().map_err(|e| anyhow::anyhow!(e))?;
-        let mut index = self.index.write().unwrap();
-        index.parent_path = self.source_index_path.clone();
-        // Propagate fallback path so the chain can always resolve to the flat file
-        if index.fallback_path.is_none() {
-            if let Some(ref fb) = self.fallback {
-                index.fallback_path = Some(fb.path().to_string());
+        let index = self.index.read().unwrap();
+        let parents = self.parents.read().unwrap();
+        let mut saved = ChunkIndex::new(index.disk_size);
+        for (i, hash) in index.hashes.iter().enumerate() {
+            saved.hashes[i] = if hash != ZERO_CHUNK_HASH {
+                hash.clone()
+            } else {
+                parents
+                    .iter()
+                    .filter_map(|p| p.get_hash(i))
+                    .find(|h| *h != ZERO_CHUNK_HASH)
+                    .unwrap_or(ZERO_CHUNK_HASH)
+                    .to_string()
+            };
+        }
+        drop(parents);
+        drop(index);
+        if let Some(fallback) = &self.fallback {
+            for (i, hash) in saved.hashes.iter_mut().enumerate() {
+                if *hash == ZERO_CHUNK_HASH && (i as u64) * (CHUNK_SIZE as u64) < fallback.size() {
+                    let data = self.read_chunk(i)?;
+                    if data.iter().any(|b| *b != 0) {
+                        *hash = self.store.put(&data)?;
+                    }
+                }
             }
         }
-        index.save(path)
+        saved.save(path)
     }
 
     fn read_chunk(&self, chunk_idx: usize) -> std::io::Result<Vec<u8>> {
@@ -361,7 +406,10 @@ impl CasBackend {
         // 2. Check current index
         let hash = {
             let index = self.index.read().unwrap();
-            index.get_hash(chunk_idx).unwrap_or(ZERO_CHUNK_HASH).to_string()
+            index
+                .get_hash(chunk_idx)
+                .unwrap_or(ZERO_CHUNK_HASH)
+                .to_string()
         };
         if hash != ZERO_CHUNK_HASH {
             return self.fetch_chunk(&hash);
@@ -381,16 +429,22 @@ impl CasBackend {
             if offset < fb.size() {
                 let read_len = CHUNK_SIZE.min((fb.size() - offset) as usize);
                 let mut buf = vec![0u8; read_len];
-                fb.read(offset, &mut buf)?;
+                if fb.read(offset, &mut buf)? != read_len {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "short read from CAS base image",
+                    ));
+                }
 
                 if buf.iter().all(|&b| b == 0) {
                     return Ok(vec![0u8; CHUNK_SIZE]);
                 }
 
                 // Cache in chunk store for future reads
-                let new_hash = self.store.put(&buf).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                })?;
+                let new_hash = self
+                    .store
+                    .put(&buf)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
                 self.index.write().unwrap().set_hash(chunk_idx, new_hash);
                 return Ok(buf);
             }
@@ -407,7 +461,10 @@ impl CasBackend {
                 tracing::warn!("chunk {} not found in store, returning zeros", hash);
                 Ok(vec![0u8; CHUNK_SIZE])
             }
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+            Err(e) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            )),
         }
     }
 }
@@ -519,13 +576,69 @@ mod tests {
         let index = ChunkIndex::new(4 * 1024 * 1024); // 4MB virtual disk
 
         // flat file == virtual disk: ok
-        assert!(index.check_size_against_backend(4 * 1024 * 1024, "test").is_ok());
+        assert!(index
+            .check_size_against_backend(4 * 1024 * 1024, "test")
+            .is_ok());
         // flat file < virtual disk: ok (sparse expansion — the normal case)
-        assert!(index.check_size_against_backend(1024 * 1024, "test").is_ok());
+        assert!(index
+            .check_size_against_backend(1024 * 1024, "test")
+            .is_ok());
         // flat file > virtual disk: corrupt — must fail
         match index.check_size_against_backend(8 * 1024 * 1024, "test") {
             Err(e) => assert!(e.to_string().contains("exceeds")),
             Ok(_) => panic!("expected size check to fail when flat file exceeds virtual disk"),
         }
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn saved_checkpoint_does_not_depend_on_mutable_base_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = dir.path().join("base.ext4");
+        fs::write(&flat, b"unread base data").unwrap();
+        let store = || Box::new(LocalChunkStore::open(dir.path().to_str().unwrap()).unwrap());
+        let backend = CasBackend::with_fallback(
+            store(),
+            ChunkIndex::new(CHUNK_SIZE as u64),
+            crate::backend::FlatFileBackend::open(flat.to_str().unwrap()).unwrap(),
+        );
+        let path = dir.path().join("saved.idx");
+        backend.save_index(path.to_str().unwrap()).unwrap();
+        fs::write(&flat, b"replaced image!").unwrap();
+        let saved = ChunkIndex::load(path.to_str().unwrap()).unwrap();
+        assert!(saved.fallback_path.is_none());
+        let restored = CasBackend::new(store(), saved);
+        let mut data = [0; 16];
+        restored.read(0, &mut data).unwrap();
+        assert_eq!(&data, b"unread base data");
+    }
+
+    #[test]
+    fn replacing_a_parent_keeps_inherited_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.idx");
+        let path = path.to_str().unwrap();
+        let store = || Box::new(LocalChunkStore::open(dir.path().to_str().unwrap()).unwrap());
+        let base = CasBackend::new(store(), ChunkIndex::new(2 * CHUNK_SIZE as u64));
+        base.write(0, b"base").unwrap();
+        base.save_index(path).unwrap();
+        let mut delta = ChunkIndex::new(2 * CHUNK_SIZE as u64);
+        delta.parent_path = Some(path.to_string());
+        let backend = CasBackend::new(store(), delta);
+        backend.write(CHUNK_SIZE as u64, b"child").unwrap();
+        backend.save_index(path).unwrap();
+        let saved = ChunkIndex::load(path).unwrap();
+        assert!(saved.parent_path.is_none());
+        let restored = CasBackend::new(store(), saved);
+        let mut head = [0; 4];
+        restored.read(0, &mut head).unwrap();
+        assert_eq!(&head, b"base");
+        let mut tail = [0; 5];
+        restored.read(CHUNK_SIZE as u64, &mut tail).unwrap();
+        assert_eq!(&tail, b"child");
     }
 }

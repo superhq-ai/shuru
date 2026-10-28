@@ -55,6 +55,24 @@ describe.if(canRun)("sandbox lifecycle", () => {
 		expect(new TextDecoder().decode(read)).toBe(content);
 	}, 30_000);
 
+	test("files larger than one frame roundtrip", async () => {
+		const content = new Uint8Array(3 * 1024 * 1024 + 7);
+		for (let i = 0; i < content.length; i++) content[i] = (i * 31) & 0xff;
+		await sb.writeFile("/tmp/sdk-big.bin", content);
+		const size = await sb.exec("stat -c %s /tmp/sdk-big.bin");
+		expect(size.stdout.trim()).toBe(String(content.length));
+		const read = await sb.readFile("/tmp/sdk-big.bin");
+		expect(Buffer.from(read).equals(Buffer.from(content))).toBe(true);
+	}, 30_000);
+
+	test("failed write reports the guest error", async () => {
+		await expect(
+			sb.writeFile("/proc/nope/file", new Uint8Array(2 * 1024 * 1024)),
+		).rejects.toThrow("No such file or directory");
+		const result = await sb.exec("echo alive");
+		expect(result.stdout.trim()).toBe("alive");
+	}, 30_000);
+
 	test("multiple sequential execs", async () => {
 		await sb.exec("echo a > /tmp/seq.txt");
 		await sb.exec("echo b >> /tmp/seq.txt");
@@ -63,10 +81,10 @@ describe.if(canRun)("sandbox lifecycle", () => {
 	}, 30_000);
 
 	test("checkpoint creates disk snapshot", async () => {
-		const cpPath = resolve(
-			process.env.HOME ?? "/tmp",
-			".local/share/shuru/checkpoints/sdk-integration-test.ext4",
-		);
+		const dataDir =
+			process.env.SHURU_DATA_DIR ??
+			resolve(process.env.HOME ?? "/tmp", ".local/share/shuru");
+		const cpPath = resolve(dataDir, "checkpoints/sdk-integration-test.ext4");
 
 		try {
 			unlinkSync(cpPath);

@@ -32,7 +32,7 @@ impl NbdHandle {
         format!("nbd+unix:///export?socket={}", self.socket_path)
     }
 
-    /// Save the current disk state as a checkpoint index. Only works with CAS backend.
+    /// Write a CAS index to the private staging path supplied by Sandbox::save_disk.
     pub fn save_checkpoint(&self, index_path: &str) -> Result<()> {
         let backend = self
             .cas_backend
@@ -136,22 +136,24 @@ pub fn start_cas_nbd_server(
 ) -> Result<NbdHandle> {
     let store: Box<dyn ChunkStore> = Box::new(LocalChunkStore::open(cas_dir)?);
 
-    let (index, fallback, source_idx) = if Path::new(index_path).exists() {
+    let (index, fallback) = if Path::new(index_path).exists() {
         info!("loading CAS index from {}", index_path);
         let idx = ChunkIndex::load(index_path)?;
         // If the index has a fallback_path, open it and validate disk_size
         let fb = idx
             .fallback_path
             .as_ref()
-            .and_then(|p| FlatFileBackend::open(p).ok());
+            .map(|p| FlatFileBackend::open(p).with_context(|| format!("open CAS base image {}", p)))
+            .transpose()?;
         if let Some(ref fb) = fb {
             anyhow::ensure!(
                 fb.size() <= idx.disk_size(),
                 "fallback file size ({}) exceeds index disk_size ({}); index may be corrupt",
-                fb.size(), idx.disk_size(),
+                fb.size(),
+                idx.disk_size(),
             );
         }
-        (idx, fb, Some(index_path.to_string()))
+        (idx, fb)
     } else {
         // No index yet — create empty index with fallback to flat file for lazy ingestion
         let fb = FlatFileBackend::open(rootfs_path).with_context(|| {
@@ -159,7 +161,7 @@ pub fn start_cas_nbd_server(
         })?;
         let disk_size = fb.size();
         info!("CAS: lazy mode, {} MB rootfs", disk_size / (1024 * 1024));
-        (ChunkIndex::new(disk_size), Some(fb), None)
+        (ChunkIndex::new(disk_size), Some(fb))
     };
 
     let mut backend = if let Some(fb) = fallback {
@@ -167,7 +169,10 @@ pub fn start_cas_nbd_server(
     } else {
         CasBackend::new(store, index)
     };
-    backend.source_index_path = source_idx;
+    anyhow::ensure!(
+        disk_size >= backend.size(),
+        "disk size is smaller than the source checkpoint"
+    );
     if disk_size > 0 {
         backend.set_disk_size(disk_size);
     }

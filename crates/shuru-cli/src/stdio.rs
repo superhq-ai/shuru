@@ -6,7 +6,7 @@ use anyhow::Result;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-use shuru_proto::{frame, WatchEvent};
+use shuru_proto::{frame, watch_kind, WatchEvent};
 use shuru_vm::Sandbox;
 
 use crate::vm::{self, PreparedVm};
@@ -21,6 +21,7 @@ mod method {
     pub const WATCH: &str = "watch";
     pub const READ_FILE: &str = "read_file";
     pub const WRITE_FILE: &str = "write_file";
+    pub const TRIM: &str = "trim";
     pub const CHECKPOINT: &str = "checkpoint";
     pub const MKDIR: &str = "mkdir";
     pub const READ_DIR: &str = "read_dir";
@@ -649,10 +650,13 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                     let mut reader = stream;
                     while let Ok(Some((frame::WATCH_EVENT, data))) = frame::read_frame(&mut reader)
                     {
-                        if let Some(evt) = WatchEvent::decode(&data) {
+                        let Some(evt) = WatchEvent::decode(&data) else {
+                            continue;
+                        };
+                        if let Some(name) = watch_kind::name(evt.kind) {
                             let _ = tx.send(Event::FileChange {
                                 path: evt.path,
-                                event: evt.kind.to_string(),
+                                event: name.to_string(),
                             });
                         }
                     }
@@ -693,6 +697,10 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 handle_write_file(&sandbox, req.id, &params.path, &params.content, &out)?;
             }
 
+            method::TRIM => match sandbox.trim() {
+                Ok(response) => send_result_shared(&out, req.id, response)?,
+                Err(e) => send_error_shared(&out, req.id, SERVER_ERROR, e.to_string())?,
+            },
             method::CHECKPOINT => {
                 let params: CheckpointParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
@@ -706,7 +714,14 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                         continue;
                     }
                 };
-                handle_checkpoint(&sandbox, prepared, req.id, &params.name, &out)?;
+                handle_checkpoint(
+                    &sandbox,
+                    prepared,
+                    nbd_handle.as_ref(),
+                    req.id,
+                    &params.name,
+                    &out,
+                )?;
                 let _ = sandbox.stop();
                 drop(event_tx);
                 let _ = event_thread.join();
@@ -964,28 +979,19 @@ fn handle_write_file(
 fn handle_checkpoint(
     sandbox: &Sandbox,
     prepared: &PreparedVm,
+    nbd: Option<&shuru_store::NbdHandle>,
     id: serde_json::Value,
     name: &str,
     out: &SharedWriter,
 ) -> Result<()> {
-    let mut discard_out = Vec::new();
-    let mut discard_err = Vec::new();
-    if let Err(e) = sandbox.exec(&["sync"], &mut discard_out, &mut discard_err) {
-        return send_error_shared(
-            out,
-            id,
-            SERVER_ERROR,
-            format!("checkpoint sync failed: {}", e),
-        );
-    }
-
     if let Err(msg) = shuru_vm::validate_checkpoint_name(name) {
         return send_error_shared(out, id, SERVER_ERROR, msg);
     }
 
     let data_dir = shuru_vm::default_data_dir();
     let checkpoints_dir = format!("{}/checkpoints", data_dir);
-    let checkpoint_path = format!("{}/{}.ext4", checkpoints_dir, name);
+    let ext = if nbd.is_some() { "idx" } else { "ext4" };
+    let checkpoint_path = format!("{checkpoints_dir}/{name}.{ext}");
 
     if let Err(e) = std::fs::create_dir_all(&checkpoints_dir) {
         return send_error_shared(
@@ -996,7 +1002,13 @@ fn handle_checkpoint(
         );
     }
 
-    if let Err(e) = prepared.work_disk.save_to(&checkpoint_path) {
+    if let Err(e) = sandbox.save_disk(&checkpoint_path, shuru_vm::AfterSave::PowerOff, |path| {
+        if let Some(handle) = nbd {
+            handle.save_checkpoint(path)
+        } else {
+            prepared.work_disk.save_to(path)
+        }
+    }) {
         return send_error_shared(
             out,
             id,

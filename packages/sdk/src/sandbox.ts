@@ -20,6 +20,7 @@ const Method = {
 	READ_FILE: "read_file",
 	WRITE_FILE: "write_file",
 	CHECKPOINT: "checkpoint",
+	TRIM: "trim",
 	WATCH: "watch",
 	MKDIR: "mkdir",
 	READ_DIR: "read_dir",
@@ -177,6 +178,11 @@ export class Sandbox {
 		}
 	}
 
+	async trim(): Promise<{ supported: boolean; bytes: number }> {
+		const resp = await this.proc.send(Method.TRIM, {});
+		return resp.result as { supported: boolean; bytes: number };
+	}
+
 	async checkpoint(name: string): Promise<void> {
 		await this.proc.send(Method.CHECKPOINT, { name });
 		this.stopped = true;
@@ -197,7 +203,12 @@ export function buildArgs(bin: string, opts: StartOptions): string[] {
 	if (opts.from) args.push("--from", opts.from);
 	if (opts.cpus) args.push("--cpus", String(opts.cpus));
 	if (opts.memory) args.push("--memory", String(opts.memory));
-	if (opts.diskSize) args.push("--disk-size", String(opts.diskSize));
+	if (opts.diskSize !== undefined) {
+		if (!Number.isSafeInteger(opts.diskSize) || opts.diskSize < 4096) {
+			throw new Error("disk size must be an integer of at least 4096 MB");
+		}
+		args.push("--disk-size", String(opts.diskSize));
+	}
 	if (opts.allowNet) args.push("--allow-net");
 	if (opts.allowHostWrites) args.push("--allow-host-writes");
 
