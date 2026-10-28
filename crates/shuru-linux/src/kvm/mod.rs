@@ -45,27 +45,38 @@ pub struct KvmVm {
 }
 
 pub struct VmCreateConfig {
+    /// An open /dev/kvm; opened here when absent.
+    pub kvm: Option<std::os::fd::OwnedFd>,
     pub cpu_count: usize,
     pub memory_bytes: u64,
-    pub kernel_path: String,
-    pub initrd_path: Option<String>,
+    pub kernel: File,
+    pub initrd: Option<File>,
     pub command_line: String,
     pub serial_write_fd: Option<i32>,
     pub serial_read_fd: Option<i32>,
-    pub disk_path: Option<String>,
+    pub disk: Option<File>,
     pub disk_read_only: bool,
     pub network_fd: Option<i32>,
     pub network_mac: Option<[u8; 6]>,
     pub has_vsock: bool,
+    pub vsock_connections: usize,
     /// Virtio-fs mounts: (tag, host_path, read_only).
     pub mounts: Vec<(String, String, bool)>,
     pub has_balloon: bool,
 }
 
 impl KvmVm {
-    pub fn create(config: VmCreateConfig) -> Result<Self, VzError> {
-        let kvm =
-            Kvm::new().map_err(|e| VzError::new(format!("failed to open /dev/kvm: {}", e)))?;
+    pub fn create(mut config: VmCreateConfig) -> Result<Self, VzError> {
+        let kvm = match config.kvm.take() {
+            // SAFETY: the descriptor is an open /dev/kvm handed over to us.
+            Some(fd) => unsafe {
+                use std::os::fd::{FromRawFd, IntoRawFd};
+                Kvm::from_raw_fd(fd.into_raw_fd())
+            },
+            None => {
+                Kvm::new().map_err(|e| VzError::new(format!("failed to open /dev/kvm: {}", e)))?
+            }
+        };
         let vm_fd = kvm
             .create_vm()
             .map_err(|e| VzError::new(format!("failed to create VM: {}", e)))?;
@@ -96,21 +107,24 @@ impl KvmVm {
         }
 
         // Load kernel (PE format for aarch64)
-        let mut kernel_file = File::open(&config.kernel_path)
-            .map_err(|e| VzError::new(format!("failed to open kernel: {}", e)))?;
         // kernel_offset must be 2MB-aligned. The PE loader adds text_offset
         // from the image header internally, so pass DRAM_BASE (1 GiB aligned).
-        let kernel_result = PE::load(&mem, Some(GuestAddress(DRAM_BASE)), &mut kernel_file, None)
-            .map_err(|e| VzError::new(format!("failed to load kernel: {}", e)))?;
+        let kernel_result = PE::load(
+            &mem,
+            Some(GuestAddress(DRAM_BASE)),
+            &mut config.kernel,
+            None,
+        )
+        .map_err(|e| VzError::new(format!("failed to load kernel: {}", e)))?;
         let entry_addr = kernel_result.kernel_load.raw_value();
 
         // Load initrd
         let mut initrd_addr: Option<u64> = None;
         let mut initrd_size: u64 = 0;
-        if let Some(ref initrd_path) = config.initrd_path {
+        if let Some(mut initrd) = config.initrd.take() {
             let mut initrd_data = Vec::new();
-            File::open(initrd_path)
-                .and_then(|mut f| f.read_to_end(&mut initrd_data))
+            initrd
+                .read_to_end(&mut initrd_data)
                 .map_err(|e| VzError::new(format!("failed to read initrd: {}", e)))?;
 
             // Place after FDT reservation, page-aligned
@@ -142,15 +156,15 @@ impl KvmVm {
         bus.add(RTC_BASE, RTC_SIZE, Box::new(Mutex::new(Pl031::new())));
 
         // Virtio block
-        if let Some(ref disk_path) = config.disk_path {
-            let blk = BlockBackend::new(disk_path, config.disk_read_only)
+        if let Some(disk) = config.disk.take() {
+            let blk = BlockBackend::new(disk, config.disk_read_only)
                 .map_err(|e| VzError::new(format!("failed to open disk: {}", e)))?;
             add_virtio(&mut bus, &mut virtio_idx, Box::new(blk), &vm_fd, &mem)?;
         }
 
         let mut vsock_control = None;
         if config.has_vsock {
-            let backend = vsock::VsockBackend::new()
+            let backend = vsock::VsockBackend::new(config.vsock_connections)
                 .map_err(|e| VzError::new(format!("failed to create vsock device: {e}")))?;
             vsock_control = Some(backend.control());
             add_virtio(&mut bus, &mut virtio_idx, Box::new(backend), &vm_fd, &mem)?;

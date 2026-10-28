@@ -2,10 +2,10 @@ mod connection;
 mod queue;
 
 use std::collections::VecDeque;
-use std::io;
+use std::io::{self, Read};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,8 +16,9 @@ use vmm_sys_util::eventfd::EventFd;
 use super::devices::{
     Interrupt, VirtioBackend, VirtioQueueState, INTERRUPT_USED, VIRTIO_F_VERSION_1,
 };
+pub use connection::MAX_CONNECTIONS;
 use connection::{
-    readv, sendv, Header, Mux, Payload, RxBuffers, GUEST_CID, HEADER_LEN, MAX_PACKET,
+    readv, sendv, Header, Mux, Opener, Payload, RxBuffers, GUEST_CID, HEADER_LEN, MAX_PACKET,
 };
 use queue::{invalid_queue, Queue};
 
@@ -27,6 +28,9 @@ const IOV_MAX: usize = 1024;
 // Epoll tokens: 0 is the wake eventfd, host ports fit in 32 bits, kicks
 // sit above them.
 const KICK: u64 = 1 << 40;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+// "CONNECT 4294967295\n" with room to spare.
+const MAX_CONNECT_LINE: usize = 32;
 
 /// Splits a descriptor chain into its header bytes and the payload after.
 fn split<'a>(
@@ -342,6 +346,7 @@ pub struct VsockControl {
     kicks: Mutex<Vec<EventFd>>,
     epoll: OwnedFd,
     stopping: AtomicBool,
+    listeners: Mutex<Vec<Arc<UnixListener>>>,
 }
 
 impl VsockControl {
@@ -371,9 +376,8 @@ impl VsockControl {
         }
     }
 
-    pub fn connect(&self, port: u32) -> io::Result<TcpStream> {
-        let (client, device) = UnixStream::pair()?;
-        let (sender, receiver) = mpsc::sync_channel(1);
+    /// Hands `device` to the mux as the host end of a connect to `port`.
+    fn attach(&self, device: UnixStream, port: u32, opener: Opener) -> io::Result<u32> {
         let host_port;
         {
             let mut state = self.state.lock().unwrap();
@@ -384,7 +388,7 @@ impl VsockControl {
                 ));
             }
             let fd = device.as_raw_fd();
-            host_port = state.mux.add(device, port, sender)?;
+            host_port = state.mux.add(device, port, opener)?;
             let events = libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLRDHUP | libc::EPOLLET;
             if let Err(error) = self.register(fd, host_port as u64, events) {
                 state.mux.cancel(host_port);
@@ -392,7 +396,14 @@ impl VsockControl {
             }
         }
         self.notify();
-        match receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(host_port)
+    }
+
+    pub fn connect(&self, port: u32) -> io::Result<TcpStream> {
+        let (client, device) = UnixStream::pair()?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let host_port = self.attach(device, port, Opener::Caller(sender))?;
+        match receiver.recv_timeout(CONNECT_TIMEOUT) {
             Ok(Ok(())) => {
                 // The public backend API uses TcpStream for any connected stream fd.
                 Ok(unsafe { TcpStream::from_raw_fd(client.into_raw_fd()) })
@@ -410,6 +421,63 @@ impl VsockControl {
             }
         }
     }
+
+    /// Accepts host connects on `listener`. A client writes
+    /// `CONNECT <guest port>\n` and reads `OK <host port>\n` once the guest
+    /// accepts; any other outcome closes the socket.
+    pub fn serve(self: &Arc<Self>, listener: UnixListener) -> io::Result<()> {
+        let listener = Arc::new(listener);
+        self.listeners.lock().unwrap().push(listener.clone());
+        let control = self.clone();
+        std::thread::Builder::new()
+            .name("shuru-vsock-listen".into())
+            .spawn(move || control.accept(&listener))?;
+        Ok(())
+    }
+
+    fn accept(&self, listener: &UnixListener) {
+        loop {
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(_) if self.stopping.load(Ordering::Acquire) => return,
+                Err(e) => match e.raw_os_error() {
+                    Some(libc::EINTR | libc::ECONNABORTED | libc::EPROTO) => continue,
+                    // Out of descriptors or memory: wait for connections to close.
+                    Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    _ => return,
+                },
+            };
+            if let Ok(port) = read_connect(&stream) {
+                let _ = self.attach(stream, port, Opener::Listener);
+            }
+        }
+    }
+}
+
+/// Reads `CONNECT <port>\n` without consuming anything after it.
+fn read_connect(stream: &UnixStream) -> io::Result<u32> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "bad vsock connect line");
+    stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
+    let mut line = Vec::new();
+    let mut byte = [0];
+    while line.len() < MAX_CONNECT_LINE {
+        if (&*stream).read(&mut byte)? == 0 {
+            return Err(invalid());
+        }
+        if byte[0] == b'\n' {
+            return std::str::from_utf8(&line)
+                .ok()
+                .and_then(|line| line.strip_prefix("CONNECT "))
+                .filter(|port| port.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|port| port.parse().ok())
+                .ok_or_else(invalid);
+        }
+        line.push(byte[0]);
+    }
+    Err(invalid())
 }
 
 pub struct VsockBackend {
@@ -419,7 +487,7 @@ pub struct VsockBackend {
 }
 
 impl VsockBackend {
-    pub fn new() -> io::Result<Self> {
+    pub fn new(max_connections: usize) -> io::Result<Self> {
         let wake = EventFd::new(libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)?;
         let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if fd < 0 {
@@ -428,13 +496,14 @@ impl VsockBackend {
         let control = Arc::new(VsockControl {
             state: Mutex::new(State {
                 transport: None,
-                mux: Mux::new(),
+                mux: Mux::with_limit(max_connections),
                 failed: false,
             }),
             wake,
             kicks: Mutex::new(Vec::new()),
             epoll: unsafe { OwnedFd::from_raw_fd(fd) },
             stopping: AtomicBool::new(false),
+            listeners: Mutex::new(Vec::new()),
         });
         control.register(control.wake.as_raw_fd(), 0, libc::EPOLLIN)?;
         let worker_control = control.clone();
@@ -611,6 +680,10 @@ impl Drop for VsockBackend {
     fn drop(&mut self) {
         self.control.stopping.store(true, Ordering::Release);
         self.control.notify();
+        // Wakes the acceptors out of accept.
+        for listener in self.control.listeners.lock().unwrap().drain(..) {
+            unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) };
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -773,5 +846,63 @@ mod tests {
         assert!(batch.room(0).is_some());
         assert_eq!(batch.room(1), None);
         assert!(batch.invalid.is_none());
+    }
+
+    fn connect_line(bytes: &[u8]) -> io::Result<u32> {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(bytes).unwrap();
+        read_connect(&server)
+    }
+
+    #[test]
+    fn connect_lines() {
+        assert_eq!(connect_line(b"CONNECT 1024\n").unwrap(), 1024);
+        assert_eq!(connect_line(b"CONNECT 4294967295\n").unwrap(), u32::MAX);
+        for bad in [
+            &b"CONNECT 4294967296\n"[..],
+            b"CONNECT +1\n",
+            b"CONNECT \n",
+            b"connect 1024\n",
+            b"CONNECT 1024 \n",
+            b"CONNECT 1024",
+            b"CONNECT 000000000000000000000000001024\n",
+        ] {
+            assert!(connect_line(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_connect_line_leaves_later_bytes_for_the_guest() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(b"CONNECT 7\nearly").unwrap();
+        assert_eq!(read_connect(&server).unwrap(), 7);
+        let mut rest = [0; 5];
+        server.read_exact(&mut rest).unwrap();
+        assert_eq!(&rest, b"early");
+    }
+
+    #[test]
+    fn listener_clients_are_refused_before_the_driver_is_up_and_the_acceptor_stops_on_drop() {
+        let path = std::env::temp_dir().join(format!("shuru-vsock-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let backend = VsockBackend::new(MAX_CONNECTIONS).unwrap();
+        let control = backend.control();
+        control.serve(listener).unwrap();
+        let acceptor = Arc::downgrade(&control.listeners.lock().unwrap()[0]);
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        client.write_all(b"CONNECT 1024\n").unwrap();
+        let mut reply = Vec::new();
+        assert_eq!(client.read_to_end(&mut reply).unwrap(), 0);
+
+        drop(control);
+        drop(backend);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while acceptor.upgrade().is_some() {
+            assert!(Instant::now() < deadline, "acceptor still running");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
