@@ -7,6 +7,7 @@ use std::collections::HashMap;
 /// Length = size of type byte + payload (excludes the 4-byte length prefix).
 /// Max frame size: 1 MB.
 pub mod frame;
+pub mod hello;
 
 // --- Exec protocol ---
 

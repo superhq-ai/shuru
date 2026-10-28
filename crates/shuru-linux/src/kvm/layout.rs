@@ -59,6 +59,3 @@ pub const PSTATE_FAULT_BITS_64: u64 = 0x3c5;
 // crate but we also reference them directly for GIC setup)
 pub const KVM_ARM_VCPU_PSCI_0_2: u32 = 2;
 pub const KVM_ARM_VCPU_POWER_OFF: u32 = 0;
-
-pub const GUEST_CID: u64 = 3;
-pub const AF_VSOCK: i32 = 40;

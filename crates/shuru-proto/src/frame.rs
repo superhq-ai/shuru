@@ -1,5 +1,8 @@
 use std::io::{self, Read, Write};
 
+pub const HELLO: u8 = 0x08;
+pub const HELLO_OK: u8 = 0x09;
+
 // I/O streams
 pub const STDIN: u8 = 0x01;
 pub const STDOUT: u8 = 0x02;

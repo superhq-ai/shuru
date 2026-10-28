@@ -2,6 +2,7 @@ pub mod balloon;
 pub mod devices;
 pub mod layout;
 pub mod virtio_fs;
+pub mod vsock;
 
 use std::fs::File;
 use std::io::Read;
@@ -31,11 +32,11 @@ pub struct KvmVm {
     pub kvm: Kvm,
     pub vm_fd: Arc<VmFd>,
     pub mem: GuestMemoryMmap,
-    pub bus: Arc<Mutex<MmioBus>>,
+    pub bus: Arc<MmioBus>,
     pub vcpus: Vec<VcpuFd>,
     pub vcpu_threads: Vec<std::thread::JoinHandle<()>>,
     pub running: Arc<AtomicBool>,
-    pub guest_cid: u64,
+    pub vsock: Option<Arc<vsock::VsockControl>>,
     pub balloon: Option<Arc<balloon::BalloonControl>>,
     #[allow(dead_code)]
     _gic: DeviceFd,
@@ -54,7 +55,6 @@ pub struct VmCreateConfig {
     pub network_fd: Option<i32>,
     pub network_mac: Option<[u8; 6]>,
     pub has_vsock: bool,
-    pub guest_cid: u64,
     /// Virtio-fs mounts: (tag, host_path, read_only).
     pub mounts: Vec<(String, String, bool)>,
     pub has_balloon: bool,
@@ -129,48 +129,29 @@ impl KvmVm {
         bus.add(
             UART_BASE,
             UART_SIZE,
-            Box::new(Pl011::new(config.serial_write_fd, config.serial_read_fd)),
+            Box::new(Mutex::new(Pl011::new(
+                config.serial_write_fd,
+                config.serial_read_fd,
+            ))),
         );
 
         // PL031 RTC - needed so the guest boots with the host wall clock
         // (otherwise TLS certs are "not yet valid" since 1970-01-01).
-        bus.add(RTC_BASE, RTC_SIZE, Box::new(Pl031::new()));
+        bus.add(RTC_BASE, RTC_SIZE, Box::new(Mutex::new(Pl031::new())));
 
         // Virtio block
         if let Some(ref disk_path) = config.disk_path {
             let blk = BlockBackend::new(disk_path, config.disk_read_only)
                 .map_err(|e| VzError::new(format!("failed to open disk: {}", e)))?;
-            let spi = VIRTIO_SPI_BASE + virtio_idx;
-            let base = VIRTIO_MMIO_BASE + (virtio_idx as u64) * VIRTIO_MMIO_GAP;
-            bus.add(
-                base,
-                VIRTIO_MMIO_SIZE,
-                Box::new(VirtioMmioDevice::new(
-                    Box::new(blk),
-                    spi,
-                    vm_fd.clone(),
-                    mem.clone(),
-                )),
-            );
-            virtio_idx += 1;
+            add_virtio(&mut bus, &mut virtio_idx, Box::new(blk), &vm_fd, &mem)?;
         }
 
-        // Vhost-vsock
-        let guest_cid = config.guest_cid;
+        let mut vsock_control = None;
         if config.has_vsock {
-            let spi = VIRTIO_SPI_BASE + virtio_idx;
-            let base = VIRTIO_MMIO_BASE + (virtio_idx as u64) * VIRTIO_MMIO_GAP;
-            bus.add(
-                base,
-                VIRTIO_MMIO_SIZE,
-                Box::new(VirtioMmioDevice::new(
-                    Box::new(VhostVsockBackend::new(guest_cid)),
-                    spi,
-                    vm_fd.clone(),
-                    mem.clone(),
-                )),
-            );
-            virtio_idx += 1;
+            let backend = vsock::VsockBackend::new()
+                .map_err(|e| VzError::new(format!("failed to create vsock device: {e}")))?;
+            vsock_control = Some(backend.control());
+            add_virtio(&mut bus, &mut virtio_idx, Box::new(backend), &vm_fd, &mem)?;
         }
 
         // Virtio-fs mounts (one device per mount)
@@ -181,19 +162,7 @@ impl KvmVm {
                     tag, e
                 ))
             })?;
-            let spi = VIRTIO_SPI_BASE + virtio_idx;
-            let base = VIRTIO_MMIO_BASE + (virtio_idx as u64) * VIRTIO_MMIO_GAP;
-            bus.add(
-                base,
-                VIRTIO_MMIO_SIZE,
-                Box::new(VirtioMmioDevice::new(
-                    Box::new(fs),
-                    spi,
-                    vm_fd.clone(),
-                    mem.clone(),
-                )),
-            );
-            virtio_idx += 1;
+            add_virtio(&mut bus, &mut virtio_idx, Box::new(fs), &vm_fd, &mem)?;
         }
 
         // Virtio net
@@ -201,19 +170,13 @@ impl KvmVm {
             let mac = config
                 .network_mac
                 .unwrap_or([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
-            let spi = VIRTIO_SPI_BASE + virtio_idx;
-            let base = VIRTIO_MMIO_BASE + (virtio_idx as u64) * VIRTIO_MMIO_GAP;
-            bus.add(
-                base,
-                VIRTIO_MMIO_SIZE,
-                Box::new(VirtioMmioDevice::new(
-                    Box::new(NetBackend::new(net_fd, mac)),
-                    spi,
-                    vm_fd.clone(),
-                    mem.clone(),
-                )),
-            );
-            virtio_idx += 1;
+            add_virtio(
+                &mut bus,
+                &mut virtio_idx,
+                Box::new(NetBackend::new(net_fd, mac)),
+                &vm_fd,
+                &mem,
+            )?;
         }
 
         // Virtio balloon
@@ -221,19 +184,7 @@ impl KvmVm {
         if config.has_balloon {
             let backend = balloon::BalloonBackend::new(config.memory_bytes);
             balloon_control = Some(backend.control());
-            let spi = VIRTIO_SPI_BASE + virtio_idx;
-            let base = VIRTIO_MMIO_BASE + (virtio_idx as u64) * VIRTIO_MMIO_GAP;
-            bus.add(
-                base,
-                VIRTIO_MMIO_SIZE,
-                Box::new(VirtioMmioDevice::new(
-                    Box::new(backend),
-                    spi,
-                    vm_fd.clone(),
-                    mem.clone(),
-                )),
-            );
-            virtio_idx += 1;
+            add_virtio(&mut bus, &mut virtio_idx, Box::new(backend), &vm_fd, &mem)?;
         }
 
         // Create vCPUs (must exist before GIC init)
@@ -276,11 +227,11 @@ impl KvmVm {
             kvm,
             vm_fd,
             mem,
-            bus: Arc::new(Mutex::new(bus)),
+            bus: Arc::new(bus),
             vcpus,
             vcpu_threads: Vec::new(),
             running: Arc::new(AtomicBool::new(false)),
-            guest_cid,
+            vsock: vsock_control,
             balloon: balloon_control,
             _gic: gic,
         })
@@ -314,6 +265,9 @@ impl KvmVm {
         }
         for handle in self.vcpu_threads.drain(..) {
             let _ = handle.join();
+        }
+        if let Some(vsock) = &self.vsock {
+            vsock.deactivate();
         }
     }
 }
@@ -571,7 +525,23 @@ fn generate_fdt(
 // vCPU run loop
 // ===========================================================================
 
-fn vcpu_run_loop(mut vcpu: VcpuFd, bus: Arc<Mutex<MmioBus>>, running: Arc<AtomicBool>) {
+fn add_virtio(
+    bus: &mut MmioBus,
+    virtio_idx: &mut u32,
+    backend: Box<dyn VirtioBackend>,
+    vm_fd: &Arc<VmFd>,
+    mem: &GuestMemoryMmap,
+) -> Result<(), VzError> {
+    let spi = VIRTIO_SPI_BASE + *virtio_idx;
+    let base = VIRTIO_MMIO_BASE + (*virtio_idx as u64) * VIRTIO_MMIO_GAP;
+    let device = VirtioMmioDevice::new(backend, base, spi, vm_fd.clone(), mem.clone())
+        .map_err(|e| VzError::new(format!("failed to set up virtio device: {e}")))?;
+    bus.add(base, VIRTIO_MMIO_SIZE, Box::new(device));
+    *virtio_idx += 1;
+    Ok(())
+}
+
+fn vcpu_run_loop(mut vcpu: VcpuFd, bus: Arc<MmioBus>, running: Arc<AtomicBool>) {
     // Install empty handler for SIGRTMIN so KVM_RUN returns EINTR on stop
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -587,10 +557,10 @@ fn vcpu_run_loop(mut vcpu: VcpuFd, bus: Arc<Mutex<MmioBus>>, running: Arc<Atomic
                 match exit_reason {
                     VcpuExit::MmioRead(addr, data) => {
                         // data is &mut [u8] — write device response directly
-                        bus.lock().unwrap().handle_read(addr, data);
+                        bus.handle_read(addr, data);
                     }
                     VcpuExit::MmioWrite(addr, data) => {
-                        bus.lock().unwrap().handle_write(addr, data);
+                        bus.handle_write(addr, data);
                     }
                     VcpuExit::SystemEvent(..) | VcpuExit::Shutdown => {
                         running.store(false, Ordering::Release);

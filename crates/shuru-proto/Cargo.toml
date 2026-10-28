@@ -1,6 +1,6 @@
 [package]
 name = "shuru-proto"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Shared wire protocol for shuru host/guest communication"
 license = "Apache-2.0"
@@ -9,3 +9,4 @@ repository = "https://github.com/superhq-ai/shuru"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+subtle = "2.6"

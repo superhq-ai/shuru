@@ -18,12 +18,11 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use kvm_ioctls::VmFd;
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::devices::{
-    avail_idx, avail_ring_entry, read_desc, write_used, VirtioBackend, VirtioQueueState,
-    VIRTIO_F_VERSION_1, VRING_DESC_F_NEXT,
+    avail_idx, avail_ring_entry, read_desc, write_used, Interrupt, VirtioBackend, VirtioQueueState,
+    INTERRUPT_CONFIG, VIRTIO_F_VERSION_1, VRING_DESC_F_NEXT,
 };
 
 const VIRTIO_BALLOON_F_STATS_VQ: u64 = 1 << 1;
@@ -37,8 +36,6 @@ const OFFERED_FEATURES: u64 =
 /// Balloon pages are always 4 KiB, whatever the guest page size.
 const PAGE_SHIFT: u32 = 12;
 const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
-
-const VIRTIO_MMIO_INT_CONFIG: u32 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum QueueRole {
@@ -84,18 +81,12 @@ impl QueueLayout {
     }
 }
 
-struct IrqLine {
-    vm_fd: Arc<VmFd>,
-    irq: u32,
-    status: Arc<AtomicU32>,
-}
-
 /// Host side of the balloon: set a target, read what the guest gave up.
 pub struct BalloonControl {
     total_bytes: u64,
     target_pages: AtomicU32,
     actual_pages: AtomicU32,
-    irq: Mutex<Option<IrqLine>>,
+    interrupt: Mutex<Option<Arc<Interrupt>>>,
 }
 
 impl BalloonControl {
@@ -105,10 +96,8 @@ impl BalloonControl {
         let keep = bytes.min(self.total_bytes);
         let pages = ((self.total_bytes - keep) / PAGE_SIZE) as u32;
         self.target_pages.store(pages, Ordering::Release);
-        if let Some(line) = self.irq.lock().unwrap().as_ref() {
-            line.status
-                .fetch_or(VIRTIO_MMIO_INT_CONFIG, Ordering::Release);
-            let _ = line.vm_fd.set_irq_line(line.irq, true);
+        if let Some(interrupt) = self.interrupt.lock().unwrap().as_ref() {
+            interrupt.raise(INTERRUPT_CONFIG);
         }
     }
 
@@ -133,7 +122,7 @@ impl BalloonBackend {
                 total_bytes,
                 target_pages: AtomicU32::new(0),
                 actual_pages: AtomicU32::new(0),
-                irq: Mutex::new(None),
+                interrupt: Mutex::new(None),
             }),
             host_page: if page > 0 { page as u64 } else { PAGE_SIZE },
             layout: QueueLayout::for_features(OFFERED_FEATURES),
@@ -191,11 +180,12 @@ impl BalloonBackend {
         }
     }
 
-    fn drain(&self, role: QueueRole, q: &mut VirtioQueueState, mem: &GuestMemoryMmap) {
+    fn drain(&self, role: QueueRole, q: &mut VirtioQueueState, mem: &GuestMemoryMmap) -> bool {
         if q.size == 0 {
-            return;
+            return false;
         }
         let current = avail_idx(mem, q.avail_addr);
+        let used = q.last_avail_idx != current;
         while q.last_avail_idx != current {
             let head = avail_ring_entry(mem, q.avail_addr, q.size, q.last_avail_idx);
             let mut idx = head;
@@ -217,6 +207,7 @@ impl BalloonBackend {
             write_used(mem, q.used_addr, q.size, q.last_avail_idx, head as u32, 0);
             q.last_avail_idx = q.last_avail_idx.wrapping_add(1);
         }
+        used
     }
 }
 
@@ -255,19 +246,8 @@ impl VirtioBackend for BalloonBackend {
         self.layout = QueueLayout::for_features(features);
     }
 
-    fn activate(
-        &mut self,
-        _: &[VirtioQueueState],
-        _: &GuestMemoryMmap,
-        vm_fd: &Arc<VmFd>,
-        irq: u32,
-        interrupt_status: Arc<AtomicU32>,
-    ) {
-        *self.control.irq.lock().unwrap() = Some(IrqLine {
-            vm_fd: vm_fd.clone(),
-            irq,
-            status: interrupt_status,
-        });
+    fn activate(&mut self, _: &[VirtioQueueState], _: &GuestMemoryMmap, interrupt: Arc<Interrupt>) {
+        *self.control.interrupt.lock().unwrap() = Some(interrupt);
     }
 
     fn process_queue(
@@ -275,21 +255,18 @@ impl VirtioBackend for BalloonBackend {
         queue_idx: u16,
         queues: &mut [VirtioQueueState],
         mem: &GuestMemoryMmap,
-        _: &Arc<VmFd>,
-        _: u32,
-    ) {
+    ) -> bool {
         let Some(role) = self.layout.role(queue_idx) else {
-            return;
+            return false;
         };
-        if let Some(q) = queues.get_mut(usize::from(queue_idx)) {
-            if q.ready {
-                self.drain(role, q, mem);
-            }
+        match queues.get_mut(usize::from(queue_idx)) {
+            Some(q) if q.ready => self.drain(role, q, mem),
+            _ => false,
         }
     }
 
     fn reset(&mut self) {
-        *self.control.irq.lock().unwrap() = None;
+        *self.control.interrupt.lock().unwrap() = None;
         self.control.actual_pages.store(0, Ordering::Release);
         self.layout = QueueLayout::for_features(OFFERED_FEATURES);
     }

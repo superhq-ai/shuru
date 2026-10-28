@@ -1,5 +1,4 @@
 use std::net::TcpStream;
-use std::os::unix::io::FromRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -7,7 +6,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::configuration::VirtualMachineConfiguration;
 use crate::error::{Result, VzError};
-use crate::kvm::{self, layout};
+use crate::kvm;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmState {
@@ -21,14 +20,13 @@ pub enum VmState {
 
 pub struct VirtualMachine {
     vm: Mutex<Option<kvm::KvmVm>>,
-    guest_cid: u64,
     state_tx: Sender<VmState>,
     state_rx: Receiver<VmState>,
     running: Arc<AtomicBool>,
 }
 
 impl VirtualMachine {
-    pub fn new(config: &VirtualMachineConfiguration) -> Self {
+    pub fn new(config: &VirtualMachineConfiguration) -> Result<Self> {
         let inner = config.inner.borrow();
         let (state_tx, state_rx) = bounded(1);
         let running = Arc::new(AtomicBool::new(false));
@@ -46,33 +44,17 @@ impl VirtualMachine {
             network_fd: inner.network_fd,
             network_mac: inner.network_mac,
             has_vsock: inner.has_socket,
-            guest_cid: layout::GUEST_CID,
             mounts: inner.mounts.clone(),
             has_balloon: inner.has_balloon,
         };
 
-        match kvm::KvmVm::create(create_config) {
-            Ok(kvm_vm) => {
-                let cid = kvm_vm.guest_cid;
-                VirtualMachine {
-                    vm: Mutex::new(Some(kvm_vm)),
-                    guest_cid: cid,
-                    state_tx,
-                    state_rx,
-                    running,
-                }
-            }
-            Err(e) => {
-                eprintln!("shuru: failed to create KVM VM: {}", e);
-                VirtualMachine {
-                    vm: Mutex::new(None),
-                    guest_cid: layout::GUEST_CID,
-                    state_tx,
-                    state_rx,
-                    running,
-                }
-            }
-        }
+        let kvm_vm = kvm::KvmVm::create(create_config)?;
+        Ok(VirtualMachine {
+            vm: Mutex::new(Some(kvm_vm)),
+            state_tx,
+            state_rx,
+            running,
+        })
     }
 
     pub fn supported() -> bool {
@@ -170,86 +152,17 @@ impl VirtualMachine {
         self.can_stop()
     }
 
-    /// Connect to a vsock port on the guest via AF_VSOCK.
     pub fn connect_to_vsock_port(&self, port: u32) -> Result<TcpStream> {
-        let sock = unsafe { libc::socket(layout::AF_VSOCK, libc::SOCK_STREAM, 0) };
-        if sock < 0 {
-            return Err(VzError::new(format!(
-                "failed to create vsock socket: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-
-        // Use non-blocking connect + poll to implement a 2-second timeout.
-        // SO_SNDTIMEO doesn't work for AF_VSOCK on some kernels.
-        unsafe {
-            let flags = libc::fcntl(sock, libc::F_GETFL);
-            libc::fcntl(sock, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-
-        let addr = libc::sockaddr_vm {
-            svm_family: layout::AF_VSOCK as libc::sa_family_t,
-            svm_reserved1: 0,
-            svm_port: port,
-            svm_cid: self.guest_cid as u32,
-            svm_zero: [0u8; 4],
-        };
-
-        let ret = unsafe {
-            libc::connect(
-                sock,
-                &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
-            )
-        };
-
-        if ret < 0 {
-            let errno = std::io::Error::last_os_error();
-            if errno.raw_os_error() != Some(libc::EINPROGRESS) {
-                unsafe { libc::close(sock) };
-                return Err(VzError::new(format!("vsock connect failed: {}", errno)));
-            }
-
-            // Wait for connect to complete with 2s timeout
-            let mut pfd = libc::pollfd {
-                fd: sock,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            let poll_ret = unsafe { libc::poll(&mut pfd, 1, 2000) };
-            if poll_ret <= 0 {
-                unsafe { libc::close(sock) };
-                return Err(VzError::new("vsock connect timed out"));
-            }
-
-            // Check if connect succeeded
-            let mut err: libc::c_int = 0;
-            let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            unsafe {
-                libc::getsockopt(
-                    sock,
-                    libc::SOL_SOCKET,
-                    libc::SO_ERROR,
-                    &mut err as *mut _ as *mut libc::c_void,
-                    &mut len,
-                );
-            }
-            if err != 0 {
-                unsafe { libc::close(sock) };
-                return Err(VzError::new(format!(
-                    "vsock connect failed: {}",
-                    std::io::Error::from_raw_os_error(err)
-                )));
-            }
-        }
-
-        // Restore blocking mode for normal I/O
-        unsafe {
-            let flags = libc::fcntl(sock, libc::F_GETFL);
-            libc::fcntl(sock, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-        }
-
-        Ok(unsafe { TcpStream::from_raw_fd(sock) })
+        let control = self
+            .vm
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|vm| vm.vsock.clone())
+            .ok_or_else(|| VzError::new("no vsock device"))?;
+        control
+            .connect(port)
+            .map_err(|e| VzError::new(format!("vsock connect failed: {e}")))
     }
 
     pub fn state(&self) -> VmState {

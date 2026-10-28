@@ -1,3 +1,6 @@
+#[cfg(any(target_os = "linux", test))]
+mod identity;
+
 #[cfg(target_os = "linux")]
 mod services;
 
@@ -377,9 +380,24 @@ mod guest {
         }
     }
 
-    fn handle_connection(fd: i32) {
+    fn authenticate(
+        stream: &mut std::net::TcpStream,
+        identity: &shuru_proto::hello::Identity,
+    ) -> std::io::Result<()> {
+        let timeout = Some(std::time::Duration::from_secs(2));
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
+        identity.accept(stream)?;
+        stream.set_read_timeout(None)?;
+        stream.set_write_timeout(None)
+    }
+
+    fn handle_connection(fd: i32, identity: shuru_proto::hello::Identity) {
         // SAFETY: fd is a valid socket from accept()
-        let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        let mut stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        if authenticate(&mut stream, &identity).is_err() {
+            return;
+        }
         let _ = stream.set_nodelay(true);
         let mut reader = stream.try_clone().expect("failed to clone stream");
         let mut writer = stream;
@@ -1563,7 +1581,7 @@ mod guest {
         write_frame_fd(vsock_fd, frame::EXIT, &frame::exit_payload(exit_code));
     }
 
-    fn forward_accept_loop(listener_fd: i32) {
+    fn forward_accept_loop(listener_fd: i32, identity: shuru_proto::hello::Identity) {
         loop {
             let client_fd =
                 unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
@@ -1573,13 +1591,16 @@ mod guest {
             }
 
             std::thread::spawn(move || {
-                handle_forward_connection(client_fd);
+                handle_forward_connection(client_fd, identity);
             });
         }
     }
 
-    fn handle_forward_connection(fd: i32) {
+    fn handle_forward_connection(fd: i32, identity: shuru_proto::hello::Identity) {
         let mut stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        if authenticate(&mut stream, &identity).is_err() {
+            return;
+        }
         let _ = stream.set_nodelay(true);
 
         // Read the forward request frame
@@ -1670,6 +1691,13 @@ mod guest {
         ensure_stdio();
         stage("filesystems mounted");
 
+        let identity = std::fs::read_to_string("/proc/cmdline")
+            .and_then(|cmdline| crate::identity::parse(&cmdline))
+            .unwrap_or_else(|_| {
+                eprintln!("shuru-guest: missing or invalid guest identity");
+                std::process::exit(1);
+            });
+
         // Set hostname
         let hostname = b"shuru\0";
         unsafe {
@@ -1709,7 +1737,7 @@ mod guest {
             VSOCK_PORT_FORWARD
         ));
         std::thread::spawn(move || {
-            forward_accept_loop(fwd_listener_fd);
+            forward_accept_loop(fwd_listener_fd, identity);
         });
 
         loop {
@@ -1724,7 +1752,7 @@ mod guest {
             eprintln!("shuru-guest: accepted vsock connection");
 
             std::thread::spawn(move || {
-                handle_connection(client_fd);
+                handle_connection(client_fd, identity);
             });
 
             reap_zombies();
