@@ -11,9 +11,11 @@
 //!   over the inflate queue, and the host discards those pages too.
 //!   Raising the target gives them back through the deflate queue.
 //!
-//! A discarded page reads as zero when the guest touches it again, so the
-//! only cost to the guest is a page fault. The guest may also deflate on
-//! its own under memory pressure (`VIRTIO_BALLOON_F_DEFLATE_ON_OOM`).
+//! A discarded page reads as zero when the guest touches it again, or as
+//! saved for a restored guest, whose memory maps the saved file. The guest
+//! assumes neither, so the only cost to it is a page fault. The guest may
+//! also deflate on its own under memory pressure
+//! (`VIRTIO_BALLOON_F_DEFLATE_ON_OOM`).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,6 +26,7 @@ use super::devices::{
     avail_ring_entry, write_used, Interrupt, VirtioBackend, VirtioQueueState, INTERRUPT_CONFIG,
     VIRTIO_F_VERSION_1, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE,
 };
+use super::snapshot::{self, BackendState};
 
 const VIRTIO_BALLOON_F_STATS_VQ: u64 = 1 << 1;
 const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u64 = 1 << 2;
@@ -270,5 +273,36 @@ impl VirtioBackend for BalloonBackend {
         *self.control.interrupt.lock().unwrap() = None;
         self.control.actual_pages.store(0, Ordering::Release);
         self.layout = QueueLayout::for_features(OFFERED_FEATURES);
+    }
+
+    fn save(&mut self) -> std::io::Result<BackendState> {
+        Ok(BackendState::Balloon {
+            target_pages: self.control.target_pages.load(Ordering::Acquire),
+            actual_pages: self.control.actual_pages.load(Ordering::Acquire),
+        })
+    }
+
+    fn restore(
+        &mut self,
+        state: &BackendState,
+        queues: &[VirtioQueueState],
+        mem: &GuestMemoryMmap,
+        interrupt: Arc<Interrupt>,
+    ) -> std::io::Result<()> {
+        let &BackendState::Balloon {
+            target_pages,
+            actual_pages,
+        } = state
+        else {
+            return Err(snapshot::mismatch());
+        };
+        self.control
+            .target_pages
+            .store(target_pages, Ordering::Release);
+        self.control
+            .actual_pages
+            .store(actual_pages, Ordering::Release);
+        self.activate(queues, mem, interrupt);
+        Ok(())
     }
 }

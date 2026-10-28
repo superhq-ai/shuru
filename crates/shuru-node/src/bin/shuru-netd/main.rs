@@ -83,10 +83,9 @@ fn start(
         ..Default::default()
     };
     seccomp::install_netd(log)?;
-    let handle = shuru_proxy::start(frames.into_raw_fd(), proxy)?;
+    let handle = shuru_proxy::start_session(frames.into_raw_fd(), proxy, config.session)?;
     let response = Response::Network {
-        placeholders: handle.placeholders.clone(),
-        ca_cert_pem: String::from_utf8(handle.ca_cert_pem.clone())?,
+        session: handle.session(),
     };
     Ok((handle, response))
 }

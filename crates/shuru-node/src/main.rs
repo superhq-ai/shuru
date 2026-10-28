@@ -1,5 +1,6 @@
 //! `shuru-node run` boots one jailed VM, runs a command in it and stops it,
-//! the way a node runs each sandbox.
+//! the way a node runs each sandbox. `shuru-node restore` does the same
+//! from a snapshot `run --snapshot-to` took.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -9,18 +10,19 @@ use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use shuru_node::cgroup::{Limits, Sandbox};
-use shuru_node::control::{self, Disk, NetdConfig, Request, Response, Secret, VmmConfig};
+use shuru_node::control::{self, Boot, Disk, NetdConfig, Request, Response, Secret, VmmConfig};
 use shuru_node::firewall::{self, NETD_UID_BASE};
 use shuru_node::jail::{self, Handoff, Jail};
-use shuru_proto::hello::Identity;
+use shuru_proto::hello::{Identity, Restore};
 use shuru_proto::{frame, ExecRequest};
 
 const RUN_DIR: &str = "/run/shuru";
@@ -48,6 +50,29 @@ struct Cli {
 enum Command {
     /// Boot a jailed VM, run one command in it and stop the VM.
     Run(RunArgs),
+    /// Restore a jailed VM from a snapshot, run one command in it and stop
+    /// the VM.
+    Restore(RestoreArgs),
+}
+
+#[derive(clap::Args)]
+struct Common {
+    /// Picks the uids and the cgroup. One VM per slot at a time.
+    #[arg(long, default_value_t = 0)]
+    slot: u32,
+    /// The directory holding the statically linked shuru-vmm and
+    /// shuru-netd. Defaults to the one holding this binary.
+    #[arg(long)]
+    bin_dir: Option<PathBuf>,
+    /// Show the guest console, guest token included.
+    #[arg(long)]
+    verbose: bool,
+    /// Log calls the seccomp filters forbid instead of killing.
+    #[arg(long)]
+    seccomp_log: bool,
+    /// Print timings and peak memory to stderr.
+    #[arg(long)]
+    time: bool,
 }
 
 #[derive(clap::Args)]
@@ -64,9 +89,6 @@ struct RunArgs {
     /// Guest memory in MiB.
     #[arg(long, default_value_t = 2048)]
     memory: u64,
-    /// Picks the uids and the cgroup. One VM per slot at a time.
-    #[arg(long, default_value_t = 0)]
-    slot: u32,
     /// Give the guest a network through a jailed shuru-netd. It reaches
     /// public addresses only.
     #[arg(long)]
@@ -84,26 +106,45 @@ struct RunArgs {
     /// Roots for checking the hosts secrets are sent to.
     #[arg(long, default_value = "/etc/ssl/certs/ca-certificates.crt")]
     ca_bundle: PathBuf,
-    /// The directory holding the statically linked shuru-vmm and
-    /// shuru-netd. Defaults to the one holding this binary.
+    /// After the command, snapshot the VM into this new directory: its
+    /// memory, its state and a copy of the working disk.
     #[arg(long)]
-    bin_dir: Option<PathBuf>,
-    /// Show the guest console, guest token included.
+    snapshot_to: Option<PathBuf>,
+    #[command(flatten)]
+    common: Common,
+    #[arg(last = true, required = true)]
+    command: Vec<String>,
+}
+
+#[derive(clap::Args)]
+struct RestoreArgs {
+    /// A directory `run --snapshot-to` wrote.
     #[arg(long)]
-    verbose: bool,
-    /// Log calls the seccomp filters forbid instead of killing.
+    from: PathBuf,
+    /// Where the working disk goes, a copy of the saved one. It must not
+    /// exist.
     #[arg(long)]
-    seccomp_log: bool,
-    /// Print boot timings and peak memory to stderr.
+    disk: PathBuf,
+    /// Roots for checking the hosts secrets are sent to, for a snapshot
+    /// with a network.
+    #[arg(long, default_value = "/etc/ssl/certs/ca-certificates.crt")]
+    ca_bundle: PathBuf,
+    /// After the command, snapshot the VM again into this new directory.
+    /// Its memory starts as a copy of the restored one.
     #[arg(long)]
-    time: bool,
+    snapshot_to: Option<PathBuf>,
+    #[command(flatten)]
+    common: Common,
     #[arg(last = true, required = true)]
     command: Vec<String>,
 }
 
 fn main() {
-    let Command::Run(args) = Cli::parse().command;
-    match run(args) {
+    let result = match Cli::parse().command {
+        Command::Run(args) => run(args),
+        Command::Restore(args) => restore(args),
+    };
+    match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("shuru-node: {e:#}");
@@ -278,72 +319,175 @@ fn secret(spec: &str) -> Result<(String, Secret)> {
     Ok((name.to_string(), Secret { value, hosts }))
 }
 
+/// What the guest may reach and which secrets it is given, kept with a
+/// snapshot so a restore gets the same.
+#[derive(Clone, Serialize, Deserialize)]
+struct NetworkPolicy {
+    allow: Vec<String>,
+    /// NAME@HOST[,HOST], valued from the environment at each start.
+    secrets: Vec<String>,
+    dns: Ipv4Addr,
+}
+
 struct Network {
     netd: Jailed,
     vm_end: OwnedFd,
     mac: [u8; 6],
-    placeholders: HashMap<String, String>,
-    ca_cert_pem: String,
+    session: shuru_proxy::Session,
 }
 
-fn start_network(args: &RunArgs, netd: Jailed) -> Result<Network> {
-    let secrets = args
+/// Configures `netd`. A restore passes the session and MAC the guest was
+/// saved with: it trusts that CA, holds those placeholders and has the
+/// gateway in its neighbour table under that MAC.
+fn start_network(
+    policy: &NetworkPolicy,
+    ca_bundle: &Path,
+    netd: Jailed,
+    saved: Option<(shuru_proxy::Session, [u8; 6])>,
+) -> Result<Network> {
+    let secrets = policy
         .secrets
         .iter()
         .map(|spec| secret(spec))
         .collect::<Result<_>>()?;
-    let upstream_roots = fs::read_to_string(&args.ca_bundle)
-        .with_context(|| format!("{}", args.ca_bundle.display()))?;
+    let upstream_roots =
+        fs::read_to_string(ca_bundle).with_context(|| format!("{}", ca_bundle.display()))?;
     let (vm_end, host_end) = shuru_proxy::create_socketpair()?;
     let (vm_end, host_end) =
         unsafe { (OwnedFd::from_raw_fd(vm_end), OwnedFd::from_raw_fd(host_end)) };
+    let (session, mac) = match saved {
+        Some((session, mac)) => (Some(session), mac),
+        None => {
+            let mut mac = [0u8; 6];
+            getrandom::fill(&mut mac).map_err(|e| anyhow::anyhow!("{e}"))?;
+            mac[0] = (mac[0] & 0xfe) | 0x02;
+            (None, mac)
+        }
+    };
     let config = NetdConfig {
-        dns_resolver: args.dns,
-        allow: args.allow.clone(),
+        dns_resolver: policy.dns,
+        allow: policy.allow.clone(),
         secrets,
         upstream_roots,
+        session,
     };
     let response = netd
         .configure(&Request::ConfigureNetwork(config), &[host_end.as_raw_fd()])
         .context("shuru-netd failed")?;
-    let Response::Network {
-        placeholders,
-        ca_cert_pem,
-    } = response
-    else {
+    let Response::Network { session } = response else {
         bail!("shuru-netd answered {response:?}");
     };
-    let mut mac = [0u8; 6];
-    getrandom::fill(&mut mac).map_err(|e| anyhow::anyhow!("{e}"))?;
-    mac[0] = (mac[0] & 0xfe) | 0x02;
     Ok(Network {
         netd,
         vm_end,
         mac,
-        placeholders,
-        ca_cert_pem,
+        session,
     })
+}
+
+/// What every sandbox needs from the host, opened before the jail.
+struct Host {
+    bin_dir: PathBuf,
+    kvm: OwnedFd,
+    null: File,
+    serial: OwnedFd,
+}
+
+impl Host {
+    fn open(common: &Common) -> Result<Self> {
+        if unsafe { libc::geteuid() } != 0 {
+            bail!("shuru-node runs as root");
+        }
+        let bin_dir = match &common.bin_dir {
+            Some(dir) => dir.clone(),
+            None => std::env::current_exe()?
+                .parent()
+                .context("no binary directory")?
+                .to_path_buf(),
+        };
+        let kvm = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .context("/dev/kvm")?
+            .into();
+        let null = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")?;
+        let serial = if common.verbose {
+            io::stderr().as_fd().try_clone_to_owned()?
+        } else {
+            null.try_clone()?.into()
+        };
+        Ok(Host {
+            bin_dir,
+            kvm,
+            null,
+            serial,
+        })
+    }
+
+    fn sandbox(&self, common: &Common, memory_bytes: u64, cpus: usize) -> Result<Sandbox> {
+        Sandbox::create(
+            &common.slot.to_string(),
+            &Limits {
+                guest_memory_bytes: memory_bytes,
+                cpus: cpus as u64,
+                pids: SANDBOX_PIDS,
+            },
+        )
+        .context("creating the sandbox cgroup")
+    }
+
+    fn spawn_netd(&self, common: &Common, dir: &RunDir, sandbox: &mut Sandbox) -> Result<Jailed> {
+        firewall::install()?;
+        spawn(Spawn {
+            name: "netd",
+            uid: NETD_UID_BASE + common.slot,
+            nofile: NETD_NOFILE,
+            host_network: true,
+            dir,
+            sandbox,
+            bin_dir: &self.bin_dir,
+            null: &self.null,
+            seccomp_log: common.seccomp_log,
+        })
+    }
+
+    fn spawn_vmm(&self, common: &Common, dir: &RunDir, sandbox: &mut Sandbox) -> Result<Jailed> {
+        spawn(Spawn {
+            name: "vmm",
+            uid: VMM_UID_BASE + common.slot,
+            nofile: VMM_NOFILE,
+            host_network: false,
+            dir,
+            sandbox,
+            bin_dir: &self.bin_dir,
+            null: &self.null,
+            seccomp_log: common.seccomp_log,
+        })
+    }
+}
+
+fn open(path: &Path) -> Result<File> {
+    File::open(path).with_context(|| format!("{}", path.display()))
+}
+
+fn print_times(sandbox: &Sandbox, times: &[(&str, Duration)]) {
+    let peak = sandbox
+        .memory_peak()
+        .map_or("unknown".into(), |bytes| format!("{} MiB", bytes >> 20));
+    let times: Vec<String> = times
+        .iter()
+        .map(|(what, at)| format!("{what} {} ms", at.as_millis()))
+        .collect();
+    eprintln!("shuru-node: {}, peak memory {peak}", times.join(", "));
 }
 
 fn run(args: RunArgs) -> Result<i32> {
     let started = Instant::now();
-    if unsafe { libc::geteuid() } != 0 {
-        bail!("shuru-node runs as root");
-    }
-    let bin_dir = match &args.bin_dir {
-        Some(dir) => dir.clone(),
-        None => std::env::current_exe()?
-            .parent()
-            .context("no binary directory")?
-            .to_path_buf(),
-    };
-    let kvm: OwnedFd = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .context("/dev/kvm")?
-        .into();
-    let open = |path: &Path| File::open(path).with_context(|| format!("{}", path.display()));
+    let host = Host::open(&args.common)?;
     let kernel = open(&args.kernel)?;
     let initrd = open(&args.initrd)?;
     let disk = OpenOptions::new()
@@ -351,70 +495,30 @@ fn run(args: RunArgs) -> Result<i32> {
         .write(true)
         .open(&args.disk)
         .with_context(|| format!("{}", args.disk.display()))?;
-    let null = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/null")?;
-    let serial: OwnedFd = if args.verbose {
-        io::stderr().as_fd().try_clone_to_owned()?
-    } else {
-        null.try_clone()?.into()
-    };
-    if args.allow_net {
-        firewall::install()?;
-    }
+    let policy = args.allow_net.then(|| NetworkPolicy {
+        allow: args.allow.clone(),
+        secrets: args.secrets.clone(),
+        dns: args.dns,
+    });
 
-    let dir = RunDir::create(args.slot)?;
+    let dir = RunDir::create(args.common.slot)?;
     let vsock_listener = UnixListener::bind(dir.vsock())?;
-    let mut sandbox = Sandbox::create(
-        &args.slot.to_string(),
-        &Limits {
-            guest_memory_bytes: args.memory << 20,
-            cpus: args.cpus as u64,
-            pids: SANDBOX_PIDS,
-        },
-    )
-    .context("creating the sandbox cgroup")?;
+    let mut sandbox = host.sandbox(&args.common, args.memory << 20, args.cpus)?;
 
-    let network = if args.allow_net {
-        let netd = spawn(Spawn {
-            name: "netd",
-            uid: NETD_UID_BASE + args.slot,
-            nofile: NETD_NOFILE,
-            host_network: true,
-            dir: &dir,
-            sandbox: &mut sandbox,
-            bin_dir: &bin_dir,
-            null: &null,
-            seccomp_log: args.seccomp_log,
-        })?;
-        Some(start_network(&args, netd)?)
-    } else {
-        None
+    let network = match &policy {
+        Some(policy) => {
+            let netd = host.spawn_netd(&args.common, &dir, &mut sandbox)?;
+            Some(start_network(policy, &args.ca_bundle, netd, None)?)
+        }
+        None => None,
     };
     let networked = started.elapsed();
 
-    let vmm = spawn(Spawn {
-        name: "vmm",
-        uid: VMM_UID_BASE + args.slot,
-        nofile: VMM_NOFILE,
-        host_network: false,
-        dir: &dir,
-        sandbox: &mut sandbox,
-        bin_dir: &bin_dir,
-        null: &null,
-        seccomp_log: args.seccomp_log,
-    })?;
+    let vmm = host.spawn_vmm(&args.common, &dir, &mut sandbox)?;
     let spawned = started.elapsed();
 
-    let mut identity = Identity {
-        token: [0; 32],
-        instance: [0; 16],
-    };
-    getrandom::fill(&mut identity.token).map_err(|e| anyhow::anyhow!("{e}"))?;
-    getrandom::fill(&mut identity.instance).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let quiet = if args.verbose { "" } else { " quiet" };
+    let identity = new_identity()?;
+    let quiet = if args.common.verbose { "" } else { " quiet" };
     let command_line = format!(
         "console=ttyAMA0 root=/dev/vda rw{quiet} shuru.token={} shuru.instance={}",
         hex(&identity.token),
@@ -424,8 +528,10 @@ fn run(args: RunArgs) -> Result<i32> {
     let config = VmmConfig {
         cpus: args.cpus,
         memory_bytes: args.memory << 20,
-        command_line,
-        initrd: true,
+        boot: Boot::Kernel {
+            command_line,
+            initrd: true,
+        },
         disk: Some(Disk { read_only: false }),
         serial: true,
         network_mac: network.as_ref().map(|network| network.mac),
@@ -433,11 +539,11 @@ fn run(args: RunArgs) -> Result<i32> {
         balloon: true,
     };
     let mut fds = vec![
-        kvm.as_raw_fd(),
+        host.kvm.as_raw_fd(),
         kernel.as_raw_fd(),
         initrd.as_raw_fd(),
         disk.as_raw_fd(),
-        serial.as_raw_fd(),
+        host.serial.as_raw_fd(),
     ];
     if let Some(network) = &network {
         fds.push(network.vm_end.as_raw_fd());
@@ -445,43 +551,308 @@ fn run(args: RunArgs) -> Result<i32> {
     fds.push(vsock_listener.as_raw_fd());
     vmm.configure(&Request::Configure(config), &fds)
         .context("shuru-vmm failed")?;
-    drop((kvm, kernel, initrd, disk, serial, vsock_listener));
+    drop((host, kernel, initrd, disk, vsock_listener));
     let ready = started.elapsed();
 
     let mut env = HashMap::new();
     if let Some(network) = &network {
-        if !network.placeholders.is_empty() {
+        if !network.session.placeholders.is_empty() {
             let guest = connect_guest(&dir.vsock(), &identity, &vmm)?;
-            let ca = HashMap::from([("SHURU_PROXY_CA".to_string(), network.ca_cert_pem.clone())]);
+            let ca = network.session.ca_cert_pem.clone();
+            let ca = HashMap::from([("SHURU_PROXY_CA".to_string(), ca)]);
             let argv = ["sh", "-c", INSTALL_CA].map(str::to_string).to_vec();
             if exec(guest, argv, ca)? != 0 {
                 bail!("installing the proxy CA in the guest failed");
             }
-            env = network.placeholders.clone();
+            env = network.session.placeholders.clone();
         }
     }
     let guest = connect_guest(&dir.vsock(), &identity, &vmm)?;
     let answered = started.elapsed();
     let code = exec(guest, args.command, env)?;
+    let done = started.elapsed();
 
-    if args.time {
-        let peak = sandbox
-            .memory_peak()
-            .map_or("unknown".into(), |bytes| format!("{} MiB", bytes >> 20));
-        eprintln!(
-            "shuru-node: network {} ms, jailed {} ms, VM running {} ms, guest answered {} ms, done {} ms, peak memory {peak}",
-            networked.as_millis(),
-            spawned.as_millis(),
-            ready.as_millis(),
-            answered.as_millis(),
-            started.elapsed().as_millis(),
-        );
+    let mut times = vec![
+        ("network", networked),
+        ("jailed", spawned),
+        ("VM running", ready),
+        ("guest answered", answered),
+        ("done", done),
+    ];
+    if let Some(to) = &args.snapshot_to {
+        let info = SnapshotInfo {
+            cpus: args.cpus,
+            memory_bytes: args.memory << 20,
+            token: hex(&identity.token),
+            instance: hex(&identity.instance),
+            network: network
+                .as_ref()
+                .zip(policy)
+                .map(|(network, policy)| SavedNetwork {
+                    policy,
+                    mac: hex(&network.mac),
+                    session: network.session.clone(),
+                }),
+        };
+        save_snapshot(&vmm, to, &args.disk, &info, None)?;
+        times.push(("snapshot", started.elapsed() - done));
+    }
+    if args.common.time {
+        print_times(&sandbox, &times);
     }
     vmm.stop();
     if let Some(network) = network {
         network.netd.stop();
     }
     Ok(code)
+}
+
+/// What a snapshot directory holds besides the memory, state and disk:
+/// the VM shape and the guest identity at the snapshot, which every
+/// restore replaces.
+#[derive(Serialize, Deserialize)]
+struct SnapshotInfo {
+    cpus: usize,
+    memory_bytes: u64,
+    token: String,
+    instance: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    network: Option<SavedNetwork>,
+}
+
+/// The guest network, with the proxy CA key. Secret values are not kept.
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedNetwork {
+    policy: NetworkPolicy,
+    mac: String,
+    session: shuru_proxy::Session,
+}
+
+const SNAPSHOT_INFO: &str = "node.json";
+
+/// A file only root can read, which must not exist yet.
+fn create_private(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("{}", path.display()))
+}
+
+/// `dst` gets the blocks of `src`, shared when the filesystem can.
+fn clone_file(src: &Path, dst: &Path) -> Result<()> {
+    let from = open(src)?;
+    let to = create_private(dst)?;
+    if !shuru_linux::reflink(&to, &from)? {
+        io::copy(&mut &from, &mut &to)?;
+    }
+    Ok(())
+}
+
+/// Saves the VM into the new directory `dir`. A restored VM passes the
+/// memory it was restored from as `base`; it only writes what changed.
+fn save_snapshot(
+    vmm: &Jailed,
+    dir: &Path,
+    disk: &Path,
+    info: &SnapshotInfo,
+    base: Option<&Path>,
+) -> Result<()> {
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("{}", dir.display()))?;
+    let memory_path = dir.join("memory");
+    let memory = match base {
+        Some(base) => {
+            clone_file(base, &memory_path)?;
+            OpenOptions::new().write(true).open(&memory_path)?
+        }
+        None => {
+            let memory = create_private(&memory_path)?;
+            memory.set_len(info.memory_bytes)?;
+            memory
+        }
+    };
+    let state = create_private(&dir.join("state"))?;
+    // The jail has no /proc. The VMM reads its page flags through this.
+    let pagemap = open(Path::new(&format!("/proc/{}/pagemap", vmm.pid)))?;
+    vmm.configure(
+        &Request::Snapshot { resume: false },
+        &[memory.as_raw_fd(), state.as_raw_fd(), pagemap.as_raw_fd()],
+    )
+    .context("snapshot failed")?;
+    // The VM is paused, so the disk is as the saved guest left it.
+    clone_file(disk, &dir.join("disk"))?;
+    serde_json::to_writer(create_private(&dir.join(SNAPSHOT_INFO))?, info)?;
+    Ok(())
+}
+
+fn restore(args: RestoreArgs) -> Result<i32> {
+    let started = Instant::now();
+    let host = Host::open(&args.common)?;
+    let info: SnapshotInfo = serde_json::from_reader(open(&args.from.join(SNAPSHOT_INFO))?)
+        .context("reading the snapshot")?;
+    let identity = Identity {
+        token: unhex(&info.token)?,
+        instance: unhex(&info.instance)?,
+    };
+    clone_file(&args.from.join("disk"), &args.disk)?;
+    let disk = OpenOptions::new().read(true).write(true).open(&args.disk)?;
+    let memory = open(&args.from.join("memory"))?;
+    let state = open(&args.from.join("state"))?;
+    let cloned = started.elapsed();
+
+    let dir = RunDir::create(args.common.slot)?;
+    let vsock_listener = UnixListener::bind(dir.vsock())?;
+    let mut sandbox = host.sandbox(&args.common, info.memory_bytes, info.cpus)?;
+    let network = match &info.network {
+        Some(saved) => {
+            let netd = host.spawn_netd(&args.common, &dir, &mut sandbox)?;
+            let saved_session = (saved.session.clone(), unhex(&saved.mac)?);
+            Some(start_network(
+                &saved.policy,
+                &args.ca_bundle,
+                netd,
+                Some(saved_session),
+            )?)
+        }
+        None => None,
+    };
+    let vmm = host.spawn_vmm(&args.common, &dir, &mut sandbox)?;
+    let spawned = started.elapsed();
+
+    let config = VmmConfig {
+        cpus: info.cpus,
+        memory_bytes: info.memory_bytes,
+        boot: Boot::Snapshot,
+        disk: Some(Disk { read_only: false }),
+        serial: true,
+        network_mac: network.as_ref().map(|network| network.mac),
+        vsock_connections: VSOCK_CONNECTIONS,
+        balloon: true,
+    };
+    let mut fds = vec![
+        host.kvm.as_raw_fd(),
+        disk.as_raw_fd(),
+        host.serial.as_raw_fd(),
+    ];
+    if let Some(network) = &network {
+        fds.push(network.vm_end.as_raw_fd());
+    }
+    fds.extend([
+        vsock_listener.as_raw_fd(),
+        memory.as_raw_fd(),
+        state.as_raw_fd(),
+    ]);
+    vmm.configure(&Request::Configure(config), &fds)
+        .context("shuru-vmm failed")?;
+    drop((host, disk, vsock_listener, memory, state));
+    let ready = started.elapsed();
+
+    let mut guest = connect_guest(&dir.vsock(), &identity, &vmm)?;
+    let answered = started.elapsed();
+    let identity = rotate(&mut guest)?;
+    let rotated = started.elapsed();
+    let env = network
+        .as_ref()
+        .map(|network| network.session.placeholders.clone())
+        .unwrap_or_default();
+    let code = exec(guest, args.command, env)?;
+    let done = started.elapsed();
+    let mut times = vec![
+        ("disk cloned", cloned),
+        ("jailed", spawned),
+        ("VM restored", ready),
+        ("guest answered", answered),
+        ("identity rotated", rotated),
+        ("done", done),
+    ];
+    if let Some(to) = &args.snapshot_to {
+        let info = SnapshotInfo {
+            token: hex(&identity.token),
+            instance: hex(&identity.instance),
+            ..info
+        };
+        let base = args.from.join("memory");
+        save_snapshot(&vmm, to, &args.disk, &info, Some(&base))?;
+        times.push(("snapshot", started.elapsed() - done));
+    }
+    if args.common.time {
+        print_times(&sandbox, &times);
+    }
+    vmm.stop();
+    if let Some(network) = network {
+        network.netd.stop();
+    }
+    Ok(code)
+}
+
+fn new_identity() -> Result<Identity> {
+    let mut identity = Identity {
+        token: [0; 32],
+        instance: [0; 16],
+    };
+    getrandom::fill(&mut identity.token).map_err(|e| anyhow::anyhow!("{e}"))?;
+    getrandom::fill(&mut identity.instance).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(identity)
+}
+
+/// Gives a restored guest an identity no other restore of the snapshot
+/// has, the current time and fresh seed material for its RNG. Until this
+/// answers, anyone holding the snapshot could reach the guest.
+fn rotate(guest: &mut UnixStream) -> Result<Identity> {
+    let mut restore = Restore {
+        identity: new_identity()?,
+        realtime_ns: 0,
+        seed: [0; 32],
+    };
+    getrandom::fill(&mut restore.seed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    restore.realtime_ns = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos()
+        .try_into()?;
+    guest.set_read_timeout(Some(Duration::from_secs(2)))?;
+    frame::write_frame(guest, frame::RESTORE_REQ, &restore.encode())?;
+    match frame::read_frame(guest) {
+        Ok(Some((frame::RESTORE_RESP, _))) => {}
+        Ok(Some((frame::ERROR, payload))) => {
+            bail!(
+                "the guest refused the restore: {}",
+                String::from_utf8_lossy(&payload)
+            )
+        }
+        Ok(Some((kind, _))) => bail!("the guest answered the restore with frame {kind:#x}"),
+        Ok(None) => bail!("the guest closed the connection"),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            bail!("the guest agent predates restore support")
+        }
+        Err(e) => return Err(e).context("reading the restore answer"),
+    }
+    guest.set_read_timeout(None)?;
+    Ok(restore.identity)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex<const N: usize>(text: &str) -> Result<[u8; N]> {
+    let mut bytes = [0; N];
+    if text.len() != 2 * N || !text.is_ascii() {
+        bail!("bad hex in the snapshot");
+    }
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16)?;
+    }
+    Ok(bytes)
 }
 
 /// Connects to the guest agent through the VMM listener, retrying until

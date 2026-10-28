@@ -44,6 +44,35 @@ pub struct ProxyHandle {
     pub placeholders: HashMap<String, String>,
     /// CA certificate in PEM format (for injecting into guest trust store).
     pub ca_cert_pem: Vec<u8>,
+    ca_key_pem: String,
+}
+
+/// What a guest keeps from the proxy that served it: the CA it trusts and
+/// the placeholders in its environment. A restored guest gets a proxy
+/// started from the session of the one it was saved with.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Session {
+    pub ca_cert_pem: String,
+    pub ca_key_pem: String,
+    pub placeholders: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("secrets", &self.placeholders.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProxyHandle {
+    pub fn session(&self) -> Session {
+        Session {
+            ca_cert_pem: String::from_utf8_lossy(&self.ca_cert_pem).into_owned(),
+            ca_key_pem: self.ca_key_pem.clone(),
+            placeholders: self.placeholders.clone(),
+        }
+    }
 }
 
 /// Generate a unique placeholder token for a secret.
@@ -129,18 +158,43 @@ fn set_sockbuf(fd: RawFd, opt: libc::c_int, want: libc::c_int) -> libc::c_int {
 /// - `host_fd`: the host end of the socketpair (raw L2 Ethernet frames)
 /// - `config`: proxy configuration (secrets, network rules)
 pub fn start(host_fd: RawFd, config: ProxyConfig) -> anyhow::Result<ProxyHandle> {
+    start_session(host_fd, config, None)
+}
+
+/// `start`, carrying on `session` when given. Its placeholders must cover
+/// the configured secrets exactly.
+pub fn start_session(
+    host_fd: RawFd,
+    config: ProxyConfig,
+    session: Option<Session>,
+) -> anyhow::Result<ProxyHandle> {
     // Install rustls crypto provider (process-wide, idempotent)
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let ca = CertificateAuthority::new()?;
+    let (ca, placeholders) = match session {
+        Some(session) => {
+            let mut names: Vec<_> = session.placeholders.keys().collect();
+            let mut secrets: Vec<_> = config.secrets.keys().collect();
+            names.sort();
+            secrets.sort();
+            if names != secrets {
+                anyhow::bail!("the secrets differ from the ones the session was started with");
+            }
+            let ca = CertificateAuthority::from_pem(&session.ca_cert_pem, &session.ca_key_pem)?;
+            (ca, session.placeholders)
+        }
+        None => {
+            let placeholders = config
+                .secrets
+                .keys()
+                .map(|name| (name.clone(), generate_placeholder()))
+                .collect();
+            (CertificateAuthority::new()?, placeholders)
+        }
+    };
     let upstream_ssl = proxy::upstream_connector(&config)?;
     let ca_cert_pem = ca.ca_cert_pem();
-
-    // Generate placeholder tokens for each secret
-    let mut placeholders = HashMap::new();
-    for name in config.secrets.keys() {
-        placeholders.insert(name.clone(), generate_placeholder());
-    }
+    let ca_key_pem = ca.ca_key_pem();
 
     let allowed_ips: AllowedIps = Arc::new(RwLock::new(LruCache::new(
         NonZeroUsize::new(ALLOWED_IPS_CAPACITY).expect("non-zero capacity"),
@@ -189,5 +243,6 @@ pub fn start(host_fd: RawFd, config: ProxyConfig) -> anyhow::Result<ProxyHandle>
         _runtime_thread: runtime_thread,
         placeholders,
         ca_cert_pem,
+        ca_key_pem,
     })
 }

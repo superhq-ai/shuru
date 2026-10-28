@@ -10,12 +10,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
+use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::devices::{
     Interrupt, VirtioBackend, VirtioQueueState, INTERRUPT_USED, VIRTIO_F_VERSION_1,
 };
+use super::snapshot::{self, BackendState};
 pub use connection::MAX_CONNECTIONS;
 use connection::{
     readv, sendv, Header, Mux, Opener, Payload, RxBuffers, GUEST_CID, HEADER_LEN, MAX_PACKET,
@@ -29,6 +30,7 @@ const IOV_MAX: usize = 1024;
 // sit above them.
 const KICK: u64 = 1 << 40;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const VIRTIO_VSOCK_EVENT_TRANSPORT_RESET: u32 = 0;
 // "CONNECT 4294967295\n" with room to spare.
 const MAX_CONNECT_LINE: usize = 32;
 // Listener clients that have not sent their CONNECT line yet. More are
@@ -269,11 +271,56 @@ impl RxBuffers for RxBatch<'_> {
 struct Transport {
     rx: Queue,
     tx: Queue,
+    event: Queue,
     mem: GuestMemoryMmap,
     interrupt: Arc<Interrupt>,
+    /// After a reset event, the event avail index that says the guest has
+    /// handled it: the guest posts the buffer again once its connections
+    /// are gone. A connect before then could be reset with them.
+    resetting: Option<u16>,
 }
 
 impl Transport {
+    /// Tells the guest every connection it had is gone, which is the case
+    /// for a restored guest. Its listeners stay.
+    fn reset_guest(&mut self) -> io::Result<()> {
+        let Transport {
+            event,
+            mem,
+            interrupt,
+            ..
+        } = self;
+        let posted = event.posted(mem)?;
+        let Some(head) = event.head(mem)? else {
+            return Err(io::Error::other("the guest posted no vsock event buffer"));
+        };
+        let descriptors = event.descriptors(mem, head, true)?;
+        let Some(&(address, len)) = descriptors.first().filter(|(_, len)| *len >= 4) else {
+            return Err(invalid_queue());
+        };
+        mem.write_obj(
+            VIRTIO_VSOCK_EVENT_TRANSPORT_RESET.to_le(),
+            GuestAddress(address),
+        )
+        .map_err(|_| invalid_queue())?;
+        event.complete(mem, head, len.min(4) as u32)?;
+        if event.wants_interrupt(mem) {
+            interrupt.raise(INTERRUPT_USED);
+        }
+        self.resetting = Some(posted.wrapping_add(1));
+        Ok(())
+    }
+
+    fn accepts_connects(&mut self) -> io::Result<bool> {
+        if let Some(handled) = self.resetting {
+            if self.event.posted(&self.mem)?.wrapping_sub(handled) >= 0x8000 {
+                return Ok(false);
+            }
+            self.resetting = None;
+        }
+        Ok(true)
+    }
+
     // One pass over both queues with guest kicks off. Returns whether there
     // is more to do right away.
     fn process(&mut self, mux: &mut Mux) -> io::Result<bool> {
@@ -282,6 +329,7 @@ impl Transport {
             tx,
             mem,
             interrupt,
+            ..
         } = self;
         tx.set_notify(mem, false)?;
         rx.set_notify(mem, false)?;
@@ -341,6 +389,8 @@ struct State {
     transport: Option<Transport>,
     mux: Mux,
     failed: bool,
+    /// Set while a snapshot is taken: the guest queues are left alone.
+    frozen: bool,
 }
 
 pub struct VsockControl {
@@ -359,6 +409,7 @@ impl VsockControl {
         state.transport = None;
         state.mux.clear();
         state.failed = false;
+        state.frozen = false;
         self.notify();
     }
 
@@ -385,7 +436,11 @@ impl VsockControl {
         let host_port;
         {
             let mut state = self.state.lock().unwrap();
-            if state.failed || state.transport.is_none() || self.stopping.load(Ordering::Acquire) {
+            let ready = match &mut state.transport {
+                Some(transport) => transport.accepts_connects().unwrap_or(false),
+                None => false,
+            };
+            if !ready || state.failed || self.stopping.load(Ordering::Acquire) {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     "vsock device is not ready",
@@ -517,6 +572,7 @@ impl VsockBackend {
                 transport: None,
                 mux: Mux::with_limit(max_connections),
                 failed: false,
+                frozen: false,
             }),
             wake,
             kicks: Mutex::new(Vec::new()),
@@ -598,6 +654,9 @@ fn run(control: Arc<VsockControl>) {
             );
         }
         busy = false;
+        if state.frozen {
+            continue;
+        }
         if let Some(mut transport) = state.transport.take() {
             match transport.process(&mut state.mux) {
                 Ok(more) => {
@@ -644,36 +703,9 @@ impl VirtioBackend for VsockBackend {
         interrupt: Arc<Interrupt>,
     ) {
         let mut state = self.control.state.lock().unwrap();
-        let queues = queues
-            .iter()
-            .map(|queue| {
-                if !queue.ready {
-                    return Err(invalid_queue());
-                }
-                Queue::new(
-                    queue.size,
-                    queue.desc_addr,
-                    queue.avail_addr,
-                    queue.used_addr,
-                    mem,
-                )
-            })
-            .collect::<io::Result<Vec<_>>>();
-        match queues {
-            Ok(mut queues) if queues.len() == 3 && !state.failed && self.negotiated => {
-                queues.pop();
-                let tx = queues.pop().unwrap();
-                let rx = queues.pop().unwrap();
-                state.transport = Some(Transport {
-                    rx,
-                    tx,
-                    mem: mem.clone(),
-                    interrupt,
-                });
-            }
-            _ => {
-                state.failed = true;
-            }
+        match self.transport(queues, mem, interrupt) {
+            Ok(transport) if !state.failed => state.transport = Some(transport),
+            _ => state.failed = true,
         }
         self.control.notify();
     }
@@ -693,6 +725,81 @@ impl VirtioBackend for VsockBackend {
     fn reset(&mut self) {
         self.negotiated = false;
         self.control.deactivate();
+    }
+
+    fn save(&mut self) -> io::Result<BackendState> {
+        let mut state = self.control.state.lock().unwrap();
+        let Some(transport) = &state.transport else {
+            return Err(io::Error::other("the vsock device is not running"));
+        };
+        let saved = BackendState::Vsock {
+            rx: transport.rx.index(),
+            tx: transport.tx.index(),
+            event: transport.event.index(),
+        };
+        state.frozen = true;
+        Ok(saved)
+    }
+
+    fn restore(
+        &mut self,
+        saved: &BackendState,
+        queues: &[VirtioQueueState],
+        mem: &GuestMemoryMmap,
+        interrupt: Arc<Interrupt>,
+    ) -> io::Result<()> {
+        let &BackendState::Vsock { rx, tx, event } = saved else {
+            return Err(snapshot::mismatch());
+        };
+        let mut transport = self.transport(queues, mem, interrupt)?;
+        transport.rx = transport.rx.starting_at(rx);
+        transport.tx = transport.tx.starting_at(tx);
+        transport.event = transport.event.starting_at(event);
+        transport.reset_guest()?;
+        self.control.state.lock().unwrap().transport = Some(transport);
+        self.control.notify();
+        Ok(())
+    }
+
+    fn resume(&mut self) {
+        self.control.state.lock().unwrap().frozen = false;
+        self.control.notify();
+    }
+}
+
+impl VsockBackend {
+    fn transport(
+        &self,
+        queues: &[VirtioQueueState],
+        mem: &GuestMemoryMmap,
+        interrupt: Arc<Interrupt>,
+    ) -> io::Result<Transport> {
+        if !self.negotiated {
+            return Err(invalid_queue());
+        }
+        let [rx, tx, event] = queues else {
+            return Err(invalid_queue());
+        };
+        let queue = |queue: &VirtioQueueState| {
+            if !queue.ready {
+                return Err(invalid_queue());
+            }
+            Queue::new(
+                queue.size,
+                queue.desc_addr,
+                queue.avail_addr,
+                queue.used_addr,
+                mem,
+            )
+        };
+        Ok(Transport {
+            rx: queue(rx)?,
+            tx: queue(tx)?,
+            event: queue(event)?,
+            mem: mem.clone(),
+            interrupt,
+            resetting: None,
+        })
     }
 }
 
@@ -715,7 +822,6 @@ impl Drop for VsockBackend {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use vm_memory::Bytes;
 
     fn memory() -> GuestMemoryMmap {
         GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1024 * 1024)]).unwrap()

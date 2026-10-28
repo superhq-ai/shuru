@@ -1,6 +1,25 @@
 use std::io;
+#[cfg(target_os = "linux")]
+use std::sync::RwLock;
 
 use shuru_proto::hello::Identity;
+
+// Set from the kernel command line at boot and replaced after a restore.
+#[cfg(target_os = "linux")]
+static CURRENT: RwLock<Identity> = RwLock::new(Identity {
+    token: [0; 32],
+    instance: [0; 16],
+});
+
+#[cfg(target_os = "linux")]
+pub fn current() -> Identity {
+    *CURRENT.read().unwrap()
+}
+
+#[cfg(target_os = "linux")]
+pub fn set(identity: Identity) {
+    *CURRENT.write().unwrap() = identity;
+}
 
 fn invalid() -> io::Error {
     io::Error::new(

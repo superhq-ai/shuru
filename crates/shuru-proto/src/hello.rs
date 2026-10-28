@@ -53,6 +53,42 @@ impl Identity {
     }
 }
 
+/// What the host sends a restored guest on its first connection. Every
+/// restore of one snapshot starts with the same memory, so the guest takes
+/// a new identity, the host wall clock and fresh seed material for its RNG.
+#[derive(Clone, Copy)]
+pub struct Restore {
+    pub identity: Identity,
+    /// Nanoseconds since the Unix epoch.
+    pub realtime_ns: i64,
+    pub seed: [u8; 32],
+}
+
+impl Restore {
+    pub const LEN: usize = 32 + 16 + 8 + 32;
+
+    pub fn encode(&self) -> [u8; Self::LEN] {
+        let mut out = [0; Self::LEN];
+        out[..32].copy_from_slice(&self.identity.token);
+        out[32..48].copy_from_slice(&self.identity.instance);
+        out[48..56].copy_from_slice(&self.realtime_ns.to_le_bytes());
+        out[56..].copy_from_slice(&self.seed);
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        let payload: &[u8; Self::LEN] = payload.try_into().ok()?;
+        Some(Restore {
+            identity: Identity {
+                token: payload[..32].try_into().unwrap(),
+                instance: payload[32..48].try_into().unwrap(),
+            },
+            realtime_ns: i64::from_le_bytes(payload[48..56].try_into().unwrap()),
+            seed: payload[56..].try_into().unwrap(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +181,20 @@ mod tests {
         assert!(ID
             .connect(&mut stream(frame::STDOUT, &ID.instance))
             .is_err());
+    }
+
+    #[test]
+    fn restore_roundtrip() {
+        let restore = Restore {
+            identity: ID,
+            realtime_ns: -5,
+            seed: [9; 32],
+        };
+        assert_eq!(
+            Restore::decode(&restore.encode()).map(|r| r.encode()),
+            Some(restore.encode())
+        );
+        assert!(Restore::decode(&restore.encode()[1..]).is_none());
+        assert!(Restore::decode(&[0; Restore::LEN + 1]).is_none());
     }
 }

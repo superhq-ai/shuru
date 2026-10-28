@@ -13,7 +13,7 @@ mod disk;
 #[cfg(target_os = "linux")]
 mod guest {
     use std::io::{Read, Write};
-    use std::os::unix::io::FromRawFd;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -26,6 +26,9 @@ mod guest {
         WriteFileResponse,
     };
     use shuru_proto::{VSOCK_PORT, VSOCK_PORT_FORWARD};
+
+    // _IO('R', 0x07): reseed the kernel CRNG now rather than on its timer.
+    const RNDRESEEDCRNG: libc::Ioctl = 0x5207;
 
     /// Process groups of running execs, by the id the host started them with.
     static EXECS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, i32>>> =
@@ -402,22 +405,38 @@ mod guest {
         }
     }
 
-    fn authenticate(
-        stream: &mut std::net::TcpStream,
-        identity: &shuru_proto::hello::Identity,
-    ) -> std::io::Result<()> {
+    fn authenticate(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
         let timeout = Some(std::time::Duration::from_secs(2));
         stream.set_read_timeout(timeout)?;
         stream.set_write_timeout(timeout)?;
-        identity.accept(stream)?;
+        crate::identity::current().accept(stream)?;
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(None)
     }
 
-    fn handle_connection(fd: i32, identity: shuru_proto::hello::Identity) {
+    /// Sets the wall clock and reseeds the RNG, then takes the new identity.
+    fn restore(restore: &shuru_proto::hello::Restore) -> std::io::Result<()> {
+        let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+        now.tv_sec = restore.realtime_ns.div_euclid(1_000_000_000) as _;
+        now.tv_nsec = restore.realtime_ns.rem_euclid(1_000_000_000) as _;
+        if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &now) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut random = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/urandom")?;
+        random.write_all(&restore.seed)?;
+        if unsafe { libc::ioctl(random.as_raw_fd(), RNDRESEEDCRNG) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        crate::identity::set(restore.identity);
+        Ok(())
+    }
+
+    fn handle_connection(fd: i32) {
         // SAFETY: fd is a valid socket from accept()
         let mut stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-        if authenticate(&mut stream, &identity).is_err() {
+        if authenticate(&mut stream).is_err() {
             return;
         }
         let _ = stream.set_nodelay(true);
@@ -666,6 +685,17 @@ mod guest {
                             );
                         }
                     }
+                }
+                frame::RESTORE_REQ => {
+                    let result = shuru_proto::hello::Restore::decode(&payload)
+                        .ok_or_else(|| std::io::Error::other("invalid restore request"))
+                        .and_then(|r| restore(&r));
+                    let _ = match result {
+                        Ok(()) => frame::write_frame(&mut writer, frame::RESTORE_RESP, &[]),
+                        Err(e) => {
+                            frame::write_frame(&mut writer, frame::ERROR, e.to_string().as_bytes())
+                        }
+                    };
                 }
                 _ => {} // unknown type, skip
             }
@@ -1726,7 +1756,7 @@ mod guest {
         write_frame_fd(vsock_fd, frame::EXIT, &frame::exit_payload(exit_code));
     }
 
-    fn forward_accept_loop(listener_fd: i32, identity: shuru_proto::hello::Identity) {
+    fn forward_accept_loop(listener_fd: i32) {
         loop {
             let client_fd =
                 unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
@@ -1736,14 +1766,14 @@ mod guest {
             }
 
             std::thread::spawn(move || {
-                handle_forward_connection(client_fd, identity);
+                handle_forward_connection(client_fd);
             });
         }
     }
 
-    fn handle_forward_connection(fd: i32, identity: shuru_proto::hello::Identity) {
+    fn handle_forward_connection(fd: i32) {
         let mut stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-        if authenticate(&mut stream, &identity).is_err() {
+        if authenticate(&mut stream).is_err() {
             return;
         }
         let _ = stream.set_nodelay(true);
@@ -1855,12 +1885,13 @@ mod guest {
         ensure_stdio();
         stage("filesystems mounted");
 
-        let identity = std::fs::read_to_string("/proc/cmdline")
+        let boot_identity = std::fs::read_to_string("/proc/cmdline")
             .and_then(|cmdline| crate::identity::parse(&cmdline))
             .unwrap_or_else(|_| {
                 eprintln!("shuru-guest: missing or invalid guest identity");
                 std::process::exit(1);
             });
+        crate::identity::set(boot_identity);
 
         // Set hostname
         let hostname = b"shuru\0";
@@ -1901,7 +1932,7 @@ mod guest {
             VSOCK_PORT_FORWARD
         ));
         std::thread::spawn(move || {
-            forward_accept_loop(fwd_listener_fd, identity);
+            forward_accept_loop(fwd_listener_fd);
         });
 
         loop {
@@ -1916,7 +1947,7 @@ mod guest {
             eprintln!("shuru-guest: accepted vsock connection");
 
             std::thread::spawn(move || {
-                handle_connection(client_fd, identity);
+                handle_connection(client_fd);
             });
 
             reap_zombies();

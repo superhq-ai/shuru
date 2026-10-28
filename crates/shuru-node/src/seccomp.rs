@@ -13,18 +13,37 @@ use seccompiler::{
 
 const KVMIO: u64 = 0xae;
 const IOC_WRITE: u64 = 1;
+const IOC_READ: u64 = 2;
 
 const fn io(nr: u64) -> u64 {
     (KVMIO << 8) | nr
 }
 
+const fn ioc(dir: u64, nr: u64, size: usize) -> u64 {
+    (dir << 30) | ((size as u64) << 16) | (KVMIO << 8) | nr
+}
+
 const fn iow(nr: u64, size: usize) -> u64 {
-    (IOC_WRITE << 30) | ((size as u64) << 16) | (KVMIO << 8) | nr
+    ioc(IOC_WRITE, nr, size)
+}
+
+const fn ior(nr: u64, size: usize) -> u64 {
+    ioc(IOC_READ, nr, size)
 }
 
 const KVM_RUN: u64 = io(0x80);
 const KVM_IRQ_LINE: u64 = iow(0x61, size_of::<kvm_bindings::kvm_irq_level>());
 const KVM_IOEVENTFD: u64 = iow(0x79, size_of::<kvm_bindings::kvm_ioeventfd>());
+// Reading the vCPUs and the GIC for a snapshot.
+const KVM_GET_ONE_REG: u64 = iow(0xab, size_of::<kvm_bindings::kvm_one_reg>());
+const KVM_GET_REG_LIST: u64 = ioc(
+    IOC_READ | IOC_WRITE,
+    0xb0,
+    size_of::<kvm_bindings::kvm_reg_list>(),
+);
+const KVM_GET_MP_STATE: u64 = ior(0x98, size_of::<kvm_bindings::kvm_mp_state>());
+const KVM_GET_VCPU_EVENTS: u64 = ior(0x9f, size_of::<kvm_bindings::kvm_vcpu_events>());
+const KVM_GET_DEVICE_ATTR: u64 = iow(0xe2, size_of::<kvm_bindings::kvm_device_attr>());
 // An unsigned long in glibc, an int in musl.
 #[allow(clippy::unnecessary_cast)]
 const FIONBIO: u64 = libc::FIONBIO as u64;
@@ -111,10 +130,20 @@ fn vmm_allowlist(mismatch: SeccompAction) -> Result<BpfProgram> {
         ALLOWED.iter().map(|&call| (call, Vec::new())).collect();
     rules.insert(
         libc::SYS_ioctl,
-        [KVM_RUN, KVM_IRQ_LINE, KVM_IOEVENTFD, FIONBIO]
-            .into_iter()
-            .map(|request| equals(1, request))
-            .collect::<Result<_>>()?,
+        [
+            KVM_RUN,
+            KVM_IRQ_LINE,
+            KVM_IOEVENTFD,
+            KVM_GET_ONE_REG,
+            KVM_GET_REG_LIST,
+            KVM_GET_MP_STATE,
+            KVM_GET_VCPU_EVENTS,
+            KVM_GET_DEVICE_ATTR,
+            FIONBIO,
+        ]
+        .into_iter()
+        .map(|request| equals(1, request))
+        .collect::<Result<_>>()?,
     );
     rules.insert(libc::SYS_mmap, vec![not_executable(2)?]);
     rules.insert(libc::SYS_mprotect, vec![not_executable(2)?]);
@@ -272,6 +301,11 @@ mod tests {
         assert_eq!(KVM_RUN, 0xae80);
         assert_eq!(KVM_IRQ_LINE, 0x4008_ae61);
         assert_eq!(KVM_IOEVENTFD, 0x4040_ae79);
+        assert_eq!(KVM_GET_ONE_REG, 0x4010_aeab);
+        assert_eq!(KVM_GET_REG_LIST, 0xc008_aeb0);
+        assert_eq!(KVM_GET_MP_STATE, 0x8004_ae98);
+        assert_eq!(KVM_GET_VCPU_EVENTS, 0x8040_ae9f);
+        assert_eq!(KVM_GET_DEVICE_ATTR, 0x4018_aee2);
     }
 
     #[test]

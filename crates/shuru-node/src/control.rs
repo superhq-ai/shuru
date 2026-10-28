@@ -14,21 +14,33 @@ use serde::{Deserialize, Serialize};
 // Room for a system CA bundle.
 pub const MAX_MESSAGE: usize = 1 << 20;
 pub const MAX_FDS: usize = 8;
+pub const SNAPSHOT_FDS: usize = 3;
 
 /// The VM to build. Descriptors follow in this order, each optional one
 /// present only when its field says so: `/dev/kvm`, kernel, initrd, disk,
-/// serial output, network socket, vsock listener.
+/// serial output, network socket, vsock listener, saved memory, saved
+/// state.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VmmConfig {
     pub cpus: usize,
     pub memory_bytes: u64,
-    pub command_line: String,
-    pub initrd: bool,
+    pub boot: Boot,
     pub disk: Option<Disk>,
     pub serial: bool,
     pub network_mac: Option<[u8; 6]>,
     pub vsock_connections: usize,
     pub balloon: bool,
+}
+
+/// What the guest starts from.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Boot {
+    /// The kernel, and the initrd when `initrd` says so.
+    Kernel { command_line: String, initrd: bool },
+    /// The memory and state a `Snapshot` request saved. The devices must
+    /// be the ones it was taken with.
+    Snapshot,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -38,7 +50,11 @@ pub struct Disk {
 
 impl VmmConfig {
     pub fn fd_count(&self) -> usize {
-        3 + self.initrd as usize
+        let image = match self.boot {
+            Boot::Kernel { initrd, .. } => 1 + initrd as usize,
+            Boot::Snapshot => 2,
+        };
+        2 + image
             + self.disk.is_some() as usize
             + self.serial as usize
             + self.network_mac.is_some() as usize
@@ -56,6 +72,9 @@ pub struct NetdConfig {
     pub secrets: HashMap<String, Secret>,
     /// PEM roots for checking upstream servers when relaying secrets.
     pub upstream_roots: String,
+    /// The proxy session a restored guest was saved with.
+    #[serde(default)]
+    pub session: Option<shuru_proxy::Session>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -70,8 +89,17 @@ pub enum Request {
     Configure(VmmConfig),
     ConfigureNetwork(NetdConfig),
     Stop,
-    SetMemoryTarget { bytes: u64 },
+    SetMemoryTarget {
+        bytes: u64,
+    },
     Stats,
+    /// Pause the VM and save it. Three descriptors follow: the memory file,
+    /// the state file and the /proc pagemap of the VMM. The memory file is
+    /// empty and as long as guest memory, or for a restored VM a copy of
+    /// the one it was restored from. Without `resume` the VM stays paused.
+    Snapshot {
+        resume: bool,
+    },
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -82,11 +110,10 @@ pub enum Response {
         running: bool,
         ballooned_bytes: u64,
     },
-    /// The guest sees `placeholders` in place of secret values, and trusts
-    /// `ca_cert_pem` for the hosts they are relayed to.
+    /// The guest sees the session placeholders in place of secret values,
+    /// and trusts its CA for the hosts they are relayed to.
     Network {
-        placeholders: HashMap<String, String>,
-        ca_cert_pem: String,
+        session: shuru_proxy::Session,
     },
     Error {
         message: String,
@@ -238,8 +265,10 @@ mod tests {
         let config = VmmConfig {
             cpus: 2,
             memory_bytes: 1 << 30,
-            command_line: "quiet".into(),
-            initrd: false,
+            boot: Boot::Kernel {
+                command_line: "quiet".into(),
+                initrd: false,
+            },
             disk: None,
             serial: false,
             network_mac: None,
