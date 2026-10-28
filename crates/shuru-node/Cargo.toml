@@ -1,0 +1,24 @@
+[package]
+name = "shuru-node"
+version = "0.1.0"
+edition = "2021"
+description = "Runs shuru VMs on a Linux node, one jailed VMM per sandbox"
+license = "Apache-2.0"
+repository = "https://github.com/superhq-ai/shuru"
+publish = false
+
+[[bin]]
+name = "shuru-node"
+path = "src/main.rs"
+
+[dependencies]
+shuru-linux = { path = "../shuru-linux" }
+shuru-proto = { path = "../shuru-proto" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.3"
+kvm-bindings = "0.9"
+libc = "0.2"
+seccompiler = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
