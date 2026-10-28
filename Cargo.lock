@@ -1714,6 +1714,7 @@ dependencies = [
  "serde_json",
  "shuru-linux",
  "shuru-proto",
+ "shuru-proxy",
 ]
 
 [[package]]

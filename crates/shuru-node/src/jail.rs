@@ -1,6 +1,7 @@
 //! Starts a process in the jail RFC 0008 describes: its own mount, pid,
-//! network, ipc, uts and cgroup namespaces, an empty read-only root, no
-//! capabilities, an unprivileged uid and only the descriptors it is given.
+//! ipc, uts and cgroup namespaces, a network namespace unless it is the
+//! egress path, an empty read-only root, no capabilities, an unprivileged
+//! uid and only the descriptors it is given.
 
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -17,6 +18,8 @@ pub struct Jail<'a> {
     pub root: &'a CStr,
     pub nofile: u64,
     pub nproc: u64,
+    /// Keep the host network namespace.
+    pub host_network: bool,
 }
 
 /// What the child inherits: fd 3 is `keep`, 0 and 1 are `null`, 2 is
@@ -58,12 +61,14 @@ pub fn spawn(jail: &Jail, binary: &File, argv: &[&CStr], handoff: &Handoff) -> i
     let (mut report_read, report_write) =
         unsafe { (File::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
 
-    let flags = libc::CLONE_NEWNS
+    let mut flags = libc::CLONE_NEWNS
         | libc::CLONE_NEWPID
-        | libc::CLONE_NEWNET
         | libc::CLONE_NEWIPC
         | libc::CLONE_NEWUTS
         | libc::SIGCHLD;
+    if !jail.host_network {
+        flags |= libc::CLONE_NEWNET;
+    }
     // Without a stack the child runs on a copy of ours, like fork.
     let pid = unsafe { libc::syscall(libc::SYS_clone, flags as libc::c_ulong, 0, 0, 0, 0) };
     if pid < 0 {

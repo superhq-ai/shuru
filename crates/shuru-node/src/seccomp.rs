@@ -1,5 +1,7 @@
-//! The VMM syscall allowlist. Installed on every thread once the VM is
-//! built, before the first `KVM_RUN`.
+//! Seccomp filters. The VMM gets an allowlist, installed on every thread
+//! once the VM is built and before the first `KVM_RUN`. The network
+//! process runs tokio and two TLS libraries, so it gets a deny list: no
+//! exec, no files, no tracing, no namespaces, IP sockets only.
 
 use std::collections::BTreeMap;
 
@@ -26,6 +28,11 @@ const KVM_IOEVENTFD: u64 = iow(0x79, size_of::<kvm_bindings::kvm_ioeventfd>());
 // An unsigned long in glibc, an int in musl.
 #[allow(clippy::unnecessary_cast)]
 const FIONBIO: u64 = libc::FIONBIO as u64;
+#[cfg(not(all(target_env = "musl", target_arch = "aarch64")))]
+const SYS_KEXEC_FILE_LOAD: libc::c_long = libc::SYS_kexec_file_load;
+// The libc crate leaves it out for musl on aarch64.
+#[cfg(all(target_env = "musl", target_arch = "aarch64"))]
+const SYS_KEXEC_FILE_LOAD: libc::c_long = 294;
 
 const ALLOWED: &[libc::c_long] = &[
     libc::SYS_accept4,
@@ -50,6 +57,8 @@ const ALLOWED: &[libc::c_long] = &[
     libc::SYS_mremap,
     libc::SYS_munmap,
     libc::SYS_nanosleep,
+    // Answered with an error by the refusals filter.
+    libc::SYS_openat,
     libc::SYS_ppoll,
     libc::SYS_pread64,
     libc::SYS_pwrite64,
@@ -88,7 +97,16 @@ fn not_executable(arg: u8) -> Result<SeccompRule> {
     rule(vec![Cond::new(arg, Len::Dword, Op::MaskedEq(exec), 0)?])
 }
 
-fn allowlist(mismatch: SeccompAction) -> Result<BpfProgram> {
+fn filter(
+    rules: BTreeMap<i64, Vec<SeccompRule>>,
+    mismatch: SeccompAction,
+    matched: SeccompAction,
+) -> Result<BpfProgram> {
+    let filter = SeccompFilter::new(rules, mismatch, matched, std::env::consts::ARCH.try_into()?)?;
+    Ok(filter.try_into()?)
+}
+
+fn vmm_allowlist(mismatch: SeccompAction) -> Result<BpfProgram> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
         ALLOWED.iter().map(|&call| (call, Vec::new())).collect();
     rules.insert(
@@ -115,39 +133,134 @@ fn allowlist(mismatch: SeccompAction) -> Result<BpfProgram> {
         )?])?],
     );
     rules.insert(libc::SYS_prctl, vec![equals(0, libc::PR_SET_NAME as u64)?]);
-    let filter = SeccompFilter::new(
-        rules,
-        mismatch,
-        SeccompAction::Allow,
-        std::env::consts::ARCH.try_into()?,
-    )?;
-    Ok(filter.try_into()?)
+    filter(rules, mismatch, SeccompAction::Allow)
 }
 
 // clone3 takes its flags in memory a filter cannot read. Refusing it makes
-// the C library fall back to clone, whose flags the allowlist checks.
+// the C library fall back to clone, whose flags a filter can check.
 fn refuse_clone3() -> Result<BpfProgram> {
     let rules = BTreeMap::from([(libc::SYS_clone3, Vec::new())]);
-    let filter = SeccompFilter::new(
+    filter(
         rules,
         SeccompAction::Allow,
         SeccompAction::Errno(libc::ENOSYS as u32),
-        std::env::consts::ARCH.try_into()?,
-    )?;
-    Ok(filter.try_into()?)
+    )
 }
 
-/// With `log`, calls outside the list are logged by the kernel and allowed,
-/// to find what a change needs.
-pub fn install(log: bool) -> Result<()> {
-    let mismatch = if log {
+const NETD_DENIED: &[libc::c_long] = &[
+    libc::SYS_acct,
+    libc::SYS_add_key,
+    libc::SYS_bpf,
+    libc::SYS_capset,
+    libc::SYS_chroot,
+    libc::SYS_delete_module,
+    libc::SYS_execve,
+    libc::SYS_execveat,
+    libc::SYS_fanotify_init,
+    libc::SYS_finit_module,
+    libc::SYS_init_module,
+    libc::SYS_io_uring_enter,
+    libc::SYS_io_uring_register,
+    libc::SYS_io_uring_setup,
+    SYS_KEXEC_FILE_LOAD,
+    libc::SYS_kexec_load,
+    libc::SYS_keyctl,
+    libc::SYS_mount,
+    libc::SYS_name_to_handle_at,
+    libc::SYS_open_by_handle_at,
+    libc::SYS_perf_event_open,
+    libc::SYS_personality,
+    libc::SYS_pivot_root,
+    libc::SYS_process_vm_readv,
+    libc::SYS_process_vm_writev,
+    libc::SYS_ptrace,
+    libc::SYS_quotactl,
+    libc::SYS_reboot,
+    libc::SYS_request_key,
+    libc::SYS_setgid,
+    libc::SYS_setgroups,
+    libc::SYS_setns,
+    libc::SYS_setregid,
+    libc::SYS_setresgid,
+    libc::SYS_setresuid,
+    libc::SYS_setreuid,
+    libc::SYS_setuid,
+    libc::SYS_swapoff,
+    libc::SYS_swapon,
+    libc::SYS_umount2,
+    libc::SYS_unshare,
+    libc::SYS_userfaultfd,
+];
+
+fn netd_kills(matched: SeccompAction) -> Result<BpfProgram> {
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
+        NETD_DENIED.iter().map(|&call| (call, Vec::new())).collect();
+    let new_user = libc::CLONE_NEWUSER as u64;
+    rules.insert(
+        libc::SYS_clone,
+        vec![rule(vec![Cond::new(
+            0,
+            Len::Qword,
+            Op::MaskedEq(new_user),
+            new_user,
+        )?])?],
+    );
+    filter(rules, SeccompAction::Allow, matched)
+}
+
+// The roots are empty, so opening fails anyway. glibc opens files on its
+// own, such as the CPU count when malloc adds an arena, and gets an error
+// here instead of a kill.
+fn refusals(mut rules: BTreeMap<i64, Vec<SeccompRule>>) -> Result<BpfProgram> {
+    for call in [libc::SYS_openat, libc::SYS_openat2] {
+        rules.insert(call, Vec::new());
+    }
+    filter(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+    )
+}
+
+fn netd_refusals() -> Result<BpfProgram> {
+    let ip_only = rule(vec![
+        Cond::new(0, Len::Dword, Op::Ne, libc::AF_INET as u64)?,
+        Cond::new(0, Len::Dword, Op::Ne, libc::AF_INET6 as u64)?,
+    ])?;
+    refusals(BTreeMap::from([(libc::SYS_socket, vec![ip_only])]))
+}
+
+fn violation(log: bool) -> SeccompAction {
+    if log {
         SeccompAction::Log
     } else {
         SeccompAction::KillProcess
-    };
-    apply_filter_all_threads(&refuse_clone3()?).context("installing the clone3 filter")?;
-    apply_filter_all_threads(&allowlist(mismatch)?).context("installing the allowlist")?;
+    }
+}
+
+fn apply(programs: &[BpfProgram]) -> Result<()> {
+    for program in programs {
+        apply_filter_all_threads(program).context("installing a seccomp filter")?;
+    }
     Ok(())
+}
+
+/// With `log`, violations are logged by the kernel and allowed, to find
+/// what a change needs.
+pub fn install_vmm(log: bool) -> Result<()> {
+    apply(&[
+        refuse_clone3()?,
+        refusals(BTreeMap::new())?,
+        vmm_allowlist(violation(log))?,
+    ])
+}
+
+pub fn install_netd(log: bool) -> Result<()> {
+    apply(&[
+        refuse_clone3()?,
+        netd_refusals()?,
+        netd_kills(violation(log))?,
+    ])
 }
 
 #[cfg(test)]
@@ -162,8 +275,11 @@ mod tests {
     }
 
     #[test]
-    fn both_filters_compile() {
-        allowlist(SeccompAction::KillProcess).unwrap();
+    fn filters_compile() {
+        vmm_allowlist(SeccompAction::KillProcess).unwrap();
         refuse_clone3().unwrap();
+        refusals(BTreeMap::new()).unwrap();
+        netd_refusals().unwrap();
+        netd_kills(SeccompAction::KillProcess).unwrap();
     }
 }

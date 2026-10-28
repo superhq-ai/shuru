@@ -1,15 +1,18 @@
-//! The node and a VMM talk over one unix stream. A message is a u32 little
-//! endian length and a JSON body. The configuration carries the VM
-//! descriptors as SCM_RIGHTS on its first byte.
+//! The node talks to each jailed process over one unix stream. A message is
+//! a u32 little endian length and a JSON body. The configuration carries
+//! the descriptors as SCM_RIGHTS on its first byte.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const MAX_MESSAGE: usize = 64 * 1024;
+// Room for a system CA bundle.
+pub const MAX_MESSAGE: usize = 1 << 20;
 pub const MAX_FDS: usize = 8;
 
 /// The VM to build. Descriptors follow in this order, each optional one
@@ -42,10 +45,30 @@ impl VmmConfig {
     }
 }
 
+/// The network process for one sandbox. One descriptor follows: the host
+/// end of the frame socket the VM sends Ethernet on.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NetdConfig {
+    pub dns_resolver: Ipv4Addr,
+    /// Domain patterns the guest may reach. Empty allows every public
+    /// address.
+    pub allow: Vec<String>,
+    pub secrets: HashMap<String, Secret>,
+    /// PEM roots for checking upstream servers when relaying secrets.
+    pub upstream_roots: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Secret {
+    pub value: String,
+    pub hosts: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Configure(VmmConfig),
+    ConfigureNetwork(NetdConfig),
     Stop,
     SetMemoryTarget { bytes: u64 },
     Stats,
@@ -55,8 +78,19 @@ pub enum Request {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
     Ok,
-    Stats { running: bool, ballooned_bytes: u64 },
-    Error { message: String },
+    Stats {
+        running: bool,
+        ballooned_bytes: u64,
+    },
+    /// The guest sees `placeholders` in place of secret values, and trusts
+    /// `ca_cert_pem` for the hosts they are relayed to.
+    Network {
+        placeholders: HashMap<String, String>,
+        ca_cert_pem: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub fn send(stream: &UnixStream, message: &impl Serialize, fds: &[RawFd]) -> io::Result<()> {

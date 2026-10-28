@@ -2,8 +2,6 @@
 //! control socket. The first connection brings the configuration and every
 //! descriptor the VM needs; after that the VMM opens nothing.
 
-mod seccomp;
-
 use std::fs::File;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -11,6 +9,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use anyhow::{bail, Context, Result};
 use shuru_linux::{VirtualMachine, VmDescriptors, VmState};
 use shuru_node::control::{self, Request, Response, VmmConfig};
+use shuru_node::seccomp;
 
 const CONTROL_FD: i32 = 3;
 
@@ -88,7 +87,7 @@ fn start(config: VmmConfig, fds: Vec<OwnedFd>, log: bool) -> Result<VirtualMachi
         balloon: config.balloon,
     })?;
     vm.serve_vsock(vsock)?;
-    seccomp::install(log)?;
+    seccomp::install_vmm(log)?;
 
     // A guest power off ends the process whatever the node is doing.
     let states = vm.state_channel();
@@ -108,7 +107,7 @@ fn start(config: VmmConfig, fds: Vec<OwnedFd>, log: bool) -> Result<VirtualMachi
 fn serve(vm: &VirtualMachine, stream: &UnixStream) {
     while let Ok(Some((request, _))) = control::receive::<Request>(stream, 0) {
         let response = match request {
-            Request::Configure(_) => Response::Error {
+            Request::Configure(_) | Request::ConfigureNetwork(_) => Response::Error {
                 message: "already configured".into(),
             },
             // The node shuts the guest down first when it wants a clean
