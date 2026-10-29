@@ -5,7 +5,14 @@ mod identity;
 mod ext4;
 
 #[cfg(target_os = "linux")]
+mod cgroup;
+#[cfg(target_os = "linux")]
+mod children;
+#[cfg(target_os = "linux")]
 mod services;
+
+#[cfg(target_os = "linux")]
+mod sessions;
 
 #[cfg(target_os = "linux")]
 mod disk;
@@ -30,9 +37,27 @@ mod guest {
     // _IO('R', 0x07): reseed the kernel CRNG now rather than on its timer.
     const RNDRESEEDCRNG: libc::Ioctl = 0x5207;
 
-    /// Process groups of running execs, by the id the host started them with.
-    static EXECS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, i32>>> =
-        std::sync::LazyLock::new(Default::default);
+    /// Running execs, by the id the host started them with.
+    static EXECS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<Scope>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    static NEXT_EXEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    /// What a kill of an exec reaches: its cgroup, or with none the process
+    /// group of its process until that is reaped.
+    enum Scope {
+        Cgroup(crate::cgroup::Cgroup),
+        Group(crate::children::Watch),
+    }
+
+    impl Scope {
+        fn signal(&self, signal: libc::c_int) {
+            match self {
+                Scope::Cgroup(cgroup) => cgroup.signal(signal),
+                Scope::Group(leader) => crate::children::signal(*leader, true, signal),
+            }
+        }
+    }
 
     fn uptime_ms() -> f64 {
         let mut ts = libc::timespec {
@@ -145,7 +170,7 @@ mod guest {
             "cgroup2",
             "/sys/fs/cgroup",
             "cgroup2",
-            Some("nsdelegate,memory_recursiveprot"),
+            Some("nsdelegate,memory_recursiveprot,favordynmods"),
         ) {
             return;
         }
@@ -315,20 +340,9 @@ mod guest {
         std::fs::write("/etc/resolv.conf", "nameserver 10.0.0.1\n").expect("configure DNS");
     }
 
-    fn reap_zombies() {
-        loop {
-            let mut status: libc::c_int = 0;
-            let ret = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-            if ret <= 0 {
-                break;
-            }
-            crate::services::reaped(ret, status);
-        }
-    }
-
     fn create_vsock_listener(port: u32) -> i32 {
         unsafe {
-            let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+            let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
             if fd < 0 {
                 panic!(
                     "shuru-guest: failed to create vsock socket: {}",
@@ -475,8 +489,9 @@ mod guest {
                 }
                 frame::KILL_REQ => {
                     if let Ok(req) = serde_json::from_slice::<shuru_proto::KillRequest>(&payload) {
-                        if let Some(pgid) = EXECS.lock().unwrap().get(&req.id) {
-                            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                        let scope = EXECS.lock().unwrap().get(&req.id).cloned();
+                        if let Some(scope) = scope {
+                            scope.signal(libc::SIGKILL);
                         }
                     }
                     let _ = frame::write_frame(&mut writer, frame::KILL_RESP, &[]);
@@ -537,6 +552,49 @@ mod guest {
                     // Non-TTY streaming mode: takes ownership of streams
                     handle_piped_exec(&req, reader, writer);
                     return;
+                }
+                frame::SESSION_START => {
+                    let req: shuru_proto::SessionStart = match serde_json::from_slice(&payload) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let msg = format!("invalid session request: {}", e);
+                            let _ = frame::write_frame(&mut writer, frame::ERROR, msg.as_bytes());
+                            continue;
+                        }
+                    };
+                    if req.exec.argv.is_empty() {
+                        let _ = frame::write_frame(&mut writer, frame::ERROR, b"empty argv");
+                        continue;
+                    }
+                    if let Err(msg) = crate::services::wait_ready() {
+                        let _ = frame::write_frame(&mut writer, frame::ERROR, msg.as_bytes());
+                        continue;
+                    }
+                    crate::sessions::start(req, writer);
+                    return;
+                }
+                frame::SESSION_ATTACH => {
+                    match serde_json::from_slice::<shuru_proto::SessionAttach>(&payload) {
+                        Ok(req) => crate::sessions::attach(req, writer),
+                        Err(e) => {
+                            let msg = format!("invalid attach request: {}", e);
+                            let _ = frame::write_frame(&mut writer, frame::ERROR, msg.as_bytes());
+                        }
+                    }
+                    return;
+                }
+                frame::SESSION_LIST => {
+                    let list = crate::sessions::list();
+                    let _ = frame::send_json(&mut writer, frame::SESSION_LIST_RESP, &list);
+                }
+                frame::SESSION_KILL => {
+                    match serde_json::from_slice::<shuru_proto::SessionKill>(&payload) {
+                        Ok(req) => crate::sessions::kill(req, &mut writer),
+                        Err(e) => {
+                            let msg = format!("invalid kill request: {}", e);
+                            let _ = frame::write_frame(&mut writer, frame::ERROR, msg.as_bytes());
+                        }
+                    }
                 }
                 frame::WATCH_REQ => {
                     let req: WatchRequest = match serde_json::from_slice(&payload) {
@@ -1198,20 +1256,47 @@ mod guest {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        // Put the child in its own process group so we can kill the
-        // entire group (sh + any children) with a single signal.
+        let name = format!(
+            "exec-{}",
+            NEXT_EXEC.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let cgroup = match crate::cgroup::Cgroup::create(&name) {
+            Ok(cgroup) => Some(cgroup),
+            Err(e) => {
+                eprintln!("shuru-guest: exec without a cgroup: {}", e);
+                None
+            }
+        };
+        let procs = match cgroup.as_ref().map(|c| c.procs()).transpose() {
+            Ok(procs) => procs,
+            Err(e) => {
+                let msg = format!("failed to spawn: {}", e);
+                let mut w = vsock_writer;
+                let _ = frame::write_frame(&mut w, frame::ERROR, msg.as_bytes());
+                return;
+            }
+        };
+        let procs_fd = procs.as_ref().map(|fd| fd.as_raw_fd());
+        // Its own process group too, which a terminal program may expect.
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
+                if let Some(fd) = procs_fd {
+                    crate::cgroup::join(fd)?;
+                }
                 libc::setpgid(0, 0);
                 Ok(())
             });
         }
 
-        match cmd.spawn() {
-            Ok(mut child) => {
-                let child_pid = child.id() as i32;
+        match crate::children::spawn_waited(&mut cmd) {
+            Ok((mut child, leader, exit)) => {
+                drop(procs);
+                let scope = std::sync::Arc::new(match cgroup {
+                    Some(cgroup) => Scope::Cgroup(cgroup),
+                    None => Scope::Group(leader),
+                });
                 if let Some(id) = req.id {
-                    EXECS.lock().unwrap().insert(id, child_pid);
+                    EXECS.lock().unwrap().insert(id, scope.clone());
                 }
 
                 // Channel serializes all frame writes to prevent interleaving
@@ -1268,8 +1353,8 @@ mod guest {
                 // up. Watch for that separately and kill the group.
                 let hangup_watch = match (vsock_reader.try_clone(), std::io::pipe()) {
                     (Ok(conn), Ok((done_rx, done_tx))) => {
-                        let t =
-                            std::thread::spawn(move || kill_on_hangup(conn, child_pid, done_rx));
+                        let scope = scope.clone();
+                        let t = std::thread::spawn(move || kill_on_hangup(conn, &scope, done_rx));
                         Some((t, done_tx))
                     }
                     _ => None,
@@ -1277,6 +1362,7 @@ mod guest {
 
                 // Thread: vsock STDIN/KILL frames -> child stdin
                 let child_stdin = child.stdin.take().unwrap();
+                let input_scope = scope.clone();
                 let input_thread = std::thread::spawn(move || {
                     let mut stdin = child_stdin;
                     let mut reader = vsock_reader;
@@ -1289,8 +1375,7 @@ mod guest {
                                 let _ = stdin.flush();
                             }
                             Ok(Some((frame::KILL, _))) => {
-                                // Kill entire process group (negative pid)
-                                unsafe { libc::kill(-child_pid, libc::SIGTERM) };
+                                input_scope.signal(libc::SIGTERM);
                                 break;
                             }
                             _ => break,
@@ -1301,18 +1386,7 @@ mod guest {
                 // Wait for output to drain, then wait for child
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
-                // Forget the id and stop the hangup watch once the child has
-                // exited but before it is reaped, so a late kill cannot reach
-                // a reused pid.
-                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                unsafe {
-                    libc::waitid(
-                        libc::P_PID,
-                        child_pid as libc::id_t,
-                        &mut info,
-                        libc::WEXITED | libc::WNOWAIT,
-                    )
-                };
+                let status = exit.wait();
                 if let Some(id) = req.id {
                     EXECS.lock().unwrap().remove(&id);
                 }
@@ -1320,8 +1394,11 @@ mod guest {
                     drop(done_tx);
                     let _ = t.join();
                 }
-                let status = child.wait().expect("failed to wait on child");
-                let exit_code = status.code().unwrap_or(-1);
+                let exit_code = if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    -1
+                };
 
                 let _ = tx.send((frame::EXIT, frame::exit_payload(exit_code).to_vec()));
                 drop(tx);
@@ -1338,9 +1415,9 @@ mod guest {
         }
     }
 
-    /// Kill the group when the host hangs up. Returns without killing once
+    /// Kill the exec when the host hangs up. Returns without killing once
     /// the write end of `done` is closed.
-    fn kill_on_hangup(conn: std::net::TcpStream, pgid: i32, done: std::io::PipeReader) {
+    fn kill_on_hangup(conn: std::net::TcpStream, scope: &Scope, done: std::io::PipeReader) {
         use std::os::unix::io::AsRawFd;
         let mut fds = [
             libc::pollfd {
@@ -1366,7 +1443,7 @@ mod guest {
                 return;
             }
             if fds[1].revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
-                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                scope.signal(libc::SIGKILL);
                 return;
             }
         }
@@ -1515,8 +1592,6 @@ mod guest {
     }
 
     fn handle_tty_exec(vsock_fd: i32, req: &ExecRequest) {
-        use std::ffi::CString;
-
         unsafe {
             // Set up initial winsize
             let ws = libc::winsize {
@@ -1542,88 +1617,108 @@ mod guest {
                 return;
             }
 
-            let pid = libc::fork();
-            if pid < 0 {
+            let exit = crate::children::Exit::default();
+            let status = exit.clone();
+            let forked = crate::children::start(
+                || {
+                    let pid = libc::fork();
+                    if pid == 0 {
+                        tty_child(master, slave, vsock_fd, req);
+                    }
+                    if pid < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(pid)
+                    }
+                },
+                Box::new(move |s| status.set(s)),
+            );
+            let Ok(child) = forked else {
                 write_frame_fd(vsock_fd, frame::ERROR, b"fork failed");
                 libc::close(master);
                 libc::close(slave);
                 libc::close(vsock_fd);
                 return;
-            }
-
-            if pid == 0 {
-                // === CHILD ===
-                libc::close(master);
-                libc::close(vsock_fd);
-                libc::setsid();
-                libc::ioctl(slave, libc::TIOCSCTTY, 0);
-                libc::dup2(slave, 0);
-                libc::dup2(slave, 1);
-                libc::dup2(slave, 2);
-                if slave > 2 {
-                    libc::close(slave);
-                }
-
-                // Close any other inherited fds
-                for fd in 3..1024 {
-                    libc::close(fd);
-                }
-
-                // Change directory if requested
-                if let Some(ref cwd) = req.cwd {
-                    if let Ok(dir) = CString::new(cwd.as_str()) {
-                        libc::chdir(dir.as_ptr());
-                    }
-                }
-
-                // Set environment
-                for (k, v) in &req.env {
-                    if let Ok(var) = CString::new(format!("{}={}", k, v)) {
-                        libc::putenv(var.into_raw());
-                    }
-                }
-                if !req.env.contains_key("TERM") {
-                    let term = CString::new("TERM=xterm-256color").unwrap();
-                    libc::putenv(term.into_raw());
-                }
-                if !req.env.contains_key("PATH") {
-                    let path = CString::new(
-                        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                    )
-                    .unwrap();
-                    libc::putenv(path.into_raw());
-                }
-
-                // Build argv and exec
-                let c_args: Vec<CString> = req
-                    .argv
-                    .iter()
-                    .map(|s| CString::new(s.as_str()).unwrap_or_else(|_| CString::new("").unwrap()))
-                    .collect();
-                let c_argv: Vec<*const libc::c_char> = c_args
-                    .iter()
-                    .map(|s| s.as_ptr())
-                    .chain(std::iter::once(std::ptr::null()))
-                    .collect();
-
-                libc::execvp(c_argv[0], c_argv.as_ptr());
-
-                // If execvp returns, it failed - print error to the PTY
-                let err = std::io::Error::last_os_error();
-                let msg = format!("shuru: {}: {}\n", req.argv[0], err);
-                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-                libc::_exit(127);
-            }
-
+            };
             // === PARENT ===
             libc::close(slave);
-            pty_poll_loop(vsock_fd, master, pid);
+            pty_poll_loop(vsock_fd, master, child, &exit);
             libc::close(master);
             libc::close(vsock_fd);
         }
     }
 
-    fn pty_poll_loop(vsock_fd: i32, master_fd: i32, child_pid: libc::pid_t) {
+    /// The child side of a tty exec, between fork and exec.
+    unsafe fn tty_child(master: i32, slave: i32, vsock_fd: i32, req: &ExecRequest) -> ! {
+        use std::ffi::CString;
+
+        libc::close(master);
+        libc::close(vsock_fd);
+        libc::setsid();
+        libc::ioctl(slave, libc::TIOCSCTTY, 0);
+        libc::dup2(slave, 0);
+        libc::dup2(slave, 1);
+        libc::dup2(slave, 2);
+        if slave > 2 {
+            libc::close(slave);
+        }
+
+        // Close any other inherited fds
+        for fd in 3..1024 {
+            libc::close(fd);
+        }
+
+        // Change directory if requested
+        if let Some(ref cwd) = req.cwd {
+            if let Ok(dir) = CString::new(cwd.as_str()) {
+                libc::chdir(dir.as_ptr());
+            }
+        }
+
+        // Set environment
+        for (k, v) in &req.env {
+            if let Ok(var) = CString::new(format!("{}={}", k, v)) {
+                libc::putenv(var.into_raw());
+            }
+        }
+        if !req.env.contains_key("TERM") {
+            let term = CString::new("TERM=xterm-256color").unwrap();
+            libc::putenv(term.into_raw());
+        }
+        if !req.env.contains_key("PATH") {
+            let path =
+                CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+                    .unwrap();
+            libc::putenv(path.into_raw());
+        }
+
+        // Build argv and exec
+        let c_args: Vec<CString> = req
+            .argv
+            .iter()
+            .map(|s| CString::new(s.as_str()).unwrap_or_else(|_| CString::new("").unwrap()))
+            .collect();
+        let c_argv: Vec<*const libc::c_char> = c_args
+            .iter()
+            .map(|s| s.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+
+        libc::execvp(c_argv[0], c_argv.as_ptr());
+
+        // If execvp returns, it failed - print error to the PTY
+        let err = std::io::Error::last_os_error();
+        let msg = format!("shuru: {}: {}\n", req.argv[0], err);
+        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        libc::_exit(127);
+    }
+
+    fn pty_poll_loop(
+        vsock_fd: i32,
+        master_fd: i32,
+        child: crate::children::Watch,
+        exit: &crate::children::Exit,
+    ) {
         let mut vsock_buf: Vec<u8> = Vec::new();
         let mut read_buf = [0u8; 4096];
 
@@ -1660,10 +1755,7 @@ mod guest {
                     )
                 };
                 if n <= 0 {
-                    // Host disconnected — signal child and exit
-                    unsafe {
-                        libc::kill(child_pid, libc::SIGHUP);
-                    }
+                    crate::children::signal(child, false, libc::SIGHUP);
                     break;
                 }
                 vsock_buf.extend_from_slice(&read_buf[..n as usize]);
@@ -1700,9 +1792,7 @@ mod guest {
             }
 
             if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                unsafe {
-                    libc::kill(child_pid, libc::SIGHUP);
-                }
+                crate::children::signal(child, false, libc::SIGHUP);
                 break;
             }
 
@@ -1739,11 +1829,7 @@ mod guest {
             }
         }
 
-        // Wait for child and send exit code
-        let mut status: libc::c_int = 0;
-        unsafe {
-            libc::waitpid(child_pid, &mut status, 0);
-        }
+        let status = exit.wait();
 
         let exit_code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
@@ -1758,8 +1844,14 @@ mod guest {
 
     fn forward_accept_loop(listener_fd: i32) {
         loop {
-            let client_fd =
-                unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+            let client_fd = unsafe {
+                libc::accept4(
+                    listener_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_CLOEXEC,
+                )
+            };
 
             if client_fd < 0 {
                 continue;
@@ -1841,10 +1933,6 @@ mod guest {
         let _ = t2.join();
     }
 
-    extern "C" fn sigchld_handler(_: libc::c_int) {
-        // Noop — actual reaping happens in the main loop
-    }
-
     extern "C" fn sigterm_handler(_: libc::c_int) {
         unsafe {
             libc::sync();
@@ -1902,6 +1990,11 @@ mod guest {
         setup_networking();
         stage("networking ready");
 
+        if let Err(e) = crate::cgroup::init() {
+            eprintln!("shuru-guest: no exec cgroups: {}", e);
+        }
+        crate::children::start_reaper().expect("start the reaper");
+
         let started = crate::services::start_all();
         if started > 0 {
             stage(&format!("{} service(s) starting", started));
@@ -1909,10 +2002,6 @@ mod guest {
 
         // Register signal handlers (PID 1 has no default signal dispositions)
         unsafe {
-            libc::signal(
-                libc::SIGCHLD,
-                sigchld_handler as *const () as libc::sighandler_t,
-            );
             libc::signal(
                 libc::SIGTERM,
                 sigterm_handler as *const () as libc::sighandler_t,
@@ -1936,11 +2025,16 @@ mod guest {
         });
 
         loop {
-            let client_fd =
-                unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+            let client_fd = unsafe {
+                libc::accept4(
+                    listener_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_CLOEXEC,
+                )
+            };
 
             if client_fd < 0 {
-                reap_zombies();
                 continue;
             }
 
@@ -1949,8 +2043,6 @@ mod guest {
             std::thread::spawn(move || {
                 handle_connection(client_fd);
             });
-
-            reap_zombies();
         }
     }
 }

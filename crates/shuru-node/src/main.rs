@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -73,6 +73,11 @@ struct Common {
     /// Print timings and peak memory to stderr.
     #[arg(long)]
     time: bool,
+    /// While the command runs, each connection to this new unix socket is
+    /// a fresh guest connection, past the hello, for speaking the guest
+    /// protocol from outside.
+    #[arg(long)]
+    guest_socket: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -573,6 +578,7 @@ fn run(args: RunArgs) -> Result<i32> {
     }
     let guest = connect_guest(&dir.vsock(), &identity, &vmm)?;
     let answered = started.elapsed();
+    let _socket = serve_guest(&args.common, dir.vsock(), identity)?;
     let code = exec(guest, args.command, env)?;
     let done = started.elapsed();
 
@@ -870,6 +876,7 @@ fn restore(args: RestoreArgs) -> Result<i32> {
         .as_ref()
         .map(|network| network.session.placeholders.clone())
         .unwrap_or_default();
+    let _socket = serve_guest(&args.common, dir.vsock(), identity)?;
     let code = exec(guest, args.command, env)?;
     let done = started.elapsed();
     let mut times = vec![
@@ -977,20 +984,68 @@ fn connect_guest(path: &Path, identity: &Identity, vmm: &Jailed) -> Result<UnixS
         if Instant::now() > deadline {
             bail!("the guest did not answer within {BOOT_TIMEOUT:?}");
         }
-        let mut stream = UnixStream::connect(path)?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-        stream.write_all(format!("CONNECT {GUEST_PORT}\n").as_bytes())?;
-        if read_line(&mut stream)?.is_some_and(|line| line.starts_with("OK ")) {
-            identity
-                .connect(&mut stream)
-                .context("the guest did not answer the connection hello")?;
-            stream.set_read_timeout(None)?;
-            stream.set_write_timeout(None)?;
+        if let Some(stream) = try_connect_guest(path, identity)? {
             return Ok(stream);
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn try_connect_guest(path: &Path, identity: &Identity) -> Result<Option<UnixStream>> {
+    let mut stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    stream.write_all(format!("CONNECT {GUEST_PORT}\n").as_bytes())?;
+    if !read_line(&mut stream)?.is_some_and(|line| line.starts_with("OK ")) {
+        return Ok(None);
+    }
+    identity
+        .connect(&mut stream)
+        .context("the guest did not answer the connection hello")?;
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
+    Ok(Some(stream))
+}
+
+/// Removes the `--guest-socket` path when the run ends.
+struct GuestSocket(PathBuf);
+
+impl Drop for GuestSocket {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn serve_guest(common: &Common, vsock: PathBuf, identity: Identity) -> Result<Option<GuestSocket>> {
+    let Some(path) = &common.guest_socket else {
+        return Ok(None);
+    };
+    let listener = UnixListener::bind(path).with_context(|| format!("{}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    std::thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            let vsock = vsock.clone();
+            std::thread::spawn(move || {
+                if let Ok(Some(guest)) = try_connect_guest(&vsock, &identity) {
+                    relay(client, guest);
+                }
+            });
+        }
+    });
+    Ok(Some(GuestSocket(path.clone())))
+}
+
+fn relay(a: UnixStream, b: UnixStream) {
+    let copy = |mut from: UnixStream, mut to: UnixStream| {
+        let _ = io::copy(&mut from, &mut to);
+        let _ = to.shutdown(std::net::Shutdown::Write);
+    };
+    let (Ok(a2), Ok(b2)) = (a.try_clone(), b.try_clone()) else {
+        return;
+    };
+    let t = std::thread::spawn(move || copy(a2, b2));
+    copy(b, a);
+    let _ = t.join();
 }
 
 /// Reads up to a newline one byte at a time, so nothing after it is lost.

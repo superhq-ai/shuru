@@ -36,6 +36,94 @@ pub struct KillRequest {
     pub id: u64,
 }
 
+// --- Exec sessions ---
+
+#[derive(Serialize, Deserialize)]
+pub struct SessionStart {
+    #[serde(flatten)]
+    pub exec: ExecRequest,
+    /// Seconds without an attachment after which the session gets SIGHUP.
+    /// Without it the session runs until it exits or is killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_run_after_disconnect: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionAttach {
+    pub id: String,
+    /// Replay from this output byte. Without it, everything still buffered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_offset: Option<u64>,
+}
+
+/// Offsets count the bytes of stdout and stderr together from the start of
+/// the session. Times are Unix seconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub command: Vec<String>,
+    pub workdir: String,
+    pub tty: bool,
+    pub created: u64,
+    pub is_active: bool,
+    pub last_activity: u64,
+    pub bytes_per_second: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// On an attachment: whether its input reaches the process.
+    #[serde(default)]
+    pub is_owner: bool,
+    /// On an attachment: the offset of the first byte that follows. Higher
+    /// than the one asked for when those bytes have left the buffer.
+    #[serde(default)]
+    pub output_offset: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionList {
+    pub sessions: Vec<SessionInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionKill {
+    pub id: String,
+    /// A name such as `SIGTERM` or `TERM`, or a number. Default SIGTERM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    /// Seconds to wait before SIGKILL. Default 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum KillEvent {
+    Signal {
+        message: String,
+        signal: String,
+        pid: i32,
+    },
+    Timeout {
+        message: String,
+    },
+    Exited {
+        message: String,
+    },
+    Killed {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+    Complete {
+        exit_code: i32,
+    },
+}
+
 // --- Shutdown protocol ---
 
 /// Reply to SHUTDOWN_REQ, sent once every guest service has exited and the
