@@ -13,6 +13,8 @@ pub const RESIZE: u8 = 0x04;
 pub const EXIT: u8 = 0x05;
 pub const ERROR: u8 = 0x06;
 pub const KILL: u8 = 0x07;
+/// Closes the stdin of a session. Empty payload.
+pub const STDIN_EOF: u8 = 0x0A;
 
 // Exec handshake
 pub const EXEC_REQ: u8 = 0x10;
@@ -62,7 +64,8 @@ pub const DOWNLOAD_PROGRESS: u8 = 0x51;
 pub const SHUTDOWN_REQ: u8 = 0x60;
 pub const SHUTDOWN_RESP: u8 = 0x61;
 
-const MAX_FRAME: u32 = 1 << 20; // 1 MB
+/// The largest frame, its type byte included.
+pub const MAX_FRAME: u32 = 1 << 20;
 
 pub const FILE_CHUNK: usize = 256 * 1024;
 
@@ -180,3 +183,16 @@ pub const KILL_RESP: u8 = 0x19;
 // and RNG seed material. See hello::Restore.
 pub const RESTORE_REQ: u8 = 0x68;
 pub const RESTORE_RESP: u8 = 0x69;
+
+// Exec sessions outlive the connection that started them (RFC 0012).
+// START and ATTACH answer with SESSION_INFO, then STDOUT and STDERR from
+// its output_offset, then EXIT; the connection takes STDIN, STDIN_EOF,
+// RESIZE and KILL like an EXEC_REQ connection.
+pub const SESSION_START: u8 = 0x70;
+pub const SESSION_ATTACH: u8 = 0x71;
+pub const SESSION_INFO: u8 = 0x72;
+pub const SESSION_LIST: u8 = 0x73;
+pub const SESSION_LIST_RESP: u8 = 0x74;
+/// Answered by SESSION_KILL_EVENT frames, the last one `complete` or `error`.
+pub const SESSION_KILL: u8 = 0x75;
+pub const SESSION_KILL_EVENT: u8 = 0x76;

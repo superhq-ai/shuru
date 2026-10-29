@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use shuru_proto::ShutdownResponse;
 
+use crate::children::{Exit, Watch};
+
 const SERVICES_DIR: &str = "/etc/shuru/services";
 const LOG_DIR: &str = "/run/shuru/log";
 const READY_POLL: Duration = Duration::from_millis(250);
@@ -37,7 +39,8 @@ struct Spec {
 
 struct Service {
     name: String,
-    pid: i32,
+    child: Option<Watch>,
+    exit: Exit,
     state: State,
     stop_timeout: Duration,
 }
@@ -186,7 +189,7 @@ fn log_path(name: &str) -> String {
     format!("{}/{}.log", LOG_DIR, name)
 }
 
-fn spawn(spec: &Spec) -> std::io::Result<i32> {
+fn spawn(spec: &Spec) -> std::io::Result<(Watch, Exit)> {
     std::fs::create_dir_all(LOG_DIR)?;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -207,28 +210,20 @@ fn spawn(spec: &Spec) -> std::io::Result<i32> {
             Ok(())
         });
     }
-    let child = cmd.spawn()?;
-    Ok(child.id() as i32)
-}
-
-/// Non-blocking exit check. `None` while running, `Some(status)` once the
-/// process is gone. A status of -1 means the main loop reaped it first.
-fn poll_exit(pid: i32) -> Option<i32> {
-    let mut status: libc::c_int = 0;
-    let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-    if r == pid {
-        Some(status)
-    } else if r < 0 {
-        Some(-1)
-    } else {
-        None
-    }
+    let exit = Exit::default();
+    let (status, name) = (exit.clone(), spec.name.clone());
+    let (_, child) = crate::children::spawn_with(
+        &mut cmd,
+        Box::new(move |s| {
+            status.set(s);
+            record_exit(&name, s);
+        }),
+    )?;
+    Ok((child, exit))
 }
 
 fn describe_exit(status: i32) -> String {
-    if status < 0 {
-        "exited".to_string()
-    } else if libc::WIFEXITED(status) {
+    if libc::WIFEXITED(status) {
         format!("exited with status {}", libc::WEXITSTATUS(status))
     } else if libc::WIFSIGNALED(status) {
         format!("killed by signal {}", libc::WTERMSIG(status))
@@ -240,7 +235,8 @@ fn describe_exit(status: i32) -> String {
 fn set_state(name: &str, state: State) {
     let mut reg = registry();
     if let Some(svc) = reg.services.iter_mut().find(|s| s.name == name) {
-        if matches!(svc.state, State::Stopped) {
+        // A service that died while its probe ran stays failed.
+        if svc.state == State::Stopped || (state == State::Ready && svc.state != State::Starting) {
             return;
         }
         svc.state = state;
@@ -249,43 +245,47 @@ fn set_state(name: &str, state: State) {
     CHANGED.notify_all();
 }
 
-/// Called by the PID 1 reaper for every child it collects, so a service
-/// that dies at any point is recorded even when no thread is polling it.
-pub fn reaped(pid: i32, status: i32) {
-    let name = {
-        let reg = registry();
+/// Records the exit of a running service, so one that dies at any point
+/// is reported even when no thread is watching it.
+fn record_exit(name: &str, status: i32) {
+    {
+        let mut reg = registry();
         if reg.shutting_down {
             return;
         }
-        reg.services
-            .iter()
-            .find(|s| s.pid == pid && s.state != State::Stopped)
-            .map(|s| s.name.clone())
-    };
-    if let Some(name) = name {
-        log_line(&format!("service {} {}", name, describe_exit(status)));
-        set_state(&name, State::Failed(describe_exit(status)));
+        let running = reg
+            .services
+            .iter_mut()
+            .find(|s| s.name == name && matches!(s.state, State::Starting | State::Ready));
+        let Some(svc) = running else {
+            return;
+        };
+        svc.state = State::Failed(describe_exit(status));
     }
+    CHANGED.notify_all();
+    log_line(&format!("service {} {}", name, describe_exit(status)));
 }
 
 fn ready_check_passes(spec: &Spec, ready: &[String]) -> bool {
-    Command::new(&ready[0])
-        .args(&ready[1..])
+    let mut cmd = Command::new(&ready[0]);
+    cmd.args(&ready[1..])
         .envs(&spec.env)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stderr(Stdio::null());
+    match crate::children::spawn_waited(&mut cmd) {
+        Ok((_, _, exit)) => {
+            let status = exit.wait();
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+        }
+        Err(_) => false,
+    }
 }
 
-fn watch_until_ready(spec: Spec, pid: i32) {
+fn watch_until_ready(spec: Spec, exit: Exit) {
     let deadline = Instant::now() + spec.ready_timeout;
     loop {
-        if let Some(status) = poll_exit(pid) {
-            set_state(&spec.name, State::Failed(describe_exit(status)));
-            log_line(&format!("service {} {}", spec.name, describe_exit(status)));
+        if exit.get().is_some() {
             return;
         }
         match &spec.ready {
@@ -316,27 +316,28 @@ pub fn start_all() -> usize {
     let specs = load_specs();
     let mut started = 0;
     for spec in specs {
-        let pid = match spawn(&spec) {
-            Ok(pid) => pid,
-            Err(e) => {
-                log_line(&format!("service {} failed to start: {}", spec.name, e));
-                registry().services.push(Service {
-                    name: spec.name.clone(),
-                    pid: 0,
-                    state: State::Failed(format!("failed to start: {}", e)),
-                    stop_timeout: spec.stop_timeout,
-                });
-                continue;
-            }
-        };
+        // Registered before its spawn, so an exit at once is recorded.
         registry().services.push(Service {
             name: spec.name.clone(),
-            pid,
+            child: None,
+            exit: Exit::default(),
             state: State::Starting,
             stop_timeout: spec.stop_timeout,
         });
+        let (child, exit) = match spawn(&spec) {
+            Ok(started) => started,
+            Err(e) => {
+                log_line(&format!("service {} failed to start: {}", spec.name, e));
+                set_state(&spec.name, State::Failed(format!("failed to start: {}", e)));
+                continue;
+            }
+        };
+        if let Some(svc) = registry().services.iter_mut().find(|s| s.name == spec.name) {
+            svc.child = Some(child);
+            svc.exit = exit.clone();
+        }
         started += 1;
-        std::thread::spawn(move || watch_until_ready(spec, pid));
+        std::thread::spawn(move || watch_until_ready(spec, exit));
     }
     started
 }
@@ -348,32 +349,12 @@ fn log_tail(name: &str) -> String {
     lines[start..].join("\n")
 }
 
-/// Pick up exits the reaper has not seen yet, so a service that died
-/// between two connections is reported on the next exec.
-fn poll_all() {
-    let pids: Vec<(String, i32)> = registry()
-        .services
-        .iter()
-        .filter(|s| s.pid > 0 && matches!(s.state, State::Starting | State::Ready))
-        .map(|s| (s.name.clone(), s.pid))
-        .collect();
-    for (name, pid) in pids {
-        if let Some(status) = poll_exit(pid) {
-            if status >= 0 {
-                log_line(&format!("service {} {}", name, describe_exit(status)));
-                set_state(&name, State::Failed(describe_exit(status)));
-            }
-        }
-    }
-}
-
 /// Block until no service is still starting. Ok when every service is ready
 /// (or none exist), Err with a message naming the first failed service.
 pub fn wait_ready() -> Result<(), String> {
     if registry().shutting_down {
         return Err("guest is shutting down".into());
     }
-    poll_all();
     let mut reg = registry();
     loop {
         if reg.shutting_down {
@@ -408,13 +389,13 @@ pub fn wait_ready() -> Result<(), String> {
 /// Stop every running service (SIGTERM, then SIGKILL to its process group
 /// after its stop timeout). The disk control path handles synchronization.
 pub fn shutdown() -> ShutdownResponse {
-    let targets: Vec<(String, i32, Duration)> = {
+    let targets: Vec<(String, Watch, Exit, Duration)> = {
         let mut reg = registry();
         reg.shutting_down = true;
         reg.services
             .iter()
-            .filter(|s| s.pid > 0 && matches!(s.state, State::Starting | State::Ready))
-            .map(|s| (s.name.clone(), s.pid, s.stop_timeout))
+            .filter(|s| matches!(s.state, State::Starting | State::Ready))
+            .filter_map(|s| Some((s.name.clone(), s.child?, s.exit.clone(), s.stop_timeout)))
             .collect()
     };
     CHANGED.notify_all();
@@ -422,12 +403,12 @@ pub fn shutdown() -> ShutdownResponse {
     let mut resp = ShutdownResponse::default();
     if !targets.is_empty() {
         let start = Instant::now();
-        for (_, pid, _) in &targets {
-            unsafe { libc::kill(*pid, libc::SIGTERM) };
+        for (_, child, _, _) in &targets {
+            crate::children::signal(*child, false, libc::SIGTERM);
         }
-        let mut pending: Vec<(String, i32, Duration)> = targets;
+        let mut pending = targets;
         loop {
-            pending.retain(|(name, pid, _)| match poll_exit(*pid) {
+            pending.retain(|(name, _, exit, _)| match exit.get() {
                 Some(_) => {
                     resp.stopped.push(name.clone());
                     false
@@ -439,23 +420,20 @@ pub fn shutdown() -> ShutdownResponse {
             }
             let elapsed = start.elapsed();
             let mut expired = Vec::new();
-            pending.retain(|(name, pid, timeout)| {
+            pending.retain(|(name, child, exit, timeout)| {
                 if elapsed >= *timeout {
-                    unsafe {
-                        libc::kill(-*pid, libc::SIGKILL);
-                        libc::kill(*pid, libc::SIGKILL);
-                    }
-                    expired.push((name.clone(), *pid));
+                    crate::children::signal(*child, true, libc::SIGKILL);
+                    crate::children::signal(*child, false, libc::SIGKILL);
+                    expired.push((name.clone(), exit.clone()));
                     false
                 } else {
                     true
                 }
             });
-            for (name, pid) in expired {
+            for (name, exit) in expired {
                 log_line(&format!("service {} ignored SIGTERM, killed", name));
-                // Reap the killed process so it does not linger as a zombie.
                 for _ in 0..100 {
-                    if poll_exit(pid).is_some() {
+                    if exit.get().is_some() {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(10));
