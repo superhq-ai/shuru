@@ -241,9 +241,10 @@ pub fn boot() -> io::Result<()> {
     let device = File::open("/dev/vda")?;
     let mut size: u64 = 0;
     check(unsafe { libc::ioctl(device.as_raw_fd(), BLKGETSIZE64 as _, &mut size) })?;
-    check(unsafe { libc::fstatfs(root.as_raw_fd(), &mut fs) })?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    check(unsafe { libc::fstatvfs(root.as_raw_fd(), &mut st) })?;
     let count = sb.blocks;
-    let blocks = size / fs.f_bsize as u64;
+    let blocks = size / st.f_bsize;
     if blocks < count {
         return Err(invalid("root filesystem exceeds device size"));
     }

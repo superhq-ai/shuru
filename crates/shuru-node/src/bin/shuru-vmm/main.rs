@@ -7,8 +7,8 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 
 use anyhow::{bail, Context, Result};
-use shuru_linux::{VirtualMachine, VmDescriptors, VmState};
-use shuru_node::control::{self, Request, Response, VmmConfig};
+use shuru_linux::{VirtualMachine, VmDescriptors, VmImage, VmState};
+use shuru_node::control::{self, Boot, Request, Response, VmmConfig};
 use shuru_node::seccomp;
 
 const CONTROL_FD: i32 = 3;
@@ -63,17 +63,36 @@ fn start(config: VmmConfig, fds: Vec<OwnedFd>, log: bool) -> Result<VirtualMachi
     let mut fds = fds.into_iter();
     let mut next = || fds.next().unwrap();
     let kvm = next();
-    let kernel = File::from(next());
-    let initrd = config.initrd.then(|| File::from(next()));
+    let kernel = match config.boot {
+        Boot::Kernel {
+            command_line,
+            initrd,
+        } => Some((
+            File::from(next()),
+            initrd.then(|| File::from(next())),
+            command_line,
+        )),
+        Boot::Snapshot => None,
+    };
     let disk = config.disk.as_ref().map(|_| File::from(next()));
     let serial_write = config.serial.then(&mut next);
     let network = config.network_mac.map(|_| next());
     let vsock = UnixListener::from(next());
+    let image = match kernel {
+        Some((kernel, initrd, command_line)) => VmImage::Kernel {
+            kernel,
+            initrd,
+            command_line,
+        },
+        None => VmImage::Snapshot {
+            memory: File::from(next()),
+            state: File::from(next()),
+        },
+    };
 
     let vm = VirtualMachine::from_descriptors(VmDescriptors {
         kvm,
-        kernel,
-        initrd,
+        image,
         disk,
         disk_read_only: config.disk.as_ref().is_some_and(|disk| disk.read_only),
         serial_write,
@@ -82,7 +101,6 @@ fn start(config: VmmConfig, fds: Vec<OwnedFd>, log: bool) -> Result<VirtualMachi
         network_mac: config.network_mac,
         cpu_count: config.cpus,
         memory_bytes: config.memory_bytes,
-        command_line: config.command_line,
         vsock: Some(config.vsock_connections),
         balloon: config.balloon,
     })?;
@@ -105,7 +123,8 @@ fn start(config: VmmConfig, fds: Vec<OwnedFd>, log: bool) -> Result<VirtualMachi
 }
 
 fn serve(vm: &VirtualMachine, stream: &UnixStream) {
-    while let Ok(Some((request, _))) = control::receive::<Request>(stream, 0) {
+    while let Ok(Some((request, fds))) = control::receive::<Request>(stream, control::SNAPSHOT_FDS)
+    {
         let response = match request {
             Request::Configure(_) | Request::ConfigureNetwork(_) => Response::Error {
                 message: "already configured".into(),
@@ -126,6 +145,22 @@ fn serve(vm: &VirtualMachine, stream: &UnixStream) {
                 running: vm.state() == VmState::Running,
                 ballooned_bytes: vm.ballooned_bytes(),
             },
+            Request::Snapshot { resume } => {
+                let result = match <[_; control::SNAPSHOT_FDS]>::try_from(fds) {
+                    Ok(fds) => {
+                        let [memory, state, pagemap] = fds.map(File::from);
+                        vm.snapshot(&memory, &state, &pagemap, resume)
+                            .map_err(|e| e.to_string())
+                    }
+                    Err(_) => {
+                        Err("a snapshot needs a memory file, a state file and a pagemap".into())
+                    }
+                };
+                match result {
+                    Ok(()) => Response::Ok,
+                    Err(message) => Response::Error { message },
+                }
+            }
         };
         if control::send(stream, &response, &[]).is_err() {
             return;

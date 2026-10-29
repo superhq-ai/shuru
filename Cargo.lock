@@ -1695,6 +1695,8 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "linux-loader",
+ "serde",
+ "serde_json",
  "vm-fdt",
  "vm-memory",
  "vmm-sys-util",

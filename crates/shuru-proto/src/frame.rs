@@ -175,3 +175,8 @@ pub const TRIM_RESP: u8 = 0x67;
 
 pub const KILL_REQ: u8 = 0x18;
 pub const KILL_RESP: u8 = 0x19;
+
+// After a restore the host gives the guest a fresh identity, the wall clock
+// and RNG seed material. See hello::Restore.
+pub const RESTORE_REQ: u8 = 0x68;
+pub const RESTORE_RESP: u8 = 0x69;

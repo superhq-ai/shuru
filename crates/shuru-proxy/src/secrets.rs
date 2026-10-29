@@ -401,11 +401,6 @@ mod tests {
 
             let script = dir.join("provider.sh");
             std::fs::write(&script, body).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-            }
 
             Self {
                 counter: dir.join("count"),
@@ -415,9 +410,12 @@ mod tests {
         }
 
         /// argv for a secret backed by this provider, minting values that
-        /// expire at `stamp`.
+        /// expire at `stamp`. The shell reads the script: executing it can
+        /// fail with ETXTBSY while a test on another thread forks with the
+        /// script still open for writing.
         fn argv(&self, stamp: &str) -> Vec<String> {
             vec![
+                "/bin/sh".to_string(),
                 self.script.to_str().unwrap().to_string(),
                 self.counter.to_str().unwrap().to_string(),
                 stamp.to_string(),

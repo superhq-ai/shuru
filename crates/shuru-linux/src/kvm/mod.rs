@@ -1,13 +1,16 @@
 pub mod balloon;
 pub mod devices;
 pub mod layout;
+pub mod snapshot;
 pub mod virtio_fs;
+pub mod vmgenid;
 pub mod vsock;
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use std::os::unix::thread::JoinHandleExt;
 
@@ -18,6 +21,7 @@ use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use self::devices::*;
 use self::layout::*;
+use self::snapshot::SnapshotState;
 use crate::error::VzError;
 
 // Use the actual constants from kvm-bindings (not our hand-defined ones)
@@ -32,16 +36,28 @@ pub struct KvmVm {
     pub kvm: Kvm,
     #[allow(dead_code)]
     pub vm_fd: Arc<VmFd>,
-    #[allow(dead_code)]
     pub mem: GuestMemoryMmap,
+    memory_bytes: u64,
     pub bus: Arc<MmioBus>,
     pub vcpus: Vec<VcpuFd>,
-    pub vcpu_threads: Vec<std::thread::JoinHandle<()>>,
+    pub vcpu_threads: Vec<std::thread::JoinHandle<VcpuFd>>,
     pub running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     pub vsock: Option<Arc<vsock::VsockControl>>,
     pub balloon: Option<Arc<balloon::BalloonControl>>,
-    #[allow(dead_code)]
-    _gic: DeviceFd,
+    gic: DeviceFd,
+    _vmgenid: vmgenid::VmGenId,
+}
+
+/// Where the guest comes from.
+pub enum Boot {
+    Kernel {
+        kernel: File,
+        initrd: Option<File>,
+        command_line: String,
+    },
+    /// A snapshot taken with `KvmVm::snapshot`, its memory in `memory`.
+    Snapshot { memory: File, state: SnapshotState },
 }
 
 pub struct VmCreateConfig {
@@ -49,9 +65,7 @@ pub struct VmCreateConfig {
     pub kvm: Option<std::os::fd::OwnedFd>,
     pub cpu_count: usize,
     pub memory_bytes: u64,
-    pub kernel: File,
-    pub initrd: Option<File>,
-    pub command_line: String,
+    pub boot: Boot,
     pub serial_write_fd: Option<i32>,
     pub serial_read_fd: Option<i32>,
     pub disk: Option<File>,
@@ -82,11 +96,16 @@ impl KvmVm {
             .map_err(|e| VzError::new(format!("failed to create VM: {}", e)))?;
         let vm_fd = Arc::new(vm_fd);
 
-        // Guest memory
-        let mem = GuestMemoryMmap::<()>::from_ranges(&[(
-            GuestAddress(DRAM_BASE),
-            config.memory_bytes as usize,
-        )])
+        let mem = match &config.boot {
+            Boot::Kernel { .. } => GuestMemoryMmap::<()>::from_ranges(&[(
+                GuestAddress(DRAM_BASE),
+                config.memory_bytes as usize,
+            )])
+            .map_err(io::Error::other),
+            Boot::Snapshot { memory, .. } => memory
+                .try_clone()
+                .and_then(|file| snapshot::private_memory(file, config.memory_bytes)),
+        }
         .map_err(|e| VzError::new(format!("failed to create guest memory: {}", e)))?;
 
         let host_addr = mem
@@ -106,36 +125,8 @@ impl KvmVm {
                 .map_err(|e| VzError::new(format!("KVM_SET_USER_MEMORY_REGION: {}", e)))?;
         }
 
-        // Load kernel (PE format for aarch64)
-        // kernel_offset must be 2MB-aligned. The PE loader adds text_offset
-        // from the image header internally, so pass DRAM_BASE (1 GiB aligned).
-        let kernel_result = PE::load(
-            &mem,
-            Some(GuestAddress(DRAM_BASE)),
-            &mut config.kernel,
-            None,
-        )
-        .map_err(|e| VzError::new(format!("failed to load kernel: {}", e)))?;
-        let entry_addr = kernel_result.kernel_load.raw_value();
-
-        // Load initrd
-        let mut initrd_addr: Option<u64> = None;
-        let mut initrd_size: u64 = 0;
-        if let Some(mut initrd) = config.initrd.take() {
-            let mut initrd_data = Vec::new();
-            initrd
-                .read_to_end(&mut initrd_data)
-                .map_err(|e| VzError::new(format!("failed to read initrd: {}", e)))?;
-
-            // Place after FDT reservation, page-aligned
-            let load_addr = DRAM_BASE + config.memory_bytes
-                - FDT_MAX_SIZE
-                - ((initrd_data.len() as u64 + 0xFFF) & !0xFFF);
-            mem.write_slice(&initrd_data, GuestAddress(load_addr))
-                .map_err(|e| VzError::new(format!("failed to write initrd: {}", e)))?;
-            initrd_addr = Some(load_addr);
-            initrd_size = initrd_data.len() as u64;
-        }
+        let vmgenid = vmgenid::VmGenId::new(&vm_fd)
+            .map_err(|e| VzError::new(format!("failed to set up vmgenid: {e}")))?;
 
         // Build MMIO bus
         let mut bus = MmioBus::new();
@@ -216,40 +207,52 @@ impl KvmVm {
         // GIC-v3
         let gic = create_gic(&vm_fd, config.cpu_count as u64)?;
 
-        // Init vCPU registers
-        for (i, vcpu) in vcpus.iter().enumerate() {
-            init_vcpu(&vm_fd, vcpu, i, entry_addr)?;
-        }
-
-        // FDT
-        let fdt_data = generate_fdt(
-            config.cpu_count,
-            config.memory_bytes,
-            &config.command_line,
-            initrd_addr,
-            initrd_size,
-            virtio_idx,
-        )?;
-        let fdt_addr = DRAM_BASE + config.memory_bytes - FDT_MAX_SIZE;
-        mem.write_slice(&fdt_data, GuestAddress(fdt_addr))
-            .map_err(|e| VzError::new(format!("failed to write FDT: {}", e)))?;
-
-        // Set x0 = FDT address for boot CPU
-        if let Some(vcpu) = vcpus.first() {
-            set_reg(vcpu, REG_X0, fdt_addr)?;
+        match config.boot {
+            Boot::Kernel {
+                mut kernel,
+                initrd,
+                command_line,
+            } => {
+                let (entry_addr, initrd) =
+                    load_kernel(&mem, &mut kernel, initrd, config.memory_bytes)?;
+                for (i, vcpu) in vcpus.iter().enumerate() {
+                    init_vcpu(&vm_fd, vcpu, i, entry_addr)?;
+                }
+                let fdt_data = generate_fdt(
+                    config.cpu_count,
+                    config.memory_bytes,
+                    &command_line,
+                    initrd,
+                    virtio_idx,
+                )?;
+                let fdt_addr = DRAM_BASE + config.memory_bytes - FDT_MAX_SIZE;
+                mem.write_slice(&fdt_data, GuestAddress(fdt_addr))
+                    .map_err(|e| VzError::new(format!("failed to write FDT: {}", e)))?;
+                // x0 = FDT address for the boot CPU
+                if let Some(vcpu) = vcpus.first() {
+                    set_reg(vcpu, REG_X0, fdt_addr)?;
+                }
+            }
+            Boot::Snapshot { state, .. } => {
+                restore(&vm_fd, &vcpus, &gic, &bus, &state, config.memory_bytes)
+                    .map_err(|e| VzError::new(format!("failed to restore the snapshot: {e}")))?;
+            }
         }
 
         Ok(KvmVm {
             kvm,
             vm_fd,
             mem,
+            memory_bytes: config.memory_bytes,
             bus: Arc::new(bus),
             vcpus,
             vcpu_threads: Vec::new(),
             running: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             vsock: vsock_control,
             balloon: balloon_control,
-            _gic: gic,
+            gic,
+            _vmgenid: vmgenid,
         })
     }
 
@@ -260,15 +263,86 @@ impl KvmVm {
         for vcpu in vcpus {
             let bus = self.bus.clone();
             let running = self.running.clone();
+            let paused = self.paused.clone();
 
             self.vcpu_threads.push(
                 std::thread::Builder::new()
                     .name("shuru-vcpu".into())
-                    .spawn(move || vcpu_run_loop(vcpu, bus, running))
+                    .spawn(move || vcpu_run_loop(vcpu, bus, running, paused))
                     .map_err(|e| VzError::new(format!("failed to spawn vCPU: {}", e)))?,
             );
         }
         Ok(())
+    }
+
+    /// Takes every vCPU out of the guest and back from its thread.
+    fn pause(&mut self) -> Result<(), VzError> {
+        self.paused.store(true, Ordering::Release);
+        for handle in std::mem::take(&mut self.vcpu_threads) {
+            // A signal that lands before the thread enters KVM_RUN does
+            // not stop it, so keep sending until it returns.
+            while !handle.is_finished() {
+                unsafe {
+                    libc::pthread_kill(handle.as_pthread_t() as libc::pthread_t, libc::SIGRTMIN());
+                }
+                std::thread::sleep(Duration::from_micros(500));
+            }
+            let vcpu = handle
+                .join()
+                .map_err(|_| VzError::new("a vCPU thread panicked"))?;
+            self.vcpus.push(vcpu);
+        }
+        if !self.running.load(Ordering::Acquire) {
+            return Err(VzError::new("the guest stopped"));
+        }
+        Ok(())
+    }
+
+    pub fn resume(&mut self) -> Result<(), VzError> {
+        for entry in &self.bus.devices {
+            entry.device.resume();
+        }
+        self.paused.store(false, Ordering::Release);
+        self.start()
+    }
+
+    /// Pauses the VM and saves it: the guest memory into `memory_out` and
+    /// the rest into the returned state. The VM stays paused. See
+    /// `snapshot::save_memory` for `memory_out` and `pagemap`.
+    pub fn snapshot(
+        &mut self,
+        memory_out: &File,
+        pagemap: &File,
+    ) -> Result<SnapshotState, VzError> {
+        self.pause()?;
+        self.save(memory_out, pagemap).map_err(|e| {
+            let _ = self.resume();
+            VzError::new(format!("snapshot failed: {e}"))
+        })
+    }
+
+    fn save(&self, memory_out: &File, pagemap: &File) -> io::Result<SnapshotState> {
+        let devices = self
+            .bus
+            .devices
+            .iter()
+            .map(|entry| entry.device.save())
+            .collect::<io::Result<Vec<_>>>()?;
+        let vcpus = self
+            .vcpus
+            .iter()
+            .map(snapshot::save_vcpu)
+            .collect::<io::Result<Vec<_>>>()?;
+        let gic = snapshot::save_gic(&self.gic, &vcpus)?;
+        snapshot::save_memory(pagemap, &self.mem, self.memory_bytes, memory_out)?;
+        Ok(SnapshotState {
+            version: snapshot::FORMAT_VERSION,
+            cpu_count: vcpus.len(),
+            memory_bytes: self.memory_bytes,
+            vcpus,
+            gic,
+            devices,
+        })
     }
 
     pub fn stop(&mut self) {
@@ -354,22 +428,96 @@ fn create_gic(vm_fd: &VmFd, _vcpu_count: u64) -> Result<DeviceFd, VzError> {
 }
 
 // ===========================================================================
+// Kernel and snapshot
+// ===========================================================================
+
+/// Loads the kernel and the initrd. Returns the entry point and where the
+/// initrd went.
+fn load_kernel(
+    mem: &GuestMemoryMmap,
+    kernel: &mut File,
+    initrd: Option<File>,
+    memory_bytes: u64,
+) -> Result<(u64, Option<(u64, u64)>), VzError> {
+    // kernel_offset must be 2MB-aligned. The PE loader adds text_offset
+    // from the image header internally, so pass DRAM_BASE (1 GiB aligned).
+    let kernel_result = PE::load(mem, Some(GuestAddress(DRAM_BASE)), kernel, None)
+        .map_err(|e| VzError::new(format!("failed to load kernel: {}", e)))?;
+    let entry_addr = kernel_result.kernel_load.raw_value();
+
+    let Some(mut initrd) = initrd else {
+        return Ok((entry_addr, None));
+    };
+    let mut initrd_data = Vec::new();
+    initrd
+        .read_to_end(&mut initrd_data)
+        .map_err(|e| VzError::new(format!("failed to read initrd: {}", e)))?;
+    // Place after FDT reservation, page-aligned
+    let load_addr =
+        DRAM_BASE + memory_bytes - FDT_MAX_SIZE - ((initrd_data.len() as u64 + 0xFFF) & !0xFFF);
+    mem.write_slice(&initrd_data, GuestAddress(load_addr))
+        .map_err(|e| VzError::new(format!("failed to write initrd: {}", e)))?;
+    Ok((entry_addr, Some((load_addr, initrd_data.len() as u64))))
+}
+
+/// Puts a snapshot into a VM built with the same devices: vCPUs, then the
+/// GIC, whose redistributors are found by vCPU affinity, then the devices,
+/// whose interrupt lines need the GIC.
+fn restore(
+    vm_fd: &VmFd,
+    vcpus: &[VcpuFd],
+    gic: &DeviceFd,
+    bus: &MmioBus,
+    state: &SnapshotState,
+    memory_bytes: u64,
+) -> io::Result<()> {
+    if state.version != snapshot::FORMAT_VERSION {
+        return Err(io::Error::other(format!(
+            "snapshot format {} is not {}",
+            state.version,
+            snapshot::FORMAT_VERSION
+        )));
+    }
+    if state.cpu_count != vcpus.len()
+        || state.vcpus.len() != vcpus.len()
+        || state.memory_bytes != memory_bytes
+        || state.devices.len() != bus.devices.len()
+    {
+        return Err(snapshot::mismatch());
+    }
+    for (vcpu, saved) in vcpus.iter().zip(&state.vcpus) {
+        vcpu_init(vm_fd, vcpu, false).map_err(|e| io::Error::other(e.to_string()))?;
+        snapshot::check_cpu(vcpu, saved)?;
+        snapshot::restore_vcpu(vcpu, saved)?;
+    }
+    snapshot::restore_gic(gic, &state.gic, &state.vcpus)?;
+    for (entry, saved) in bus.devices.iter().zip(&state.devices) {
+        entry.device.restore(saved)?;
+    }
+    vmgenid::VmGenId::notify(vm_fd)
+}
+
+// ===========================================================================
 // vCPU init
 // ===========================================================================
 
-fn init_vcpu(vm_fd: &VmFd, vcpu: &VcpuFd, cpu_id: usize, entry_addr: u64) -> Result<(), VzError> {
+fn vcpu_init(vm_fd: &VmFd, vcpu: &VcpuFd, power_off: bool) -> Result<(), VzError> {
     let mut kvi = kvm_bindings::kvm_vcpu_init::default();
     vm_fd
         .get_preferred_target(&mut kvi)
         .map_err(|e| VzError::new(format!("KVM_ARM_PREFERRED_TARGET: {}", e)))?;
 
     kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
-    if cpu_id > 0 {
+    if power_off {
         kvi.features[0] |= 1 << KVM_ARM_VCPU_POWER_OFF;
     }
 
     vcpu.vcpu_init(&kvi)
-        .map_err(|e| VzError::new(format!("KVM_ARM_VCPU_INIT({}): {}", cpu_id, e)))?;
+        .map_err(|e| VzError::new(format!("KVM_ARM_VCPU_INIT: {}", e)))
+}
+
+fn init_vcpu(vm_fd: &VmFd, vcpu: &VcpuFd, cpu_id: usize, entry_addr: u64) -> Result<(), VzError> {
+    vcpu_init(vm_fd, vcpu, cpu_id > 0).map_err(|e| VzError::new(format!("vCPU {cpu_id}: {e}")))?;
 
     if cpu_id == 0 {
         set_reg(vcpu, REG_PC, entry_addr)?;
@@ -392,8 +540,7 @@ fn generate_fdt(
     cpu_count: usize,
     mem_size: u64,
     cmdline: &str,
-    initrd_addr: Option<u64>,
-    initrd_size: u64,
+    initrd: Option<(u64, u64)>,
     virtio_device_count: u32,
 ) -> Result<Vec<u8>, VzError> {
     use vm_fdt::FdtWriter;
@@ -412,10 +559,9 @@ fn generate_fdt(
     fdt.property_string("bootargs", cmdline).unwrap();
     fdt.property_string("stdout-path", "/pl011@9000000")
         .unwrap();
-    if let Some(addr) = initrd_addr {
+    if let Some((addr, size)) = initrd {
         fdt.property_u64("linux,initrd-start", addr).unwrap();
-        fdt.property_u64("linux,initrd-end", addr + initrd_size)
-            .unwrap();
+        fdt.property_u64("linux,initrd-end", addr + size).unwrap();
     }
     fdt.end_node(chosen).unwrap();
 
@@ -520,6 +666,17 @@ fn generate_fdt(
     fdt.property_u32("clocks", 2).unwrap();
     fdt.end_node(rtc).unwrap();
 
+    let vmgenid = fdt
+        .begin_node(&format!("vmgenid@{:x}", VMGENID_BASE))
+        .unwrap();
+    fdt.property_string("compatible", "microsoft,vmgenid")
+        .unwrap();
+    fdt.property_array_u64("reg", &[VMGENID_BASE, VMGENID_SIZE])
+        .unwrap();
+    fdt.property_array_u32("interrupts", &[0, VMGENID_SPI, 1]) // SPI, edge rising
+        .unwrap();
+    fdt.end_node(vmgenid).unwrap();
+
     // Virtio MMIO devices
     for i in 0..virtio_device_count {
         let base = VIRTIO_MMIO_BASE + (i as u64) * VIRTIO_MMIO_GAP;
@@ -557,7 +714,13 @@ fn add_virtio(
     Ok(())
 }
 
-fn vcpu_run_loop(mut vcpu: VcpuFd, bus: Arc<MmioBus>, running: Arc<AtomicBool>) {
+/// Runs until the guest stops or the VM pauses, and hands the vCPU back.
+fn vcpu_run_loop(
+    mut vcpu: VcpuFd,
+    bus: Arc<MmioBus>,
+    running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+) -> VcpuFd {
     // Install empty handler for SIGRTMIN so KVM_RUN returns EINTR on stop
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -567,6 +730,11 @@ fn vcpu_run_loop(mut vcpu: VcpuFd, bus: Arc<MmioBus>, running: Arc<AtomicBool>) 
     }
 
     while running.load(Ordering::Acquire) {
+        // With immediate_exit set, KVM_RUN still finishes the MMIO read the
+        // guest waits on before it returns, so the saved state is whole.
+        if paused.load(Ordering::Acquire) {
+            vcpu.set_kvm_immediate_exit(1);
+        }
         match vcpu.run() {
             Ok(exit_reason) => {
                 use kvm_ioctls::VcpuExit;
@@ -580,7 +748,7 @@ fn vcpu_run_loop(mut vcpu: VcpuFd, bus: Arc<MmioBus>, running: Arc<AtomicBool>) 
                     }
                     VcpuExit::SystemEvent(..) | VcpuExit::Shutdown => {
                         running.store(false, Ordering::Release);
-                        return;
+                        break;
                     }
                     VcpuExit::Hlt => {
                         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -588,7 +756,7 @@ fn vcpu_run_loop(mut vcpu: VcpuFd, bus: Arc<MmioBus>, running: Arc<AtomicBool>) 
                     VcpuExit::InternalError => {
                         eprintln!("shuru: KVM internal error");
                         running.store(false, Ordering::Release);
-                        return;
+                        break;
                     }
                     _ => {} // other exits — continue
                 }
@@ -597,12 +765,17 @@ fn vcpu_run_loop(mut vcpu: VcpuFd, bus: Arc<MmioBus>, running: Arc<AtomicBool>) 
                 if e.errno() != libc::EAGAIN && e.errno() != libc::EINTR {
                     eprintln!("shuru: KVM_RUN error: {}", e);
                     running.store(false, Ordering::Release);
-                    return;
+                    break;
                 }
-                // EINTR from our signal → check running flag and loop
+                // EINTR from our signal: stopping, pausing, or neither.
+                if e.errno() == libc::EINTR && paused.load(Ordering::Acquire) {
+                    vcpu.set_kvm_immediate_exit(0);
+                    break;
+                }
             }
         }
     }
+    vcpu
 }
 
 extern "C" fn empty_signal_handler(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {

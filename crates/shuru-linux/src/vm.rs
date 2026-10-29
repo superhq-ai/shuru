@@ -21,12 +21,23 @@ pub enum VmState {
     Unknown = -1,
 }
 
+/// What a VM starts from.
+pub enum VmImage {
+    Kernel {
+        kernel: File,
+        initrd: Option<File>,
+        command_line: String,
+    },
+    /// The memory and state files `VirtualMachine::snapshot` wrote. The
+    /// devices must be the ones the snapshot was taken with.
+    Snapshot { memory: File, state: File },
+}
+
 /// Everything a VM needs, already open, for a process that may not open
 /// files itself. There is no virtio-fs: it needs host paths.
 pub struct VmDescriptors {
     pub kvm: OwnedFd,
-    pub kernel: File,
-    pub initrd: Option<File>,
+    pub image: VmImage,
     pub disk: Option<File>,
     pub disk_read_only: bool,
     pub serial_write: Option<OwnedFd>,
@@ -35,7 +46,6 @@ pub struct VmDescriptors {
     pub network_mac: Option<[u8; 6]>,
     pub cpu_count: usize,
     pub memory_bytes: u64,
-    pub command_line: String,
     /// The vsock connection cap, or no vsock device.
     pub vsock: Option<usize>,
     pub balloon: bool,
@@ -78,9 +88,11 @@ impl VirtualMachine {
             kvm: None,
             cpu_count: inner.cpu_count,
             memory_bytes: inner.memory_size,
-            kernel,
-            initrd,
-            command_line: inner.command_line.clone(),
+            boot: kvm::Boot::Kernel {
+                kernel,
+                initrd,
+                command_line: inner.command_line.clone(),
+            },
             serial_write_fd: inner.serial_write_fd,
             serial_read_fd: inner.serial_read_fd,
             disk,
@@ -97,13 +109,27 @@ impl VirtualMachine {
 
     pub fn from_descriptors(descriptors: VmDescriptors) -> Result<Self> {
         let raw = |fd: &Option<OwnedFd>| fd.as_ref().map(|fd| fd.as_raw_fd());
+        let boot = match descriptors.image {
+            VmImage::Kernel {
+                kernel,
+                initrd,
+                command_line,
+            } => kvm::Boot::Kernel {
+                kernel,
+                initrd,
+                command_line,
+            },
+            VmImage::Snapshot { memory, state } => kvm::Boot::Snapshot {
+                memory,
+                state: serde_json::from_reader(std::io::BufReader::new(state))
+                    .map_err(|e| VzError::new(format!("bad snapshot state: {e}")))?,
+            },
+        };
         let create_config = kvm::VmCreateConfig {
             kvm: Some(descriptors.kvm),
             cpu_count: descriptors.cpu_count,
             memory_bytes: descriptors.memory_bytes,
-            kernel: descriptors.kernel,
-            initrd: descriptors.initrd,
-            command_line: descriptors.command_line,
+            boot,
             serial_write_fd: raw(&descriptors.serial_write),
             serial_read_fd: raw(&descriptors.serial_read),
             disk: descriptors.disk,
@@ -175,6 +201,30 @@ impl VirtualMachine {
             .ok();
 
         Ok(())
+    }
+
+    /// Pauses the VM and writes it out: the guest memory into `memory` and
+    /// the rest into `state`. With `resume` the guest runs on, otherwise it
+    /// stays paused until stopped. See `KvmVm::snapshot` for `memory` and
+    /// `pagemap`.
+    pub fn snapshot(
+        &self,
+        memory: &File,
+        state: &File,
+        pagemap: &File,
+        resume: bool,
+    ) -> Result<()> {
+        let mut vm = self.vm.lock().unwrap();
+        let kvm_vm = vm
+            .as_mut()
+            .ok_or_else(|| VzError::new("VM was not created successfully"))?;
+        let saved = kvm_vm.snapshot(memory, pagemap)?;
+        let written = serde_json::to_writer(std::io::BufWriter::new(state), &saved)
+            .map_err(|e| VzError::new(format!("failed to write the snapshot state: {e}")));
+        if resume || written.is_err() {
+            kvm_vm.resume()?;
+        }
+        written
     }
 
     pub fn stop(&self) -> Result<()> {

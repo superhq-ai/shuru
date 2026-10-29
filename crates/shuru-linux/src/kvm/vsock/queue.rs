@@ -60,6 +60,25 @@ impl Queue {
         })
     }
 
+    /// The ring index of the next buffer the device takes.
+    pub(super) fn index(&self) -> u16 {
+        self.next_avail
+    }
+
+    /// The queue as a device that has used every buffer before `index`.
+    pub(super) fn starting_at(mut self, index: u16) -> Self {
+        self.next_avail = index;
+        self.used = index;
+        self
+    }
+
+    /// The avail index: how many buffers the driver has posted, wrapping.
+    pub(super) fn posted(&self, mem: &GuestMemoryMmap) -> io::Result<u16> {
+        mem.read_obj::<u16>(GuestAddress(self.avail_addr + 2))
+            .map(u16::from_le)
+            .map_err(|_| invalid_queue())
+    }
+
     pub(super) fn head(&self, mem: &GuestMemoryMmap) -> io::Result<Option<u16>> {
         self.head_at(mem, 0)
     }

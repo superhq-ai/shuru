@@ -8,6 +8,7 @@ use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::layout;
+use super::snapshot::{self, BackendState, DeviceState, QueueState, VirtioState};
 
 // ===========================================================================
 // MMIO device traits + bus
@@ -17,6 +18,12 @@ use super::layout;
 pub trait MmioDevice: Send {
     fn read(&mut self, offset: u64, data: &mut [u8]);
     fn write(&mut self, offset: u64, data: &[u8]);
+    fn save(&self) -> io::Result<DeviceState> {
+        Err(snapshot::unsupported())
+    }
+    fn restore(&mut self, _state: &DeviceState) -> io::Result<()> {
+        Err(snapshot::unsupported())
+    }
 }
 
 /// What the bus dispatches to. Every device does its own locking, so vCPUs
@@ -24,6 +31,12 @@ pub trait MmioDevice: Send {
 pub trait MmioHandler: Send + Sync {
     fn read(&self, offset: u64, data: &mut [u8]);
     fn write(&self, offset: u64, data: &[u8]);
+    /// Called with the vCPUs paused. A device that works on its own stops
+    /// until `resume`.
+    fn save(&self) -> io::Result<DeviceState>;
+    /// Called once on a new VM, before its vCPUs first run.
+    fn restore(&self, state: &DeviceState) -> io::Result<()>;
+    fn resume(&self) {}
 }
 
 impl<T: MmioDevice> MmioHandler for Mutex<T> {
@@ -33,6 +46,14 @@ impl<T: MmioDevice> MmioHandler for Mutex<T> {
 
     fn write(&self, offset: u64, data: &[u8]) {
         self.lock().unwrap().write(offset, data);
+    }
+
+    fn save(&self) -> io::Result<DeviceState> {
+        self.lock().unwrap().save()
+    }
+
+    fn restore(&self, state: &DeviceState) -> io::Result<()> {
+        self.lock().unwrap().restore(state)
     }
 }
 
@@ -183,6 +204,31 @@ impl MmioDevice for Pl011 {
         bytes[..len].copy_from_slice(&data[..len]);
         self.write_u32(offset, u32::from_le_bytes(bytes));
     }
+
+    fn save(&self) -> io::Result<DeviceState> {
+        Ok(DeviceState::Uart {
+            lcr: self.lcr,
+            cr: self.cr,
+            imsc: self.imsc,
+            ibrd: self.ibrd,
+            fbrd: self.fbrd,
+        })
+    }
+
+    fn restore(&mut self, state: &DeviceState) -> io::Result<()> {
+        let &DeviceState::Uart {
+            lcr,
+            cr,
+            imsc,
+            ibrd,
+            fbrd,
+        } = state
+        else {
+            return Err(snapshot::mismatch());
+        };
+        (self.lcr, self.cr, self.imsc, self.ibrd, self.fbrd) = (lcr, cr, imsc, ibrd, fbrd);
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -269,6 +315,22 @@ impl MmioDevice for Pl031 {
             RTCICR => {}
             _ => {}
         }
+    }
+
+    fn save(&self) -> io::Result<DeviceState> {
+        Ok(DeviceState::Rtc {
+            mr: self.mr,
+            cr: self.cr,
+            imsc: self.imsc,
+        })
+    }
+
+    fn restore(&mut self, state: &DeviceState) -> io::Result<()> {
+        let &DeviceState::Rtc { mr, cr, imsc } = state else {
+            return Err(snapshot::mismatch());
+        };
+        (self.mr, self.cr, self.imsc) = (mr, cr, imsc);
+        Ok(())
     }
 }
 
@@ -435,6 +497,19 @@ impl Interrupt {
     }
 }
 
+impl From<&VirtioQueueState> for QueueState {
+    fn from(q: &VirtioQueueState) -> Self {
+        QueueState {
+            size: q.size,
+            ready: q.ready,
+            desc_addr: q.desc_addr,
+            avail_addr: q.avail_addr,
+            used_addr: q.used_addr,
+            last_avail_idx: q.last_avail_idx,
+        }
+    }
+}
+
 pub trait VirtioBackend: Send {
     fn device_id(&self) -> u32;
     fn device_features(&self) -> u64;
@@ -463,6 +538,22 @@ pub trait VirtioBackend: Send {
         Ok(false)
     }
     fn reset(&mut self);
+    /// The backend part of a snapshot. A backend that serves its queues
+    /// itself stops until `resume`.
+    fn save(&mut self) -> io::Result<BackendState> {
+        Err(snapshot::unsupported())
+    }
+    /// Takes up a saved state where a booted device would `activate`.
+    fn restore(
+        &mut self,
+        _state: &BackendState,
+        _queues: &[VirtioQueueState],
+        _mem: &GuestMemoryMmap,
+        _interrupt: Arc<Interrupt>,
+    ) -> io::Result<()> {
+        Err(snapshot::unsupported())
+    }
+    fn resume(&mut self) {}
 }
 
 struct Core {
@@ -768,6 +859,93 @@ impl MmioHandler for VirtioMmioDevice {
             _ => {}
         }
     }
+
+    fn save(&self) -> io::Result<DeviceState> {
+        let mut core = self.core.lock().unwrap();
+        let id = core.backend.device_id();
+        let Core {
+            backend,
+            queues,
+            mem,
+            activated,
+            ..
+        } = &mut *core;
+        // Requests the guest made before the pause finish now, so none is
+        // half done in the snapshot.
+        if *activated && self.worker.is_some() {
+            for index in 0..queues.len() {
+                if backend.process_queue(index as u16, queues, mem)
+                    && queues[index].wants_interrupt(mem)
+                {
+                    self.interrupt.raise(INTERRUPT_USED);
+                }
+            }
+        }
+        let backend = backend
+            .save()
+            .map_err(|e| io::Error::new(e.kind(), format!("virtio device {id}: {e}")))?;
+        Ok(DeviceState::Virtio(VirtioState {
+            device_id: id,
+            status: core.status,
+            drv_features: core.drv_features,
+            dev_features_sel: core.dev_features_sel,
+            drv_features_sel: core.drv_features_sel,
+            queue_sel: core.queue_sel,
+            activated: core.activated,
+            interrupt_status: self.interrupt.status(),
+            queues: core.queues.iter().map(QueueState::from).collect(),
+            backend,
+        }))
+    }
+
+    fn restore(&self, state: &DeviceState) -> io::Result<()> {
+        let DeviceState::Virtio(state) = state else {
+            return Err(snapshot::mismatch());
+        };
+        let mut core = self.core.lock().unwrap();
+        if state.device_id != core.backend.device_id() || state.queues.len() != core.queues.len() {
+            return Err(snapshot::mismatch());
+        }
+        for (queue, saved) in core.queues.iter_mut().zip(&state.queues) {
+            if saved.size > queue.max_size {
+                return Err(snapshot::mismatch());
+            }
+            queue.size = saved.size;
+            queue.ready = saved.ready;
+            queue.desc_addr = saved.desc_addr;
+            queue.avail_addr = saved.avail_addr;
+            queue.used_addr = saved.used_addr;
+            queue.last_avail_idx = saved.last_avail_idx;
+        }
+        core.status = state.status;
+        core.drv_features = state.drv_features;
+        core.dev_features_sel = state.dev_features_sel;
+        core.drv_features_sel = state.drv_features_sel;
+        core.queue_sel = state.queue_sel;
+        if state.status & VIRTIO_STATUS_FEATURES_OK != 0 {
+            let features = core.drv_features & core.backend.device_features();
+            core.backend.features_ok(features);
+        }
+        core.activated = state.activated;
+        if state.activated {
+            let Core {
+                backend,
+                queues,
+                mem,
+                ..
+            } = &mut *core;
+            backend.restore(&state.backend, queues, mem, self.interrupt.clone())?;
+        }
+        drop(core);
+        if state.interrupt_status != 0 {
+            self.interrupt.raise(state.interrupt_status);
+        }
+        Ok(())
+    }
+
+    fn resume(&self) {
+        self.core.lock().unwrap().backend.resume();
+    }
 }
 
 // ===========================================================================
@@ -1062,6 +1240,23 @@ impl VirtioBackend for BlockBackend {
     fn reset(&mut self) {
         self.negotiated = 0;
     }
+
+    fn save(&mut self) -> io::Result<BackendState> {
+        Ok(BackendState::Block)
+    }
+
+    fn restore(
+        &mut self,
+        state: &BackendState,
+        _: &[VirtioQueueState],
+        _: &GuestMemoryMmap,
+        _: Arc<Interrupt>,
+    ) -> io::Result<()> {
+        match state {
+            BackendState::Block => Ok(()),
+            _ => Err(snapshot::mismatch()),
+        }
+    }
 }
 
 // ===========================================================================
@@ -1074,9 +1269,18 @@ const VIRTIO_NET_HDR_SIZE: usize = 12;
 pub struct NetBackend {
     fd: RawFd,
     mac: [u8; 6],
+    rx: Option<NetRx>,
     rx_running: Arc<AtomicBool>,
-    rx_thread: Option<std::thread::JoinHandle<()>>,
+    // Returns the next receive ring index when it stops.
+    rx_thread: Option<std::thread::JoinHandle<u16>>,
     tx_buf: Vec<u8>,
+}
+
+/// What the receive thread needs, kept to start it again after a pause.
+struct NetRx {
+    queue: VirtioQueueState,
+    mem: GuestMemoryMmap,
+    interrupt: Arc<Interrupt>,
 }
 
 // The virtio-net header plus one Ethernet frame at the 65535-byte IP MTU.
@@ -1087,9 +1291,56 @@ impl NetBackend {
         NetBackend {
             fd,
             mac,
+            rx: None,
             rx_running: Arc::new(AtomicBool::new(false)),
             tx_buf: vec![0; MAX_TX_FRAME],
             rx_thread: None,
+        }
+    }
+
+    fn start(
+        &mut self,
+        queues: &[VirtioQueueState],
+        mem: &GuestMemoryMmap,
+        interrupt: Arc<Interrupt>,
+    ) {
+        unsafe {
+            let flags = libc::fcntl(self.fd, libc::F_GETFL);
+            libc::fcntl(self.fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        self.rx = match queues.first() {
+            Some(q) if q.ready => Some(NetRx {
+                queue: q.clone(),
+                mem: mem.clone(),
+                interrupt,
+            }),
+            _ => None,
+        };
+        self.start_rx();
+    }
+
+    fn start_rx(&mut self) {
+        let Some(rx) = &self.rx else {
+            return;
+        };
+        self.rx_running.store(true, Ordering::Release);
+        let running = self.rx_running.clone();
+        let fd = self.fd;
+        let (queue, mem, interrupt) = (rx.queue.clone(), rx.mem.clone(), rx.interrupt.clone());
+        self.rx_thread = Some(
+            std::thread::Builder::new()
+                .name("shuru-net-rx".into())
+                .spawn(move || net_rx_loop(fd, mem, queue, interrupt, running))
+                .expect("failed to spawn net-rx thread"),
+        );
+    }
+
+    fn stop_rx(&mut self) {
+        self.rx_running.store(false, Ordering::Release);
+        if let Some(thread) = self.rx_thread.take() {
+            if let (Ok(next), Some(rx)) = (thread.join(), &mut self.rx) {
+                rx.queue.last_avail_idx = next;
+            }
         }
     }
 }
@@ -1126,31 +1377,7 @@ impl VirtioBackend for NetBackend {
         mem: &GuestMemoryMmap,
         interrupt: Arc<Interrupt>,
     ) {
-        // Set fd to non-blocking
-        unsafe {
-            let flags = libc::fcntl(self.fd, libc::F_GETFL);
-            libc::fcntl(self.fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-
-        // Spawn RX polling thread
-        let rx_q = match queues.first() {
-            Some(q) if q.ready => q.clone(),
-            _ => return,
-        };
-
-        self.rx_running.store(true, Ordering::Release);
-        let running = self.rx_running.clone();
-        let fd = self.fd;
-        let mem = mem.clone();
-
-        self.rx_thread = Some(
-            std::thread::Builder::new()
-                .name("shuru-net-rx".into())
-                .spawn(move || {
-                    net_rx_loop(fd, mem, rx_q, interrupt, running);
-                })
-                .expect("failed to spawn net-rx thread"),
-        );
+        self.start(queues, mem, interrupt);
     }
 
     fn process_queue(
@@ -1210,9 +1437,37 @@ impl VirtioBackend for NetBackend {
     }
 
     fn reset(&mut self) {
-        self.rx_running.store(false, Ordering::Release);
-        if let Some(h) = self.rx_thread.take() {
-            let _ = h.join();
+        self.stop_rx();
+        self.rx = None;
+    }
+
+    fn save(&mut self) -> io::Result<BackendState> {
+        self.stop_rx();
+        let rx = self.rx.as_ref().map_or(0, |rx| rx.queue.last_avail_idx);
+        Ok(BackendState::Net { rx })
+    }
+
+    fn restore(
+        &mut self,
+        state: &BackendState,
+        queues: &[VirtioQueueState],
+        mem: &GuestMemoryMmap,
+        interrupt: Arc<Interrupt>,
+    ) -> io::Result<()> {
+        let &BackendState::Net { rx } = state else {
+            return Err(snapshot::mismatch());
+        };
+        let mut queues = queues.to_vec();
+        if let Some(queue) = queues.first_mut() {
+            queue.last_avail_idx = rx;
+        }
+        self.start(&queues, mem, interrupt);
+        Ok(())
+    }
+
+    fn resume(&mut self) {
+        if self.rx_thread.is_none() {
+            self.start_rx();
         }
     }
 }
@@ -1224,15 +1479,18 @@ impl Drop for NetBackend {
 }
 
 /// RX loop: poll socketpair → push frames into guest RX queue → inject interrupt.
+/// Returns the next ring index once `running` clears.
 fn net_rx_loop(
     fd: RawFd,
     mem: GuestMemoryMmap,
     rx_q: VirtioQueueState,
     interrupt: Arc<Interrupt>,
     running: Arc<AtomicBool>,
-) {
+) -> u16 {
     let mut last_avail = rx_q.last_avail_idx;
-    let mut used_idx: u16 = 0;
+    // Only this thread writes the used index, so memory has the current one,
+    // zero for a fresh ring.
+    let mut used_idx: u16 = mem.read_obj(GuestAddress(rx_q.used_addr + 2)).unwrap_or(0);
     // One Ethernet frame at the 65535-byte IP-MTU the proxy stack uses:
     // 14 bytes of header plus the IP payload. A datagram longer than the
     // buffer would be truncated by recv.
@@ -1296,6 +1554,7 @@ fn net_rx_loop(
             }
         }
     }
+    last_avail
 }
 
 #[cfg(test)]

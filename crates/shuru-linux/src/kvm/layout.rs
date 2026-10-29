@@ -22,6 +22,11 @@ pub const UART_SPI: u32 = 1;
 pub const RTC_BASE: u64 = 0x0901_0000;
 pub const RTC_SIZE: u64 = 0x1000;
 
+// The 16 byte VM generation ID, in a page of its own.
+pub const VMGENID_BASE: u64 = 0x0902_0000;
+pub const VMGENID_SIZE: u64 = 0x1000;
+pub const VMGENID_SPI: u32 = 2;
+
 // Virtio MMIO devices
 pub const VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
 pub const VIRTIO_MMIO_SIZE: u64 = 0x200;
