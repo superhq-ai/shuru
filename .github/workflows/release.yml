@@ -15,7 +15,7 @@ jobs:
   build-os-image:
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -45,7 +45,7 @@ jobs:
             Image initramfs.cpio rootfs.ext4
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: os-image
           path: shuru-os-*.tar.gz
@@ -54,7 +54,7 @@ jobs:
   build-cli-darwin:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -73,7 +73,7 @@ jobs:
             shuru
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cli-binary-darwin
           path: shuru-*.tar.gz
@@ -82,7 +82,7 @@ jobs:
   build-cli-linux:
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -98,7 +98,7 @@ jobs:
             shuru
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cli-binary-linux
           path: shuru-*.tar.gz
@@ -108,23 +108,23 @@ jobs:
     needs: [build-os-image, build-cli-darwin, build-cli-linux]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: os-image
           path: artifacts/
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: cli-binary-darwin
           path: artifacts/
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: cli-binary-linux
           path: artifacts/
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           # A tag with a hyphen (v0.8.0-rc.1) is a rehearsal: published as a
@@ -138,13 +138,13 @@ jobs:
     needs: release
     if: ${{ !contains(github.ref_name, '-') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: superhq-ai/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
       - name: Download CLI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: cli-binary-darwin
           path: /tmp/artifact
@@ -152,7 +152,7 @@ jobs:
       - name: Update formula
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          SHA256=$(sha256sum /tmp/artifact/shuru-${GITHUB_REF_NAME}-darwin-aarch64.tar.gz | awk '{print $1}')
+          SHA256=$(sha256sum "/tmp/artifact/shuru-${GITHUB_REF_NAME}-darwin-aarch64.tar.gz" | awk '{print $1}')
           sed -i "s/version \".*\"/version \"${VERSION}\"/" Formula/shuru.rb
           sed -i "s/sha256 \".*\"/sha256 \"${SHA256}\"/" Formula/shuru.rb
 
