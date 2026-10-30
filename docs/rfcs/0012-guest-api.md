@@ -29,6 +29,39 @@ network drops connections all the time.
 
 ## Design
 
+### The agent
+
+`shuru-node serve` keeps sandboxes on one host and serves the API for
+them, HTTP and WebSocket on a unix socket that only root can reach. It
+does no authentication of its own; whatever exposes the API beyond the
+host brings that.
+
+```
+POST   /v1/sandboxes                  { "name": "web-1" }
+GET    /v1/sandboxes                  ?prefix= &max_results= &continuation_token=
+GET    /v1/sandboxes/{name}
+DELETE /v1/sandboxes/{name}
+```
+
+Each sandbox keeps a directory under the state directory
+(`/var/lib/shuru/sandboxes/<id>/`) with `sandbox.json` (id, name, size)
+and its working disk, a reflink copy of the base disk the agent is given.
+Create writes the directory under another name, syncs it and renames it
+into place, as a snapshot is written (RFC 0009), then boots the VM.
+
+A sandbox is `running` while its VM is up and `cold` otherwise. A cold
+sandbox keeps its disk and boots on the next request that needs its
+guest. A restart of the agent finds every sandbox cold. On SIGTERM the
+agent shuts every guest down, which stops its services and syncs its
+disk, then stops the VMs.
+
+Each running VM has a thread in the agent that boots it, holds it and
+stops it. The jailed VMM and netd are children of that thread and are
+killed when it exits (`PR_SET_PDEATHSIG`), so a VM never outlives an
+agent that crashed. VMs run in slots from `--first-slot`, one VM per slot
+as with `run --slot`; at start the agent frees the slots a crashed run
+left, and skips any whose cgroup still holds a process.
+
 ### Exec sessions (guest)
 
 The guest agent keeps a session table. A session is one process started
@@ -255,9 +288,10 @@ seccomp, before the next starts.
    output with offsets, attach, list, kill through session cgroups. Tested
    through `shuru-node run` with a session client, including a dropped
    connection during output and an attach after exit.
-2. **Exec, files and ports in the agent.** HTTP and WebSocket exec, the
-   filesystem, `proxy`, `ports/watch`. One guest connection per session,
-   fanned out to its clients.
+2. **Exec, files and ports in the agent.** `shuru-node serve` with
+   create, list, get and delete, HTTP and WebSocket exec, the filesystem,
+   `proxy`, `ports/watch`. One guest connection per session, fanned out
+   to its clients.
 3. **Checkpoints.** Create with `resume: true`, list, get, restore in
    place.
 4. **Policies and services.** The netd rule list with live reload,
@@ -275,7 +309,8 @@ seccomp, before the next starts.
 
 ## Not in this RFC
 
-- How sandboxes are created, kept and placed on hosts.
+- Placing sandboxes on hosts, moving them between hosts, and keeping
+  them anywhere but the host that runs them.
 - The SDKs.
 - Multiplexing several operations over one WebSocket.
 - An API from inside the guest (holding a sandbox awake, checkpoints from
