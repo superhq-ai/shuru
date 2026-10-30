@@ -19,7 +19,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use shuru_proto::frame;
-use shuru_proto::{KillEvent, SessionInfo, SessionKill, SessionList, SessionStart};
+use shuru_proto::{KillEvent, PortEvent, SessionInfo, SessionKill, SessionList, SessionStart};
 
 use super::process::Spawned;
 use super::ring::Ring;
@@ -42,6 +42,9 @@ const SIGKILL_WAIT: Duration = Duration::from_secs(5);
 const KILL_TICK: Duration = Duration::from_millis(20);
 const SWEEP_TICK: Duration = Duration::from_secs(1);
 const RATE_WINDOW: usize = 10;
+/// Port events wait behind at most this much unsent output; past it an
+/// attachment misses them.
+const PORT_EVENT_ROOM: usize = 4 * SEND_LOW;
 /// Bytes of the command and of the workdir in session info, counted as
 /// JSON, so a full session table fits in one frame.
 const SHOWN_COMMAND: usize = 2048;
@@ -343,6 +346,7 @@ impl Loop {
             self.commands();
             self.timers();
             self.settle();
+            crate::ports::set_attached(self.attachments.len());
         }
     }
 
@@ -686,7 +690,7 @@ impl Loop {
                     } => self.start(id, req, spawned, cgroup, conn),
                     Cmd::Attach { req, conn } => match req.id.parse::<u64>() {
                         Ok(sid) if self.sessions.contains_key(&sid) => {
-                            self.attach(sid, conn, req.output_offset)
+                            self.attach(sid, conn, req.output_offset, req.take_owner)
                         }
                         _ => refuse(conn, &format!("no session {}", shown_id(&req.id))),
                     },
@@ -696,6 +700,7 @@ impl Loop {
                     }
                     Cmd::Kill { req, events } => self.kill(req, events),
                     Cmd::Exited { id, status } => self.exited(id, status),
+                    Cmd::Port { id, event } => self.port_event(id, event),
                     #[cfg(test)]
                     Cmd::Inspect { id, reply } => {
                         let found = self.sessions.get(&id).map(|s| super::Inspected {
@@ -761,7 +766,7 @@ impl Loop {
         self.sessions.insert(id, session);
         // The starting connection is attached before any output is read, so
         // none of it can be dropped before it is sent.
-        self.attach(id, conn, Some(0));
+        self.attach(id, conn, Some(0), false);
         if let Some(s) = self.sessions.get_mut(&id) {
             if s.attachments.is_empty() {
                 s.hangup_at = s.hangup_after.and_then(after);
@@ -770,7 +775,7 @@ impl Loop {
         self.dirty.insert(id);
     }
 
-    fn attach(&mut self, sid: u64, conn: TcpStream, offset: Option<u64>) {
+    fn attach(&mut self, sid: u64, conn: TcpStream, offset: Option<u64>, take_owner: bool) {
         let Some(s) = self.sessions.get_mut(&sid) else {
             return;
         };
@@ -779,7 +784,7 @@ impl Loop {
         }
         let cursor = offset.unwrap_or(0).clamp(s.ring.start(), s.ring.end());
         let aid = self.next_attachment;
-        let is_owner = s.owner.is_none();
+        let is_owner = take_owner || s.owner.is_none();
         let info = SessionInfo {
             is_owner,
             output_offset: cursor,
@@ -827,6 +832,24 @@ impl Loop {
             self.poll.unwatch(w);
         }
         self.dirty.insert(id);
+    }
+
+    fn port_event(&mut self, sid: u64, event: PortEvent) {
+        let Some(s) = self.sessions.get(&sid) else {
+            return;
+        };
+        let Ok(payload) = serde_json::to_vec(&event) else {
+            return;
+        };
+        for aid in &s.attachments {
+            let Some(a) = self.attachments.get_mut(aid) else {
+                continue;
+            };
+            if !a.closing && a.out.len() - a.sent < PORT_EVENT_ROOM {
+                let _ = frame::write_frame(&mut a.out, frame::PORT_EVENT, &payload);
+            }
+        }
+        self.dirty.insert(sid);
     }
 
     fn kill(&mut self, req: SessionKill, events: mpsc::Sender<KillEvent>) {

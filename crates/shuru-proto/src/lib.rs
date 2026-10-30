@@ -54,6 +54,9 @@ pub struct SessionAttach {
     /// Replay from this output byte. Without it, everything still buffered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_offset: Option<u64>,
+    /// Become the owner now, in place of any owner there is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub take_owner: bool,
 }
 
 /// Offsets count the bytes of stdout and stderr together from the start of
@@ -150,6 +153,13 @@ pub struct PortMapping {
 #[derive(Serialize, Deserialize)]
 pub struct ForwardRequest {
     pub port: u16,
+    /// A name or address resolved in the guest; 127.0.0.1 when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// The host end never half closes, so the end of its input ends the
+    /// connection both ways.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub whole_close: bool,
 }
 
 /// Sent by the guest in response to a ForwardRequest.
@@ -158,6 +168,26 @@ pub struct ForwardResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// A listening TCP socket in the guest.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Port {
+    pub port: u16,
+    pub address: String,
+    /// The process that owns the socket, 0 when none was found.
+    pub pid: u32,
+}
+
+/// The payload of a PORT_EVENT frame: on a ports watch, the list of
+/// listening sockets first and then each change; on an exec session, a
+/// socket opened or closed by a process of the session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PortEvent {
+    PortList { ports: Vec<Port> },
+    PortOpened(Port),
+    PortClosed(Port),
 }
 
 // --- Mount protocol ---
@@ -477,6 +507,25 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let req2: MountRequest = serde_json::from_str(&json).unwrap();
         assert!(!req2.read_only);
+    }
+
+    #[test]
+    fn port_events_are_tagged_by_type() {
+        let port = Port {
+            port: 8080,
+            address: "0.0.0.0".into(),
+            pid: 42,
+        };
+        let opened = serde_json::to_value(PortEvent::PortOpened(port.clone())).unwrap();
+        assert_eq!(
+            opened,
+            serde_json::json!({"type": "port_opened", "port": 8080, "address": "0.0.0.0", "pid": 42})
+        );
+        let list = PortEvent::PortList { ports: vec![port] };
+        let json = serde_json::to_value(&list).unwrap();
+        assert_eq!(json["type"], "port_list");
+        assert_eq!(json["ports"][0]["port"], 8080);
+        assert_eq!(serde_json::from_value::<PortEvent>(json).unwrap(), list);
     }
 }
 

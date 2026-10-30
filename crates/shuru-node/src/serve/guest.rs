@@ -25,6 +25,20 @@ pub struct Conn {
 /// Connects to the guest within `budget`, a share of the connections its
 /// VM takes, so one kind of use cannot starve the others.
 pub async fn connect(addr: &GuestAddr, budget: &Arc<Semaphore>) -> Result<Conn, ApiError> {
+    connect_port(addr, budget, shuru_proto::VSOCK_PORT).await
+}
+
+/// Connects to the guest port forwarder, which `FWD_REQ` points at a TCP
+/// address in the guest.
+pub async fn connect_forward(addr: &GuestAddr, budget: &Arc<Semaphore>) -> Result<Conn, ApiError> {
+    connect_port(addr, budget, shuru_proto::VSOCK_PORT_FORWARD).await
+}
+
+async fn connect_port(
+    addr: &GuestAddr,
+    budget: &Arc<Semaphore>,
+    port: u32,
+) -> Result<Conn, ApiError> {
     let permit = budget
         .clone()
         .try_acquire_owned()
@@ -33,7 +47,10 @@ pub async fn connect(addr: &GuestAddr, budget: &Arc<Semaphore>) -> Result<Conn, 
     // The permit goes with the connect, which runs on even if the caller
     // goes away.
     let (stream, permit) = tokio::task::spawn_blocking(move || {
-        (vm::try_connect_guest(&addr.vsock, &addr.identity), permit)
+        (
+            vm::try_connect_guest_port(&addr.vsock, &addr.identity, port),
+            permit,
+        )
     })
     .await
     .map_err(|e| ApiError::internal(format!("{e}")))?;

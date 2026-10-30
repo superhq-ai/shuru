@@ -139,8 +139,8 @@ sessions are not held up. At most 128 sessions run at once; a start past
 that gets an `ERROR`. Kill events are the JSON the
 API streams as NDJSON, so the agent passes them through.
 
-`PORT_EVENT` arrives with ports (slice 2): a port opened by a process of
-an attached session.
+`PORT_EVENT` tells attached clients of a port opened or closed by a
+process of the session, as the JSON the API sends.
 
 The agent turns these into the two exec forms of the API. HTTP exec
 starts a session, sends the request body as stdin when `stdin=true`, and
@@ -170,6 +170,10 @@ additions:
   entry, which `READ_DIR_RESP` gains;
 - `fs/copy` gains `preserveAttrs`; `fs/chmod` gains `recursive`;
 - `CHOWN_REQ` is new: `{ path, uid, gid, recursive }`;
+- `fs/stat` is an addition to the Sprites API: one entry for any path,
+  shaped as in `fs/list`. The Sprites SDK stats a path by listing it and
+  taking the first entry, which for a directory is its first child;
+  `fs/list` stays as Sprites has it, so `readdir` stays right;
 - `asRoot`: operations run as the default user unless `asRoot` is
   set, in which case they run as root. The guest agent switches its file
   system uid and gid per request (`setfsuid`, `setfsgid`) on the thread
@@ -184,17 +188,20 @@ stdin over HTTP. Larger transfers use exec with stdin over the WebSocket.
 
 ### Ports and URL traffic
 
-`proxy` opens a TCP connection from inside the guest to the host and port
-in its first message, through the existing `FWD_REQ` path, then carries
-raw bytes. `host` is usually `localhost`; any other name resolves inside
-the guest, and its egress goes through netd like any other.
+`proxy` opens a TCP connection from inside the guest to the host and
+port in its first message, through the existing `FWD_REQ` path, answers
+`{"status":"connected","target":"host:port"}` or a `status` of `error`
+with a `message`, then carries raw bytes. `host` is usually `localhost`;
+any other name resolves inside the guest, and its egress goes through
+netd like any other.
 
 `ports/watch` asks the guest for a `PORTS_WATCH_REQ` stream. The guest
-reads `/proc/net/tcp` and `/proc/net/tcp6` every 500 ms for listening
-sockets, maps each socket inode to a process through `/proc/*/fd`, sends
-the full list first and then `port_opened` and `port_closed` with
-`address`, `port` and `pid`. The same scan sends `PORT_EVENT` to attached
-exec sessions whose cgroup holds the process that owns the new socket.
+reads `/proc/net/tcp` and `/proc/net/tcp6` every 500 ms, while a port
+watch or an attached exec session wants them, for listening sockets,
+maps each socket inode to a process through `/proc/*/fd`, sends the full
+list first and then `port_opened` and `port_closed` with `address`,
+`port` and `pid`. The same scan sends `PORT_EVENT` to attached exec
+sessions whose cgroup holds the process that owns the new socket.
 
 ### Services (guest, extends RFC 0004)
 

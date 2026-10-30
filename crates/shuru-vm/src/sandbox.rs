@@ -1279,7 +1279,11 @@ fn open_forward_stream(vm: &GuestVm, guest_port: u16) -> Result<TcpStream> {
     let _ = vsock_stream.set_nodelay(true);
 
     // Send forward request
-    let req = ForwardRequest { port: guest_port };
+    let req = ForwardRequest {
+        port: guest_port,
+        host: None,
+        whole_close: false,
+    };
     frame::send_json(&mut vsock_stream, frame::FWD_REQ, &req)?;
 
     // Read response frame

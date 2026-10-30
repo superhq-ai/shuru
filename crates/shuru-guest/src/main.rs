@@ -21,6 +21,9 @@ mod disk;
 mod files;
 
 #[cfg(target_os = "linux")]
+mod ports;
+
+#[cfg(target_os = "linux")]
 mod guest {
     use std::io::{Read, Write};
     use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -38,6 +41,8 @@ mod guest {
 
     // _IO('R', 0x07): reseed the kernel CRNG now rather than on its timer.
     const RNDRESEEDCRNG: libc::Ioctl = 0x5207;
+    const FORWARD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const FORWARD_STALL: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// Running execs, by the id the host started them with.
     static EXECS: std::sync::LazyLock<
@@ -612,6 +617,10 @@ mod guest {
                     } else {
                         handle_watch(&req, writer);
                     }
+                    return;
+                }
+                frame::PORTS_WATCH_REQ => {
+                    crate::ports::watch(writer);
                     return;
                 }
                 frame::READ_FILE_REQ => {
@@ -1765,14 +1774,13 @@ mod guest {
             }
         };
 
-        // Connect to the target port on localhost inside the guest
-        let tcp_stream = match std::net::TcpStream::connect(("127.0.0.1", req.port)) {
+        let host = req.host.as_deref().unwrap_or("127.0.0.1");
+        let tcp_stream = match forward_connect(host, req.port) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("shuru-guest: forward to port {} failed: {}", req.port, e);
                 let resp = ForwardResponse {
                     status: "error".into(),
-                    message: Some(format!("connection refused: {}", e)),
+                    message: Some(format!("connect to {host}:{}: {e}", req.port)),
                 };
                 let _ = frame::send_json(&mut stream, frame::FWD_RESP, &resp);
                 return;
@@ -1789,18 +1797,52 @@ mod guest {
         }
 
         // Bidirectional relay between vsock and TCP
-        forward_relay(stream, tcp_stream);
+        forward_relay(stream, tcp_stream, req.whole_close);
     }
 
-    fn forward_relay(vsock: std::net::TcpStream, tcp: std::net::TcpStream) {
+    fn forward_connect(host: &str, port: u16) -> std::io::Result<std::net::TcpStream> {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+        // Loopback whatever the image has in /etc/hosts (RFC 6761).
+        let addrs: Vec<SocketAddr> = if host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+        {
+            vec![
+                (Ipv4Addr::LOCALHOST, port).into(),
+                (Ipv6Addr::LOCALHOST, port).into(),
+            ]
+        } else {
+            (host, port).to_socket_addrs()?.collect()
+        };
+        let mut last = None;
+        for addr in addrs {
+            match std::net::TcpStream::connect_timeout(&addr, FORWARD_CONNECT_TIMEOUT) {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no address found")
+        }))
+    }
+
+    fn forward_relay(vsock: std::net::TcpStream, tcp: std::net::TcpStream, whole_close: bool) {
         let mut vsock_read = vsock.try_clone().expect("clone vsock");
         let mut tcp_write = tcp.try_clone().expect("clone tcp");
         let mut tcp_read = tcp;
         let mut vsock_write = vsock;
+        // The host gives up on a stalled target, so the guest does too.
+        if whole_close {
+            let _ = tcp_write.set_write_timeout(Some(FORWARD_STALL));
+        }
 
         let t1 = std::thread::spawn(move || {
             let _ = std::io::copy(&mut vsock_read, &mut tcp_write);
-            let _ = tcp_write.shutdown(std::net::Shutdown::Write);
+            // Shutting down both ways also ends the read of the other thread.
+            let how = if whole_close {
+                std::net::Shutdown::Both
+            } else {
+                std::net::Shutdown::Write
+            };
+            let _ = tcp_write.shutdown(how);
         });
         let t2 = std::thread::spawn(move || {
             let _ = std::io::copy(&mut tcp_read, &mut vsock_write);

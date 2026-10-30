@@ -24,6 +24,10 @@ use shuru_proto::frame;
 use shuru_proto::hello::Identity;
 
 const RUN_DIR: &str = "/run/shuru";
+/// Each slot is one byte of this file, held with an open file description
+/// lock. The lock goes with the last descriptor of the open, whether the
+/// holder closes it or dies, so no file is left behind per slot.
+const SLOT_LOCKS: &str = "slots.lock";
 const VMM_UID_BASE: u32 = 100_000;
 pub const VSOCK_CONNECTIONS: usize = 128;
 const VMM_NOFILE: u64 = 512;
@@ -90,12 +94,15 @@ fn remove_slot_dir(path: &Path) {
 }
 
 fn lock_slot(slot: u32) -> Result<File> {
-    let base = Path::new(RUN_DIR);
+    lock_slot_in(Path::new(RUN_DIR), slot)
+}
+
+fn lock_slot_in(base: &Path, slot: u32) -> Result<File> {
     fs::DirBuilder::new()
         .mode(0o700)
         .recursive(true)
         .create(base)?;
-    let path = base.join(format!("slot-{slot}.lock"));
+    let path = base.join(SLOT_LOCKS);
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -103,8 +110,19 @@ fn lock_slot(slot: u32) -> Result<File> {
         .mode(0o600)
         .open(&path)
         .with_context(|| format!("{}", path.display()))?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        bail!("slot {slot} is in use");
+    let byte = libc::flock {
+        l_type: libc::F_WRLCK as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: libc::off_t::from(slot),
+        l_len: 1,
+        l_pid: 0,
+    };
+    if unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_OFD_SETLK, &byte) } != 0 {
+        let e = io::Error::last_os_error();
+        if matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) {
+            bail!("slot {slot} is in use");
+        }
+        return Err(e).with_context(|| format!("locking slot {slot}"));
     }
     Ok(lock)
 }
@@ -571,10 +589,18 @@ pub fn connect_guest(path: &Path, identity: &Identity, vmm: &Jailed) -> Result<U
 }
 
 pub fn try_connect_guest(path: &Path, identity: &Identity) -> Result<Option<UnixStream>> {
+    try_connect_guest_port(path, identity, GUEST_PORT)
+}
+
+pub fn try_connect_guest_port(
+    path: &Path,
+    identity: &Identity,
+    port: u32,
+) -> Result<Option<UnixStream>> {
     let mut stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    stream.write_all(format!("CONNECT {GUEST_PORT}\n").as_bytes())?;
+    stream.write_all(format!("CONNECT {port}\n").as_bytes())?;
     if !read_line(&mut stream)?.is_some_and(|line| line.starts_with("OK ")) {
         return Ok(None);
     }
@@ -614,4 +640,26 @@ fn read_line(stream: &mut UnixStream) -> io::Result<Option<String>> {
         line.push(byte[0]);
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_slot_is_held_until_its_lock_is_closed() {
+        let base = std::env::temp_dir().join(format!("shuru-slots-{}", std::process::id()));
+        let first = lock_slot_in(&base, 1000).unwrap();
+        assert!(lock_slot_in(&base, 1000).is_err());
+        let other = lock_slot_in(&base, 1001).unwrap();
+        drop(first);
+        let again = lock_slot_in(&base, 1000).unwrap();
+        drop((again, other));
+        let names: Vec<_> = fs::read_dir(&base)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [SLOT_LOCKS]);
+        fs::remove_dir_all(&base).unwrap();
+    }
 }

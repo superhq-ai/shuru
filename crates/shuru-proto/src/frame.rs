@@ -35,6 +35,9 @@ pub const WRITE_FILE_RESP: u8 = 0x17;
 // Port forwarding
 pub const FWD_REQ: u8 = 0x20;
 pub const FWD_RESP: u8 = 0x21;
+/// Answered by PORT_EVENT frames, a PortList first, until the host hangs up.
+pub const PORTS_WATCH_REQ: u8 = 0x22;
+pub const PORT_EVENT: u8 = 0x23;
 
 // File watching
 pub const WATCH_REQ: u8 = 0x30;

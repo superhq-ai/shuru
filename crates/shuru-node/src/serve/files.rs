@@ -51,6 +51,7 @@ pub async fn route(
         (&Method::GET, "read") => read(node, entry, request).await,
         (&Method::PUT, "write") => write(node, entry, request).await,
         (&Method::GET, "list") => list(node, entry, request).await,
+        (&Method::GET, "stat") => stat(node, entry, request).await,
         (&Method::DELETE, "delete") => delete(node, entry, request).await,
         (&Method::POST, "rename") => rename(node, entry, request).await,
         (&Method::POST, "copy") => copy(node, entry, request).await,
@@ -59,7 +60,8 @@ pub async fn route(
         (&Method::GET, "watch") => watch(node, entry, request).await,
         (
             _,
-            "read" | "write" | "list" | "delete" | "rename" | "copy" | "chmod" | "chown" | "watch",
+            "read" | "write" | "list" | "stat" | "delete" | "rename" | "copy" | "chmod" | "chown"
+            | "watch",
         ) => Err(ApiError::not_allowed(&method, request.uri().path())),
         _ => Err(ApiError::not_found(format!(
             "no route {}",
@@ -380,6 +382,50 @@ fn basename(path: &str) -> &str {
     }
 }
 
+/// The path itself, on a connection kept open for more requests.
+async fn stat_path(addr: &GuestAddr, path: &str) -> Result<(Conn, StatResponse), ApiError> {
+    let stat = StatRequest {
+        path: path.to_string(),
+    };
+    let mut conn = call(addr, frame::STAT_REQ, &stat).await?;
+    let stat = parsed(&mut conn, frame::STAT_RESP, path).await?;
+    Ok((conn, stat))
+}
+
+fn stat_entry(path: &str, stat: &StatResponse) -> DirEntry {
+    let kind = if stat.is_symlink {
+        "symlink"
+    } else if stat.is_dir {
+        "dir"
+    } else {
+        "file"
+    };
+    DirEntry {
+        name: basename(path).to_string(),
+        entry_type: kind.to_string(),
+        size: stat.size,
+        mode: Some(stat.mode),
+        mtime: Some(stat.mtime),
+    }
+}
+
+/// One entry for any path, a directory included, shaped as in a listing.
+/// Not in the Sprites API, whose SDK takes a listing's first entry, which
+/// for a directory is its first child.
+async fn stat(
+    node: &Arc<Node>,
+    entry: &Arc<Entry>,
+    request: Request<Incoming>,
+) -> Result<Response<Body>, ApiError> {
+    let path = Params::parse(request.uri().query())?.target()?;
+    let addr = node.guest(entry).await?;
+    let (_, stat) = stat_path(&addr, &path).await?;
+    Ok(json_response(
+        StatusCode::OK,
+        &entry_json(&stat_entry(&path, &stat), &path),
+    ))
+}
+
 /// A listing of a directory, or of a file as its one entry. A long one
 /// streams as the guest sends it.
 async fn list(
@@ -390,23 +436,8 @@ async fn list(
     let params = Params::parse(request.uri().query())?;
     let path = params.target()?;
     let addr = node.guest(entry).await?;
-    let stat = StatRequest { path: path.clone() };
-    let mut conn = call(&addr, frame::STAT_REQ, &stat).await?;
-    let stat: StatResponse = parsed(&mut conn, frame::STAT_RESP, &path).await?;
-    let itself = DirEntry {
-        name: basename(&path).to_string(),
-        entry_type: if stat.is_symlink {
-            "symlink"
-        } else if stat.is_dir {
-            "dir"
-        } else {
-            "file"
-        }
-        .to_string(),
-        size: stat.size,
-        mode: Some(stat.mode),
-        mtime: Some(stat.mtime),
-    };
+    let (mut conn, stat) = stat_path(&addr, &path).await?;
+    let itself = stat_entry(&path, &stat);
     let single = || {
         let body = json!({ "path": path, "entries": [entry_json(&itself, &path)], "count": 1 });
         Ok(json_response(StatusCode::OK, &body))

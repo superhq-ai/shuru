@@ -46,6 +46,9 @@ pub enum Event {
     Behind(u64),
     /// The guest connection ended without an exit.
     Gone,
+    /// A port opened or closed by a process of the session, as the JSON
+    /// the API sends.
+    Port(Bytes),
 }
 
 /// The hub of a session, if it has one, locked while one is opened.
@@ -143,13 +146,15 @@ impl Hubs {
             if let Some(attachment) = hub.join(offset)? {
                 return Ok(attachment);
             }
-            // The guest takes the new connection as the owner only once
-            // the old one is gone.
             hub.closed().await;
         }
+        // The guest may not have seen the old connection go yet, so this
+        // one claims the session outright; nothing else on the host owns
+        // it.
         let attach = SessionAttach {
             id: id.to_string(),
             output_offset: offset,
+            take_owner: true,
         };
         let (conn, info) = handshake(addr, frame::SESSION_ATTACH, &attach).await?;
         let (hub, attachment) = Hub::open(self, id, info, conn, offset);
@@ -372,22 +377,17 @@ impl Hub {
                 state.start += old.len() as u64;
             }
         }
-        let mut behind = Vec::new();
-        for (id, client) in &state.clients {
-            if client.queued.load(Ordering::Acquire) + len > MAX_BEHIND {
-                let _ = client.tx.send((Event::Behind(before), 0));
-                behind.push(*id);
-            } else {
-                client.queued.fetch_add(len, Ordering::AcqRel);
-                let _ = client.tx.send((Event::Output(stream, data.clone()), len));
-            }
-        }
-        for id in behind {
-            state.clients.remove(&id);
-            if state.owner == Some(id) {
-                state.owner = None;
-            }
-        }
+        queue(&mut state, len, before, || {
+            Event::Output(stream, data.clone())
+        });
+    }
+
+    /// Hands a port event to every client, dropping those too far behind.
+    /// It is not kept for later ones.
+    fn notify(&self, event: Bytes) {
+        let mut state = self.state();
+        let end = state.end;
+        queue(&mut state, event.len(), end, || Event::Port(event.clone()));
     }
 
     /// Sends the last event to every client and takes no more.
@@ -486,6 +486,28 @@ async fn write(
     }
 }
 
+/// Queues `len` bytes of `event` for every client. A client that would
+/// be too far behind is dropped instead and told to attach again from
+/// `offset`.
+fn queue(state: &mut State, len: usize, offset: u64, event: impl Fn() -> Event) {
+    let mut behind = Vec::new();
+    for (id, client) in &state.clients {
+        if client.queued.load(Ordering::Acquire) + len > MAX_BEHIND {
+            let _ = client.tx.send((Event::Behind(offset), 0));
+            behind.push(*id);
+        } else {
+            client.queued.fetch_add(len, Ordering::AcqRel);
+            let _ = client.tx.send((event(), len));
+        }
+    }
+    for id in behind {
+        state.clients.remove(&id);
+        if state.owner == Some(id) {
+            state.owner = None;
+        }
+    }
+}
+
 /// What the reader lets go of when the hub ends: it stops the writer and
 /// waits for it, so the guest connection is closed, whoever still holds
 /// the hub, before its permit returns.
@@ -508,6 +530,7 @@ async fn read(hub: Arc<Hub>, hubs: Arc<Hubs>, mut from_guest: OwnedReadHalf, tea
             Ok(Some((kind @ (frame::STDOUT | frame::STDERR), data))) => {
                 hub.publish(kind, data.into())
             }
+            Ok(Some((frame::PORT_EVENT, payload))) => hub.notify(payload.into()),
             Ok(Some((frame::EXIT, payload))) => {
                 let code = guest::exit_byte(&payload);
                 hub.finish(|| Event::Exit(code));

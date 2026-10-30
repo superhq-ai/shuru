@@ -139,6 +139,7 @@ pub async fn http(
                         let _ = tx.send(Ok(tagged(STREAM_EXIT, &[code]))).await;
                         return;
                     }
+                    Some(Event::Port(_)) => continue,
                     Some(Event::Error(_) | Event::Behind(_) | Event::Gone) | None => return,
                 };
                 if tx.send(Ok(chunk)).await.is_err() {
@@ -231,6 +232,10 @@ async fn bridge(ws: ws::Socket, mut attachment: Attachment) {
                 Some(Event::Output(kind, data)) => {
                     Message::binary(tagged(stream_byte(kind), &data))
                 }
+                Some(Event::Port(event)) => match String::from_utf8(event.into()) {
+                    Ok(text) => Message::text(text),
+                    Err(_) => continue,
+                },
                 Some(Event::Exit(code)) => {
                     let exit = if tty {
                         Message::text(json!({ "type": "exit", "exit_code": code }).to_string())

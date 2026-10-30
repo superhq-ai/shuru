@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use super::sandboxes::{Entry, Node};
-use super::{exec, files, ws};
+use super::{exec, files, ports, ws};
 
 /// A body that fails aborts the connection, so a client cannot take a cut
 /// stream for a whole one.
@@ -295,9 +295,24 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
             let entry = node.get(name)?;
             files::route(&node, &entry, request, op).await
         }
-        (_, [] | [_] | [_, "exec"] | [_, "exec", _] | [_, "exec", _, "kill"]) => {
-            Err(ApiError::not_allowed(&method, &path))
+        (&Method::GET, [name, "proxy"]) => {
+            let entry = node.get(name)?;
+            ports::proxy(&node, &entry, request).await
         }
+        (&Method::GET, [name, "ports", "watch"]) => {
+            let entry = node.get(name)?;
+            ports::watch(&node, &entry, request).await
+        }
+        (
+            _,
+            []
+            | [_]
+            | [_, "exec"]
+            | [_, "exec", _]
+            | [_, "exec", _, "kill"]
+            | [_, "proxy"]
+            | [_, "ports", "watch"],
+        ) => Err(ApiError::not_allowed(&method, &path)),
         _ => Err(ApiError::not_found(format!("no route {path}"))),
     }
 }
