@@ -97,6 +97,29 @@ impl Drop for Sandbox {
     }
 }
 
+/// Removes the cgroup of sandbox `id` that a VM which is gone left behind.
+/// Refuses one that still holds a process.
+pub fn remove_empty(id: &str) -> io::Result<()> {
+    let path = Path::new(ROOT)
+        .join("shuru.slice")
+        .join(format!("sbx-{id}"));
+    match fs::read_to_string(path.join("cgroup.events")) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+        Ok(events) if !events.lines().any(|line| line == "populated 0") => {
+            return Err(io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        Ok(_) => {}
+    }
+    for entry in fs::read_dir(&path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir(entry.path())?;
+        }
+    }
+    fs::remove_dir(&path)
+}
+
 fn write(path: &Path, value: &str) -> io::Result<()> {
     OpenOptions::new()
         .write(true)

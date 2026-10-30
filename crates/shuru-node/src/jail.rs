@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
+use std::sync::Mutex;
 
 pub struct Jail<'a> {
     pub uid: u32,
@@ -46,13 +47,19 @@ const STEPS: [&str; 6] = [
 ];
 
 /// Executes `binary` in the jail and returns its pid. The binary must be
-/// statically linked, since the root it runs in is empty, and the caller
-/// must be single threaded.
+/// statically linked, since the root it runs in is empty. The process is
+/// killed when the thread that spawned it exits, so it never outlives a
+/// caller that crashed.
 pub fn spawn(jail: &Jail, binary: &File, argv: &[&CStr], handoff: &Handoff) -> io::Result<i32> {
     let mut argv: Vec<*const libc::c_char> = argv.iter().map(|arg| arg.as_ptr()).collect();
     argv.push(ptr::null());
     let envp: [*const libc::c_char; 1] = [ptr::null()];
     let options = CString::new("mode=0555,size=4k").unwrap();
+
+    // One launch at a time, so no child inherits the alive pipe of another
+    // and takes that writer for a live parent.
+    static LAUNCH: Mutex<()> = Mutex::new(());
+    let _launch = LAUNCH.lock().unwrap_or_else(|e| e.into_inner());
 
     let mut pipe = [0; 2];
     if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
@@ -60,6 +67,13 @@ pub fn spawn(jail: &Jail, binary: &File, argv: &[&CStr], handoff: &Handoff) -> i
     }
     let (mut report_read, report_write) =
         unsafe { (File::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
+    // The child sees the read end hang up if this process dies before the
+    // parent death signal is set.
+    if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (alive_read, alive_write) =
+        unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
 
     let mut flags = libc::CLONE_NEWNS
         | libc::CLONE_NEWPID
@@ -75,8 +89,12 @@ pub fn spawn(jail: &Jail, binary: &File, argv: &[&CStr], handoff: &Handoff) -> i
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
-        let report = report_write.as_raw_fd();
+        let pipes = Pipes {
+            report: report_write.as_raw_fd(),
+            alive: alive_read.as_raw_fd(),
+        };
         unsafe {
+            libc::close(alive_write.as_raw_fd());
             child(
                 jail,
                 binary.as_raw_fd(),
@@ -84,12 +102,12 @@ pub fn spawn(jail: &Jail, binary: &File, argv: &[&CStr], handoff: &Handoff) -> i
                 &envp,
                 &options,
                 handoff,
-                report,
+                pipes,
             )
         }
     }
     let pid = pid as i32;
-    drop(report_write);
+    drop((report_write, alive_read));
 
     let mut report = [0u8; 8];
     let mut read = 0;
@@ -118,6 +136,13 @@ pub fn spawn(jail: &Jail, binary: &File, argv: &[&CStr], handoff: &Handoff) -> i
     ))
 }
 
+/// The child ends of the pipes to its parent: `report` carries a failed
+/// step, and `alive` hangs up when the parent is gone.
+struct Pipes {
+    report: RawFd,
+    alive: RawFd,
+}
+
 // Runs between clone and exec, so it makes system calls only: no
 // allocation, no locks, and no libc wrappers that assume other threads.
 unsafe fn child(
@@ -127,9 +152,9 @@ unsafe fn child(
     envp: &[*const libc::c_char],
     options: &CStr,
     handoff: &Handoff,
-    report: RawFd,
+    pipes: Pipes,
 ) -> ! {
-    let mut report = report;
+    let Pipes { mut report, alive } = pipes;
     macro_rules! check {
         ($step:expr, $call:expr) => {
             if ($call as i64) < 0 {
@@ -218,6 +243,21 @@ unsafe fn child(
         CREDENTIALS,
         libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
     );
+    // After the uid change, which clears it.
+    check!(
+        CREDENTIALS,
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0)
+    );
+    // A parent that died before that sent no signal.
+    let mut parent = libc::pollfd {
+        fd: alive,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    check!(CREDENTIALS, libc::poll(&mut parent, 1, 0));
+    if parent.revents & libc::POLLHUP != 0 {
+        libc::_exit(127);
+    }
     for (resource, limit) in [
         (libc::RLIMIT_NOFILE, jail.nofile),
         (libc::RLIMIT_NPROC, jail.nproc),
