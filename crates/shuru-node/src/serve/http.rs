@@ -2,6 +2,7 @@
 //! share. Paths and shapes follow the sandbox API (RFC 0012).
 
 use std::convert::Infallible;
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -18,12 +19,14 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use super::exec;
 use super::sandboxes::{Entry, Node};
+use super::{exec, files, ws};
 
-pub type Body = BoxBody<Bytes, Infallible>;
+/// A body that fails aborts the connection, so a client cannot take a cut
+/// stream for a whole one.
+pub type Body = BoxBody<Bytes, io::Error>;
 
-const MAX_JSON_BODY: usize = 64 * 1024;
+pub const MAX_JSON_BODY: usize = 64 * 1024;
 const DEFAULT_PAGE: usize = 50;
 const MAX_PAGE: usize = 500;
 
@@ -32,6 +35,8 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    /// The path of a filesystem error, which takes the errno as its code.
+    path: Option<String>,
 }
 
 impl ApiError {
@@ -40,7 +45,29 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            path: None,
         }
+    }
+
+    pub fn fs(
+        status: StatusCode,
+        errno: &'static str,
+        message: impl Into<String>,
+        path: &str,
+    ) -> Self {
+        ApiError {
+            path: Some(path.to_string()),
+            ..Self::new(status, errno, message)
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    #[cfg(test)]
+    pub fn code(&self) -> &str {
+        self.code
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -59,6 +86,14 @@ impl ApiError {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", message)
     }
 
+    pub fn not_allowed(method: &Method, path: &str) -> Self {
+        Self::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            format!("{method} is not allowed on {path}"),
+        )
+    }
+
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
     }
@@ -67,14 +102,17 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }
 
-    fn response(&self) -> Response<Body> {
-        let body = json!({ "error": self.code, "message": self.message });
+    pub fn response(&self) -> Response<Body> {
+        let body = match &self.path {
+            Some(path) => json!({ "error": self.message, "code": self.code, "path": path }),
+            None => json!({ "error": self.code, "message": self.message }),
+        };
         json_response(self.status, &body)
     }
 }
 
-impl From<std::io::Error> for ApiError {
-    fn from(e: std::io::Error) -> Self {
+impl From<io::Error> for ApiError {
+    fn from(e: io::Error) -> Self {
         ApiError::internal(e.to_string())
     }
 }
@@ -89,28 +127,33 @@ pub fn json_response(status: StatusCode, value: &Value) -> Response<Body> {
 }
 
 pub fn full(bytes: impl Into<Bytes>) -> Body {
-    Full::new(bytes.into()).boxed()
+    Full::new(bytes.into())
+        .map_err(|never| match never {})
+        .boxed()
 }
 
 /// A body that sends each buffer from the channel as one HTTP chunk, and
-/// ends when the sending side is dropped.
-pub struct ChannelBody(pub mpsc::Receiver<Bytes>);
+/// ends when the sending side is dropped or sends an error.
+pub struct ChannelBody(pub mpsc::Receiver<io::Result<Bytes>>);
 
 impl hyper::body::Body for ChannelBody {
     type Data = Bytes;
-    type Error = Infallible;
+    type Error = io::Error;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+    ) -> Poll<Option<io::Result<Frame<Bytes>>>> {
         self.0
             .poll_recv(cx)
-            .map(|chunk| chunk.map(|c| Ok(Frame::data(c))))
+            .map(|chunk| chunk.map(|c| c.map(Frame::data)))
     }
 }
 
-pub fn streaming(content_type: &'static str, rx: mpsc::Receiver<Bytes>) -> Response<Body> {
+pub fn streaming(
+    content_type: &'static str,
+    rx: mpsc::Receiver<io::Result<Bytes>>,
+) -> Response<Body> {
     let mut response = Response::new(ChannelBody(rx).boxed());
     response
         .headers_mut()
@@ -229,7 +272,7 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
         }
         (&Method::GET, [name, "exec"]) => {
             let entry = node.get(name)?;
-            if exec::is_websocket(&request) {
+            if ws::is_websocket(&request) {
                 exec::websocket(&node, &entry, request, None).await
             } else {
                 exec::list(&entry).await
@@ -248,12 +291,12 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
             let entry = node.get(name)?;
             exec::kill(&entry, session, request.uri().query()).await
         }
+        (_, [name, "fs", op]) => {
+            let entry = node.get(name)?;
+            files::route(&node, &entry, request, op).await
+        }
         (_, [] | [_] | [_, "exec"] | [_, "exec", _] | [_, "exec", _, "kill"]) => {
-            Err(ApiError::new(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "method_not_allowed",
-                format!("{method} is not allowed on {path}"),
-            ))
+            Err(ApiError::not_allowed(&method, &path))
         }
         _ => Err(ApiError::not_found(format!("no route {path}"))),
     }

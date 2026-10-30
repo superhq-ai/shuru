@@ -4,10 +4,12 @@
 //! authentication.
 
 mod exec;
+mod files;
 mod guest;
 mod http;
 mod hub;
 mod sandboxes;
+mod ws;
 
 use std::fs;
 use std::net::Ipv4Addr;

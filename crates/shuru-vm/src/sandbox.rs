@@ -623,6 +623,7 @@ impl Sandbox {
         let req = WriteFileRequest {
             path: path.to_string(),
             len: content.len() as u64,
+            ..Default::default()
         };
         frame::send_json(&mut writer, frame::WRITE_FILE_REQ, &req)?;
         for chunk in content.chunks(frame::FILE_CHUNK) {
@@ -745,6 +746,7 @@ impl Sandbox {
 
         let req = ReadDirRequest {
             path: path.to_string(),
+            ..Default::default()
         };
         frame::send_json(&mut writer, frame::READ_DIR_REQ, &req)?;
 
@@ -826,6 +828,7 @@ impl Sandbox {
                 src: src.to_string(),
                 dst: dst.to_string(),
                 recursive,
+                ..Default::default()
             },
         )
     }
@@ -836,6 +839,7 @@ impl Sandbox {
             &ChmodRequest {
                 path: path.to_string(),
                 mode,
+                ..Default::default()
             },
         )
     }
@@ -944,6 +948,7 @@ impl Sandbox {
         let req = WatchRequest {
             path: path.to_string(),
             recursive,
+            detail: false,
         };
         frame::send_json(&mut writer, frame::WATCH_REQ, &req)?;
 

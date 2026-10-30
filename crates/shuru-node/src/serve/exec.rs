@@ -8,32 +8,24 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use hyper::body::{Bytes, Incoming};
-use hyper::header::{
-    HeaderName, HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY,
-    SEC_WEBSOCKET_VERSION, UPGRADE,
-};
-use hyper::upgrade::Upgraded;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use shuru_proto::{
     frame, ExecRequest, KillEvent, SessionInfo, SessionKill, SessionList, SessionStart,
 };
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
 
-use super::guest;
 use super::http::{
-    full, json_response, parse_bool, parse_number, parse_seconds, query_pairs, read_body,
-    streaming, timestamp, ApiError, Body,
+    json_response, parse_bool, parse_number, parse_seconds, query_pairs, read_body, streaming,
+    timestamp, ApiError, Body,
 };
 use super::hub::{Attachment, Event, Input};
 use super::sandboxes::{Entry, Node};
+use super::{guest, ws};
 
 const MAX_STDIN: usize = 10 << 20;
 const MAX_MESSAGE: usize = 1 << 20;
@@ -46,19 +38,6 @@ const STREAM_STDOUT: u8 = 1;
 const STREAM_STDERR: u8 = 2;
 const STREAM_EXIT: u8 = 3;
 const STREAM_STDIN_EOF: u8 = 4;
-
-pub fn is_websocket(request: &Request<Incoming>) -> bool {
-    let has = |name: HeaderName, token: &str| {
-        request.headers().get_all(name).iter().any(|value| {
-            value.to_str().is_ok_and(|value| {
-                value
-                    .split(',')
-                    .any(|t| t.trim().eq_ignore_ascii_case(token))
-            })
-        })
-    };
-    has(CONNECTION, "upgrade") && has(UPGRADE, "websocket")
-}
 
 /// The session a query asks for, and whether the HTTP form sends its body
 /// as stdin. Only the WebSocket form takes a terminal.
@@ -157,12 +136,12 @@ pub async fn http(
                 let chunk = match event {
                     Some(Event::Output(kind, data)) => tagged(stream_byte(kind), &data),
                     Some(Event::Exit(code)) => {
-                        let _ = tx.send(tagged(STREAM_EXIT, &[code])).await;
+                        let _ = tx.send(Ok(tagged(STREAM_EXIT, &[code]))).await;
                         return;
                     }
                     Some(Event::Error(_) | Event::Behind(_) | Event::Gone) | None => return,
                 };
-                if tx.send(chunk).await.is_err() {
+                if tx.send(Ok(chunk)).await.is_err() {
                     return;
                 }
             }
@@ -190,21 +169,7 @@ pub async fn websocket(
     mut request: Request<Incoming>,
     session: Option<String>,
 ) -> Result<Response<Body>, ApiError> {
-    if !is_websocket(&request) {
-        return Err(ApiError::bad_request("expected a WebSocket upgrade"));
-    }
-    if request
-        .headers()
-        .get(SEC_WEBSOCKET_VERSION)
-        .is_none_or(|version| version != "13")
-    {
-        return Err(ApiError::bad_request("expected WebSocket version 13"));
-    }
-    let key = request
-        .headers()
-        .get(SEC_WEBSOCKET_KEY)
-        .ok_or_else(|| ApiError::bad_request("no Sec-WebSocket-Key"))?
-        .clone();
+    let key = ws::key(&request)?;
     let query = request.uri().query();
     let attachment = match session {
         None => {
@@ -232,37 +197,15 @@ pub async fn websocket(
         }
     };
 
-    let upgrade = hyper::upgrade::on(&mut request);
-    tokio::spawn(async move {
-        let Ok(upgraded) = upgrade.await else {
-            return;
-        };
-        let config = WebSocketConfig::default()
-            .max_message_size(Some(MAX_MESSAGE))
-            .max_frame_size(Some(MAX_MESSAGE));
-        let ws =
-            WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(config))
-                .await;
-        bridge(ws, attachment).await;
-    });
-
-    let mut response = Response::new(full(Bytes::new()));
-    *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-    let headers = response.headers_mut();
-    headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
-    headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
-    let accept = derive_accept_key(key.as_bytes());
-    headers.insert(
-        SEC_WEBSOCKET_ACCEPT,
-        HeaderValue::from_str(&accept).map_err(|e| ApiError::internal(e.to_string()))?,
-    );
-    Ok(response)
+    ws::upgrade(&mut request, &key, MAX_MESSAGE, move |socket| {
+        bridge(socket, attachment)
+    })
 }
 
 /// Carries a session between a WebSocket and its hub. Binary messages
 /// carry a stream byte, or raw terminal bytes in a terminal session; text
 /// messages carry JSON.
-async fn bridge(ws: WebSocketStream<TokioIo<Upgraded>>, mut attachment: Attachment) {
+async fn bridge(ws: ws::Socket, mut attachment: Attachment) {
     let info = attachment.info.clone();
     let tty = info.tty;
     let (mut sink, mut stream) = ws.split();
@@ -469,9 +412,11 @@ pub async fn kill(
     }
     let (tx, rx) = mpsc::channel(16);
     tokio::spawn(async move {
+        // The whole connection moves in, its permit with it.
+        let mut guest = guest;
         let mut event = Ok(first);
         while let Ok((line, parsed)) = event {
-            if tx.send(line).await.is_err() {
+            if tx.send(Ok(line)).await.is_err() {
                 return;
             }
             if matches!(

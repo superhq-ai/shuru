@@ -189,26 +189,49 @@ pub struct ReadFileRequest {
     pub path: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct WriteFileRequest {
     pub path: String,
     pub len: u64,
+    /// Permission bits for the file, a new one or one already there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    /// Create missing parent directories. Without it they are created,
+    /// as before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mkdir: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct WriteFileResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The file as written, on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 // --- Filesystem operations protocol ---
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct FsOkResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The paths an operation created or changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    /// The bytes a copy wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    /// The ids a chown set, names resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -239,9 +262,19 @@ pub struct MkdirRequest {
     pub recursive: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct ReadDirRequest {
     pub path: String,
+    /// List the whole tree, each entry named by its path below `path`.
+    #[serde(default)]
+    pub recursive: bool,
+    /// Keep only entries that match this gitignore style pattern.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// Answer with as many READ_DIR_RESP frames as it takes, each with
+    /// `more` set but the last, instead of one frame.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -250,11 +283,19 @@ pub struct DirEntry {
     #[serde(rename = "type")]
     pub entry_type: String,
     pub size: u64,
+    /// The full `st_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    /// Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct ReadDirResponse {
     pub entries: Vec<DirEntry>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -293,18 +334,44 @@ pub struct RenameRequest {
     pub new_path: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct CopyRequest {
     pub src: String,
     pub dst: String,
     #[serde(default)]
     pub recursive: bool,
+    /// Keep owners and times as well as modes.
+    #[serde(default)]
+    pub preserve_attrs: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct ChmodRequest {
     pub path: String,
     pub mode: u32,
+    #[serde(default)]
+    pub recursive: bool,
+}
+
+/// A user or group by number or by name, a name looked up in the guest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Owner {
+    Id(u32),
+    Name(String),
+}
+
+/// Answered by FS_OK_RESP with `count`, `uid` and `gid`. An owner left
+/// out stays as it is.
+#[derive(Default, Serialize, Deserialize)]
+pub struct ChownRequest {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<Owner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<Owner>,
+    #[serde(default)]
+    pub recursive: bool,
 }
 
 // --- File watching protocol ---
@@ -314,6 +381,23 @@ pub struct WatchRequest {
     pub path: String,
     #[serde(default = "default_true")]
     pub recursive: bool,
+    /// Every change, directories included and nothing ignored: an
+    /// FS_OK_RESP once the watch is in place, then WATCH_DETAIL frames,
+    /// with an ERROR frame for a failure.
+    #[serde(default)]
+    pub detail: bool,
+}
+
+/// The payload of a WATCH_DETAIL frame.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct WatchDetail {
+    /// A `watch_kind`.
+    pub kind: u8,
+    pub path: String,
+    /// The size after the change, when the path is still there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    pub is_dir: bool,
 }
 
 fn default_true() -> bool {
@@ -326,6 +410,8 @@ pub mod watch_kind {
     pub const MODIFY: u8 = 0x02;
     pub const DELETE: u8 = 0x03;
     pub const RENAME: u8 = 0x04;
+    /// Owner, mode or times; only in WATCH_DETAIL.
+    pub const CHMOD: u8 = 0x05;
 
     /// The name the stdio protocol and the SDKs use for a kind.
     pub fn name(kind: u8) -> Option<&'static str> {
@@ -334,6 +420,7 @@ pub mod watch_kind {
             MODIFY => Some("modify"),
             DELETE => Some("delete"),
             RENAME => Some("rename"),
+            CHMOD => Some("chmod"),
             _ => None,
         }
     }
