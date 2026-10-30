@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use shuru_node::cgroup::{Limits, Sandbox};
+use shuru_node::cgroup::{Limits, Sandbox, Usage};
 use shuru_node::control::{self, Boot, Disk, NetdConfig, Request, Response, Secret, VmmConfig};
 use shuru_node::firewall::{self, NETD_UID_BASE};
 use shuru_node::jail::{self, Handoff, Jail};
@@ -529,7 +529,9 @@ impl Vm {
         connect_guest(&self.dir.vsock(), &self.identity, &self.vmm)
     }
 
-    pub fn stop(self) {
+    /// Stops the VM and answers what its cgroup used in all, read once
+    /// nothing in it runs.
+    pub fn stop(self) -> Option<Usage> {
         let Vm {
             vmm,
             network,
@@ -541,7 +543,9 @@ impl Vm {
         if let Some(network) = network {
             network.netd.stop();
         }
+        let used = sandbox.usage().ok();
         drop((sandbox, dir));
+        used
     }
 }
 

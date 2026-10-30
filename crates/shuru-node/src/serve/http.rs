@@ -295,6 +295,20 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
             let entry = node.get(name)?;
             files::route(&node, &entry, request, op).await
         }
+        (&Method::GET, [name, "usage"]) => {
+            let entry = node.get(name)?;
+            let run = entry.usage().await?;
+            Ok(json_response(
+                StatusCode::OK,
+                &json!({
+                    "running": run.running,
+                    "boot": run.boot,
+                    "ended": run.ended_ms,
+                    "cpu_usec": run.usage.cpu_usec,
+                    "memory_bytes": run.usage.memory_bytes,
+                }),
+            ))
+        }
         (&Method::GET, [name, "proxy"]) => {
             let entry = node.get(name)?;
             ports::proxy(&node, &entry, request).await
@@ -311,7 +325,8 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
             | [_, "exec", _]
             | [_, "exec", _, "kill"]
             | [_, "proxy"]
-            | [_, "ports", "watch"],
+            | [_, "ports", "watch"]
+            | [_, "usage"],
         ) => Err(ApiError::not_allowed(&method, &path)),
         _ => Err(ApiError::not_found(format!("no route {path}"))),
     }

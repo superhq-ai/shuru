@@ -41,7 +41,16 @@ POST   /v1/sandboxes                  { "name": "web-1" }
 GET    /v1/sandboxes                  ?prefix= &max_results= &continuation_token=
 GET    /v1/sandboxes/{name}
 DELETE /v1/sandboxes/{name}
+GET    /v1/sandboxes/{name}/usage
 ```
+
+`usage` is an addition to the Sprites API, for whatever meters the host:
+`running`, `boot`, a number for the run of the VM that grows with every
+start, and the CPU time (`cpu_usec`) and memory (`memory_bytes`) the
+cgroup of that run shows. Once the VM stops, `cpu_usec` is what its last
+run used in all and `ended` when it stopped, so a meter misses nothing at
+the end of a run; `boot` and `ended` are in milliseconds, and `boot` is
+null for a sandbox that has not run since serve started.
 
 Each sandbox keeps a directory under the state directory
 (`/var/lib/shuru/sandboxes/<id>/`) with `sandbox.json` (id, name, size)

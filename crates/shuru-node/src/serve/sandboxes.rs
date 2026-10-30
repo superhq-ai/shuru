@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ use super::http::ApiError;
 use super::hub::Hubs;
 use super::ServeArgs;
 use crate::vm::{self, Host, KernelBoot, NetworkPolicy, Vm};
+use shuru_node::cgroup;
 
 const RECORD: &str = "sandbox.json";
 const DISK: &str = "disk";
@@ -58,6 +59,8 @@ pub struct GuestAddr {
 
 struct Running {
     guest: GuestAddr,
+    slot: u32,
+    boot: u64,
     alive: Arc<AtomicBool>,
     /// Stops the VM, after shutting the guest down when true.
     stop: mpsc::Sender<bool>,
@@ -80,6 +83,26 @@ pub struct Entry {
     running: Arc<AtomicBool>,
     deleted: AtomicBool,
     last_running_at: AtomicU64,
+    ended: Mutex<Option<Ended>>,
+}
+
+/// The last run of a VM to stop: its boot, when it stopped, in
+/// milliseconds, and the CPU time it used in all.
+#[derive(Clone, Copy)]
+struct Ended {
+    boot: u64,
+    at_ms: u64,
+    cpu_usec: u64,
+}
+
+/// What a VM of a sandbox has used. `boot` tells one run of the VM from
+/// the next, and is `None` for a sandbox that has not run since serve
+/// started; `ended_ms` is when the run stopped.
+pub struct RunUsage {
+    pub running: bool,
+    pub boot: Option<u64>,
+    pub ended_ms: Option<u64>,
+    pub usage: cgroup::Usage,
 }
 
 impl Entry {
@@ -95,6 +118,37 @@ impl Entry {
             0 => None,
             at => Some(at),
         }
+    }
+
+    /// What the running VM has used since it booted or, once it stopped,
+    /// what the last one used in all, so a meter misses nothing at the end
+    /// of a run.
+    pub async fn usage(&self) -> Result<RunUsage, ApiError> {
+        let vm = self.vm.lock().await;
+        if let Some(running) = vm
+            .as_ref()
+            .filter(|running| running.alive.load(Ordering::Acquire))
+        {
+            let usage = cgroup::usage(&running.slot.to_string())
+                .map_err(|e| ApiError::internal(format!("reading the sandbox cgroup: {e}")))?;
+            return Ok(RunUsage {
+                running: true,
+                boot: Some(running.boot),
+                ended_ms: None,
+                usage,
+            });
+        }
+        drop(vm);
+        let ended = *self.ended.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(RunUsage {
+            running: false,
+            boot: ended.map(|ended| ended.boot),
+            ended_ms: ended.map(|ended| ended.at_ms),
+            usage: cgroup::Usage {
+                cpu_usec: ended.map_or(0, |ended| ended.cpu_usec),
+                memory_bytes: 0,
+            },
+        })
     }
 
     /// The guest of a sandbox that is running, without booting one that is
@@ -124,6 +178,7 @@ pub struct Node {
     dir: PathBuf,
     sandboxes: Mutex<BTreeMap<String, Arc<Entry>>>,
     slots: Mutex<BTreeSet<u32>>,
+    last_boot: AtomicU64,
     /// Set once shutdown starts; no operation starts after it.
     closing: AtomicBool,
     /// A permit per create, delete or boot in flight, which shutdown waits
@@ -186,6 +241,7 @@ impl Node {
             dir,
             sandboxes: Mutex::new(BTreeMap::new()),
             slots: Mutex::new(slots),
+            last_boot: AtomicU64::new(0),
             closing: AtomicBool::new(false),
             ops: Arc::new(Semaphore::new(OPS as usize)),
             _lock: lock,
@@ -447,6 +503,7 @@ impl Node {
             .slots()
             .pop_first()
             .ok_or_else(|| ApiError::unavailable("this host runs as many sandboxes as it may"))?;
+        let boot = self.next_boot();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
         let alive = entry.running.clone();
@@ -456,7 +513,7 @@ impl Node {
             let alive = alive.clone();
             std::thread::Builder::new()
                 .name(format!("vm-{}", entry.record.name))
-                .spawn(move || node.hold(&entry, slot, alive, ready_tx, stop_rx))
+                .spawn(move || node.hold(&entry, slot, boot, alive, ready_tx, stop_rx))
         };
         let thread = match thread {
             Ok(thread) => thread,
@@ -479,6 +536,8 @@ impl Node {
         entry.last_running_at.store(unix_now(), Ordering::Relaxed);
         *vm = Some(Running {
             guest: guest.clone(),
+            slot,
+            boot,
             alive,
             stop: stop_tx,
             thread,
@@ -486,10 +545,24 @@ impl Node {
         Ok(guest)
     }
 
+    /// A number for a VM start, above that of any start before it: the
+    /// time in milliseconds, or one past the last when the clock has not
+    /// moved on.
+    fn next_boot(&self) -> u64 {
+        let now = unix_millis();
+        let next = |last: u64| now.max(last + 1);
+        self.last_boot
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                Some(next(last))
+            })
+            .map_or(now, next)
+    }
+
     fn hold(
         &self,
         entry: &Entry,
         slot: u32,
+        boot: u64,
         alive: Arc<AtomicBool>,
         ready: tokio::sync::oneshot::Sender<Result<GuestAddr>>,
         stop: mpsc::Receiver<bool>,
@@ -532,7 +605,13 @@ impl Node {
                 eprintln!("shuru-node: shutting down sandbox {name}: {e:#}");
             }
         }
-        vm.stop();
+        if let Some(used) = vm.stop() {
+            *entry.ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ended {
+                boot,
+                at_ms: unix_millis(),
+                cpu_usec: used.cpu_usec,
+            });
+        }
         self.release(slot);
     }
 
@@ -597,6 +676,7 @@ impl Entry {
             running: Arc::new(AtomicBool::new(false)),
             deleted: AtomicBool::new(false),
             last_running_at: AtomicU64::new(0),
+            ended: Mutex::new(None),
         }
     }
 }
@@ -666,6 +746,12 @@ pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[cfg(test)]
