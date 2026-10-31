@@ -52,7 +52,7 @@ jobs:
           retention-days: 1
 
   build-cli-darwin:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
 
