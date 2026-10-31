@@ -129,7 +129,7 @@ fn serve(vm: &VirtualMachine, stream: &UnixStream) {
             Request::Configure(_) | Request::ConfigureNetwork(_) => Response::Error {
                 message: "already configured".into(),
             },
-            Request::Flows => Response::Error {
+            Request::Flows | Request::Egress => Response::Error {
                 message: "not a request for the VMM".into(),
             },
             // The node shuts the guest down first when it wants a clean

@@ -32,6 +32,13 @@ const CONNECTION_RATE: ConnectionRate = ConnectionRate {
     },
 };
 
+/// 100 Mbit/s for all the connections of a sandbox, with a second of it
+/// at once.
+const EGRESS_RATE: Rate = Rate {
+    per_second: 12_500_000,
+    burst: 12_500_000,
+};
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("shuru-netd: {e:#}");
@@ -99,6 +106,7 @@ fn start(
         public_only: true,
         deny_ports: SMTP.to_vec(),
         connection_rate: Some(CONNECTION_RATE),
+        egress_rate: Some(EGRESS_RATE),
         egress_log: Some(egress.clone()),
         upstream_roots: Some(config.upstream_roots.into_bytes()),
         ..Default::default()
@@ -121,6 +129,9 @@ fn serve(stream: &UnixStream, proxy: &shuru_proxy::ProxyHandle, egress: &EgressL
             }
             Request::Flows => Response::Flows {
                 flows: proxy.flows.ages(),
+            },
+            Request::Egress => Response::Egress {
+                bytes: proxy.egress.bytes(),
             },
             _ => Response::Error {
                 message: "not a request for the network process".into(),

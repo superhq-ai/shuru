@@ -1,6 +1,7 @@
 //! Which new connections the guest may open, decided on its SYN: ports
-//! refused outright, and a pace for the rest. And the record of what it
-//! opened, for tracing an abuse report to a sandbox.
+//! refused outright, and a pace for the rest. The bytes it sends out, in
+//! all and at a pace. And the record of what it opened, for tracing an
+//! abuse report to a sandbox.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
@@ -220,6 +221,42 @@ fn rfc3339(at: SystemTime) -> String {
         .unwrap_or_default()
 }
 
+/// The bytes the guest sent out, in all, and the pace they may leave at.
+pub struct Egress {
+    bytes: AtomicU64,
+    pace: Option<Mutex<Bucket>>,
+}
+
+impl Egress {
+    pub(crate) fn new(rate: Option<Rate>, now: Instant) -> Self {
+        Egress {
+            bytes: AtomicU64::new(0),
+            pace: rate
+                .filter(|rate| rate.per_second > 0)
+                .map(|rate| Mutex::new(Bucket::new(rate, now))),
+        }
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Spends `n` bytes of the pace, and answers how long to hold them
+    /// back before they leave.
+    pub(crate) fn spend(&self, n: usize, now: Instant) -> Option<Duration> {
+        let mut bucket = self
+            .pace
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        bucket.owe(n as f64, now)
+    }
+
+    pub(crate) fn sent(&self, n: usize) {
+        self.bytes.fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
 /// Bytes each way on one connection, and the host its TLS ClientHello
 /// named, filled in as the relay runs.
 #[derive(Default)]
@@ -360,6 +397,15 @@ impl Bucket {
 
     fn take(&mut self) {
         self.tokens -= 1.0;
+    }
+
+    /// Takes `n` even past empty, and answers how long until the debt is
+    /// paid back.
+    fn owe(&mut self, n: f64, now: Instant) -> Option<Duration> {
+        self.refill(now);
+        self.tokens -= n;
+        (self.tokens < 0.0)
+            .then(|| Duration::from_secs_f64(-self.tokens / f64::from(self.rate.per_second)))
     }
 }
 
@@ -600,5 +646,36 @@ mod tests {
         }
         let later = now + Duration::from_secs(1);
         assert_eq!(gate.admit((host(2), 443), later), Verdict::Open);
+    }
+
+    #[test]
+    fn egress_leaves_at_its_pace_after_the_burst() {
+        let now = Instant::now();
+        let rate = Rate {
+            per_second: 1000,
+            burst: 1000,
+        };
+        let egress = Egress::new(Some(rate), now);
+        assert_eq!(egress.spend(1000, now), None);
+        assert_eq!(egress.spend(500, now), Some(Duration::from_millis(500)));
+        // Every connection waits out the debt of all of them.
+        assert_eq!(egress.spend(500, now), Some(Duration::from_secs(1)));
+        let later = now + Duration::from_secs(3);
+        assert_eq!(egress.spend(1000, later), None, "paid back and full again");
+    }
+
+    #[test]
+    fn egress_without_a_pace_is_only_counted() {
+        let now = Instant::now();
+        let egress = Egress::new(None, now);
+        assert_eq!(egress.spend(usize::MAX, now), None);
+        egress.sent(1500);
+        egress.sent(500);
+        assert_eq!(egress.bytes(), 2000);
+        let zero = Rate {
+            per_second: 0,
+            burst: 0,
+        };
+        assert_eq!(Egress::new(Some(zero), now).spend(1, now), None);
     }
 }

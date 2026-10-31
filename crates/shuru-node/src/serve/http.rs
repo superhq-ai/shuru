@@ -385,6 +385,7 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
                     "ended": run.ended_ms,
                     "cpu_usec": run.usage.cpu_usec,
                     "memory_bytes": run.usage.memory_bytes,
+                    "egress_bytes": run.egress_bytes,
                 }),
             ))
         }
