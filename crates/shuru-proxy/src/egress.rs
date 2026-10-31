@@ -2,12 +2,12 @@
 //! refused outright, and a pace for the rest. And the record of what it
 //! opened, for tracing an abuse report to a sandbox.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use lru::LruCache;
@@ -30,17 +30,54 @@ const REPORT_EVERY: Duration = Duration::from_secs(10);
 const HOST_MAX: usize = 253;
 
 /// Where the record of what a guest opened goes: one JSON line per
-/// connection, and the SYNs held back or refused per interval.
+/// connection, and the SYNs held back or refused per interval. `close`
+/// writes what is still open, so a sandbox that stops leaves its record.
 #[derive(Clone)]
 pub struct EgressLog {
     sandbox: Arc<str>,
+    state: Arc<Mutex<State>>,
     out: Arc<Mutex<Box<dyn Write + Send>>>,
+}
+
+struct State {
+    next: u64,
+    open: HashMap<u64, Open>,
+    turned_away: TurnedAway,
+}
+
+struct Open {
+    dst: SocketAddr,
+    at: SystemTime,
+    since: Instant,
+    tally: Arc<Tally>,
+}
+
+/// SYNs turned away since `since`.
+struct TurnedAway {
+    since: SystemTime,
+    held: u64,
+    refused: BTreeMap<u16, u64>,
+}
+
+impl TurnedAway {
+    fn since(since: SystemTime) -> Self {
+        TurnedAway {
+            since,
+            held: 0,
+            refused: BTreeMap::new(),
+        }
+    }
 }
 
 impl EgressLog {
     pub fn new(sandbox: &str, out: impl Write + Send + 'static) -> Self {
         EgressLog {
             sandbox: sandbox.into(),
+            state: Arc::new(Mutex::new(State {
+                next: 0,
+                open: HashMap::new(),
+                turned_away: TurnedAway::since(SystemTime::now()),
+            })),
             out: Arc::new(Mutex::new(Box::new(out))),
         }
     }
@@ -49,39 +86,102 @@ impl EgressLog {
         Self::new(sandbox, std::io::stderr())
     }
 
+    /// Writes every connection still open, marked `open`, and the SYNs
+    /// turned away since the last report. For a sandbox about to stop.
+    pub fn close(&self) {
+        let (open, turned) = {
+            let mut state = self.state();
+            let open: Vec<Open> = state.open.drain().map(|(_, open)| open).collect();
+            let turned =
+                std::mem::replace(&mut state.turned_away, TurnedAway::since(SystemTime::now()));
+            (open, turned)
+        };
+        for open in &open {
+            self.connection(open, open.since.elapsed(), None);
+        }
+        self.turned_away(turned);
+    }
+
+    pub(crate) fn open(&self, dst: SocketAddr, tally: Arc<Tally>) -> Opened {
+        let mut state = self.state();
+        let id = state.next;
+        state.next += 1;
+        state.open.insert(
+            id,
+            Open {
+                dst,
+                at: SystemTime::now(),
+                since: Instant::now(),
+                tally,
+            },
+        );
+        Opened {
+            log: self.clone(),
+            id,
+            ok: false,
+        }
+    }
+
+    fn ended(&self, id: u64, ok: bool) {
+        let open = self.state().open.remove(&id);
+        if let Some(open) = open {
+            self.connection(&open, open.since.elapsed(), Some(ok));
+        }
+    }
+
+    fn refused(&self, port: u16) {
+        *self.state().turned_away.refused.entry(port).or_default() += 1;
+    }
+
+    fn held(&self) {
+        self.state().turned_away.held += 1;
+    }
+
+    fn report(&self) {
+        let turned = std::mem::replace(
+            &mut self.state().turned_away,
+            TurnedAway::since(SystemTime::now()),
+        );
+        self.turned_away(turned);
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn write(&self, line: serde_json::Value) {
         let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
         let _ = writeln!(out, "{line}");
     }
 
-    pub(crate) fn connection(
-        &self,
-        dst: SocketAddr,
-        opened: SystemTime,
-        lasted: Duration,
-        tally: &Tally,
-        ok: bool,
-    ) {
-        self.write(json!({
+    fn connection(&self, open: &Open, lasted: Duration, ok: Option<bool>) {
+        let mut line = json!({
             "egress": "connection",
             "sandbox": &*self.sandbox,
-            "at": rfc3339(opened),
-            "dst": dst.to_string(),
-            "host": tally.host.get(),
-            "up": tally.up.load(Ordering::Relaxed),
-            "down": tally.down.load(Ordering::Relaxed),
+            "at": rfc3339(open.at),
+            "dst": open.dst.to_string(),
+            "host": open.tally.host.get(),
+            "up": open.tally.up.load(Ordering::Relaxed),
+            "down": open.tally.down.load(Ordering::Relaxed),
             "ms": lasted.as_millis() as u64,
-            "ok": ok,
-        }));
+        });
+        match ok {
+            Some(ok) => line["ok"] = ok.into(),
+            None => line["open"] = true.into(),
+        }
+        self.write(line);
     }
 
-    fn turned_away(&self, since: SystemTime, held: u64, refused: &BTreeMap<u16, u64>) {
+    fn turned_away(&self, turned: TurnedAway) {
+        if turned.held == 0 && turned.refused.is_empty() {
+            return;
+        }
         self.write(json!({
             "egress": "turned_away",
             "sandbox": &*self.sandbox,
-            "at": rfc3339(since),
-            "held": held,
-            "refused": refused,
+            "at": rfc3339(turned.since),
+            "held": turned.held,
+            "refused": turned.refused,
         }));
     }
 }
@@ -91,6 +191,26 @@ impl std::fmt::Debug for EgressLog {
         f.debug_struct("EgressLog")
             .field("sandbox", &self.sandbox)
             .finish_non_exhaustive()
+    }
+}
+
+/// A connection in the record until it ends. Dropped without `end`, as
+/// when its task panics, it is written as failed.
+pub(crate) struct Opened {
+    log: EgressLog,
+    id: u64,
+    ok: bool,
+}
+
+impl Opened {
+    pub(crate) fn end(mut self, ok: bool) {
+        self.ok = ok;
+    }
+}
+
+impl Drop for Opened {
+    fn drop(&mut self) {
+        self.log.ended(self.id, self.ok);
     }
 }
 
@@ -126,13 +246,6 @@ impl Tally {
     }
 }
 
-/// SYNs turned away since `since`.
-struct TurnedAway {
-    since: (Instant, SystemTime),
-    held: u64,
-    refused: BTreeMap<u16, u64>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verdict {
     Open,
@@ -146,7 +259,7 @@ pub(crate) struct Gate {
     deny_ports: HashSet<u16>,
     rate: Option<Paced>,
     log: Option<EgressLog>,
-    turned_away: TurnedAway,
+    next_report: Instant,
 }
 
 struct Paced {
@@ -165,20 +278,18 @@ impl Gate {
                 reached: LruCache::new(NonZeroUsize::new(DESTINATIONS_KEPT).expect("non-zero")),
             }),
             log: config.egress_log.clone(),
-            turned_away: TurnedAway {
-                since: (now, SystemTime::now()),
-                held: 0,
-                refused: BTreeMap::new(),
-            },
+            next_report: now + REPORT_EVERY,
         }
     }
 
     pub(crate) fn admit(&mut self, dst: (Ipv4Address, u16), now: Instant) -> Verdict {
         let verdict = self.decide(dst, now);
-        match verdict {
-            Verdict::Open => {}
-            Verdict::Refuse => *self.turned_away.refused.entry(dst.1).or_default() += 1,
-            Verdict::Wait => self.turned_away.held += 1,
+        if let Some(log) = &self.log {
+            match verdict {
+                Verdict::Open => {}
+                Verdict::Refuse => log.refused(dst.1),
+                Verdict::Wait => log.held(),
+            }
         }
         verdict
     }
@@ -189,18 +300,11 @@ impl Gate {
         let Some(log) = &self.log else {
             return;
         };
-        let turned = &mut self.turned_away;
-        if now.saturating_duration_since(turned.since.0) < REPORT_EVERY {
+        if now < self.next_report {
             return;
         }
-        if turned.held > 0 || !turned.refused.is_empty() {
-            log.turned_away(turned.since.1, turned.held, &turned.refused);
-        }
-        *turned = TurnedAway {
-            since: (now, SystemTime::now()),
-            held: 0,
-            refused: BTreeMap::new(),
-        };
+        log.report();
+        self.next_report = now + REPORT_EVERY;
     }
 
     fn decide(&mut self, dst: (Ipv4Address, u16), now: Instant) -> Verdict {
@@ -384,9 +488,13 @@ mod tests {
         tally.up.store(512, Ordering::Relaxed);
         tally.down.store(4096, Ordering::Relaxed);
         tally.set_host("Example.COM");
-        let dst: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        let opened = SystemTime::UNIX_EPOCH + Duration::from_secs(1_793_000_000);
-        log.connection(dst, opened, Duration::from_millis(1234), &tally, true);
+        let open = Open {
+            dst: "93.184.216.34:443".parse().unwrap(),
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_793_000_000),
+            since: Instant::now(),
+            tally: Arc::new(tally),
+        };
+        log.connection(&open, Duration::from_millis(1234), Some(true));
         let lines = lines.read();
         assert_eq!(lines.len(), 1);
         assert_eq!(
@@ -403,6 +511,36 @@ mod tests {
                 "ok": true,
             })
         );
+    }
+
+    #[test]
+    fn closing_writes_what_is_still_open_and_what_was_turned_away() {
+        let lines = Lines::default();
+        let log = EgressLog::new("sbx-1", lines.clone());
+        let ended = log.open("93.184.216.34:443".parse().unwrap(), Arc::default());
+        let still = log.open("93.184.216.35:443".parse().unwrap(), Arc::default());
+        ended.end(true);
+        log.refused(25);
+        log.close();
+        drop(still);
+        log.close();
+        let read = lines.read();
+        assert_eq!(read.len(), 3, "{read:?}");
+        assert_eq!(read[0]["dst"], "93.184.216.34:443");
+        assert_eq!(read[0]["ok"], true);
+        assert_eq!(read[1]["dst"], "93.184.216.35:443");
+        assert_eq!(read[1]["open"], true);
+        assert!(read[1].get("ok").is_none());
+        assert_eq!(read[2]["egress"], "turned_away");
+        assert_eq!(read[2]["refused"], json!({"25": 1}));
+    }
+
+    #[test]
+    fn a_connection_dropped_without_an_end_is_written_as_failed() {
+        let lines = Lines::default();
+        let log = EgressLog::new("sbx-1", lines.clone());
+        drop(log.open("93.184.216.34:443".parse().unwrap(), Arc::default()));
+        assert_eq!(lines.read()[0]["ok"], false);
     }
 
     #[test]

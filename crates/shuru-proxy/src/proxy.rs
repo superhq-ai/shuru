@@ -141,21 +141,19 @@ impl ProxyEngine {
             cmd_tx: self.cmd_tx.clone(),
         };
         let shared = self.shared.clone();
+        let opened = shared
+            .config
+            .egress_log
+            .as_ref()
+            .map(|log| log.open(conn.dst, tally.clone()));
 
         tokio::spawn(async move {
-            let opened = (std::time::SystemTime::now(), std::time::Instant::now());
             let result = handle_connection(guest, conn.dst, &shared, &tally).await;
             if let Err(e) = &result {
                 debug!("connection to {} ended: {e}", conn.dst);
             }
-            if let Some(log) = &shared.config.egress_log {
-                log.connection(
-                    conn.dst,
-                    opened.0,
-                    opened.1.elapsed(),
-                    &tally,
-                    result.is_ok(),
-                );
+            if let Some(opened) = opened {
+                opened.end(result.is_ok());
             }
         });
     }

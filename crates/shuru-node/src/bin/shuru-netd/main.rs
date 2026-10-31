@@ -52,7 +52,7 @@ fn run() -> Result<()> {
     let Request::ConfigureNetwork(config) = request else {
         bail!("the first request must be the network configuration");
     };
-    let (proxy, response) = match start(config, fds, log) {
+    let (proxy, egress, response) = match start(config, fds, log) {
         Ok(started) => started,
         Err(e) => {
             let message = format!("{e:#}");
@@ -64,7 +64,7 @@ fn run() -> Result<()> {
 
     let mut stream = stream;
     loop {
-        serve(&stream, &proxy);
+        serve(&stream, &proxy, &egress);
         stream = listener.accept().context("accepting the node")?.0;
     }
 }
@@ -73,7 +73,7 @@ fn start(
     config: NetdConfig,
     fds: Vec<OwnedFd>,
     log: bool,
-) -> Result<(shuru_proxy::ProxyHandle, Response)> {
+) -> Result<(shuru_proxy::ProxyHandle, EgressLog, Response)> {
     let [frames]: [OwnedFd; 1] = fds
         .try_into()
         .map_err(|fds: Vec<_>| anyhow::anyhow!("expected 1 descriptor, got {}", fds.len()))?;
@@ -89,6 +89,7 @@ fn start(
             (name, secret)
         })
         .collect();
+    let egress = EgressLog::stderr(&config.sandbox);
     let proxy = ProxyConfig {
         dns_resolver: config.dns_resolver,
         secrets,
@@ -98,7 +99,7 @@ fn start(
         public_only: true,
         deny_ports: SMTP.to_vec(),
         connection_rate: Some(CONNECTION_RATE),
-        egress_log: Some(EgressLog::stderr(&config.sandbox)),
+        egress_log: Some(egress.clone()),
         upstream_roots: Some(config.upstream_roots.into_bytes()),
         ..Default::default()
     };
@@ -107,13 +108,14 @@ fn start(
     let response = Response::Network {
         session: handle.session(),
     };
-    Ok((handle, response))
+    Ok((handle, egress, response))
 }
 
-fn serve(stream: &UnixStream, proxy: &shuru_proxy::ProxyHandle) {
+fn serve(stream: &UnixStream, proxy: &shuru_proxy::ProxyHandle, egress: &EgressLog) {
     while let Ok(Some((request, _))) = control::receive::<Request>(stream, 0) {
         let response = match request {
             Request::Stop => {
+                egress.close();
                 let _ = control::send(stream, &Response::Ok, &[]);
                 std::process::exit(0);
             }
