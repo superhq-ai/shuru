@@ -63,7 +63,7 @@ async fn carry(mut socket: ws::Socket, addr: GuestAddr) {
         Err(_) => Err("no target within 10 s".to_string()),
     };
     let opened = match target {
-        Ok(target) => open(&addr, &target)
+        Ok(target) => open(&addr, &target.host, target.port)
             .await
             .map(|conn| (conn, format!("{}:{}", target.host, target.port)))
             .map_err(|e| e.message().to_string()),
@@ -98,11 +98,11 @@ fn target(text: &str) -> Result<ProxyTarget, String> {
     Ok(target)
 }
 
-async fn open(addr: &GuestAddr, target: &ProxyTarget) -> Result<Conn, ApiError> {
+pub async fn open(addr: &GuestAddr, host: &str, port: u16) -> Result<Conn, ApiError> {
     let mut conn = guest::connect_forward(addr, &addr.streams).await?;
     let request = ForwardRequest {
-        port: target.port,
-        host: Some(target.host.clone()),
+        port,
+        host: Some(host.to_string()),
         whole_close: true,
     };
     guest::send_json(&mut conn.stream, frame::FWD_REQ, &request).await?;

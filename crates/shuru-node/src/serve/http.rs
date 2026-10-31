@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use super::config::SandboxConfig;
 use super::idle::Busy;
 use super::sandboxes::{Entry, Node};
-use super::{exec, files, ports, ws};
+use super::{exec, files, ports, url, ws};
 
 /// A body that fails aborts the connection, so a client cannot take a cut
 /// stream for a whole one.
@@ -96,6 +96,11 @@ impl ApiError {
             "method_not_allowed",
             format!("{method} is not allowed on {path}"),
         )
+    }
+
+    /// The server in the guest a request was for did not answer.
+    pub fn bad_gateway(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, "bad_gateway", message)
     }
 
     pub fn unavailable(message: impl Into<String>) -> Self {
@@ -268,6 +273,12 @@ pub async fn connection(node: Arc<Node>, stream: tokio::net::UnixStream) {
 
 async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<Body>, ApiError> {
     let path = request.uri().path().to_string();
+    if let Some((name, target)) = url::target(&path, request.uri().query()) {
+        let entry = node.get(name)?;
+        let busy = entry.busy();
+        let response = url::forward(&node, &entry, request, &target).await?;
+        return Ok(response.map(|body| Held { body, _busy: busy }.boxed()));
+    }
     let Some(rest) = path.strip_prefix("/v1/sandboxes") else {
         return Err(ApiError::not_found(format!("no route {path}")));
     };
