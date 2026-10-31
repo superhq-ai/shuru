@@ -39,6 +39,8 @@ const STREAMS: usize = vm::VSOCK_CONNECTIONS * 3 / 4;
 const CALLS: usize = vm::VSOCK_CONNECTIONS - STREAMS - 1;
 /// More creates, deletes and boots than ever run at once.
 const OPS: u32 = 1 << 20;
+const MIB: u64 = 1 << 20;
+const GIB: u64 = 1 << 30;
 
 /// The settings of a sandbox.
 #[derive(Clone, Serialize, Deserialize)]
@@ -64,8 +66,8 @@ struct Stored {
 
 /// Where the disk of a new sandbox comes from.
 enum NewDisk {
-    /// A copy of the base disk.
-    Base(PathBuf),
+    /// A copy of the base disk, grown to `size` bytes when it is smaller.
+    Base { path: PathBuf, size: u64 },
     /// A file under the import directory, moved in.
     Import(PathBuf),
 }
@@ -228,6 +230,9 @@ struct Config {
     base_disk: PathBuf,
     cpus: usize,
     memory_mib: u64,
+    disk_bytes: u64,
+    min_free_disk: u64,
+    min_free_memory: u64,
     network: Option<NetworkPolicy>,
     ca_bundle: PathBuf,
     verbose: bool,
@@ -264,6 +269,17 @@ impl Node {
         for path in [&args.kernel, &args.initrd, &args.disk] {
             fs::metadata(path).with_context(|| format!("{}", path.display()))?;
         }
+        let gib = |value: u64, flag: &str| {
+            value
+                .checked_mul(GIB)
+                .with_context(|| format!("{flag} is too large"))
+        };
+        let disk_bytes = gib(args.disk_size, "--disk-size")?;
+        let min_free_disk = gib(args.min_free_disk, "--min-free-disk")?;
+        let min_free_memory = args
+            .min_free_memory
+            .checked_mul(MIB)
+            .context("--min-free-memory is too large")?;
         fs::DirBuilder::new()
             .mode(0o700)
             .recursive(true)
@@ -312,6 +328,9 @@ impl Node {
                 base_disk: args.disk.clone(),
                 cpus: args.cpus,
                 memory_mib: args.memory,
+                disk_bytes,
+                min_free_disk,
+                min_free_memory,
                 network: args.allow_net.then(|| NetworkPolicy {
                     allow: Vec::new(),
                     secrets: Vec::new(),
@@ -430,9 +449,13 @@ impl Node {
             ));
         }
         self.check_config(&config)?;
+        disk_room(free_bytes(&self.dir)?, self.config.min_free_disk)?;
         let disk = match disk {
             Some(disk) => NewDisk::Import(import_path(&self.import, disk)?),
-            None => NewDisk::Base(self.config.base_disk.clone()),
+            None => NewDisk::Base {
+                path: self.config.base_disk.clone(),
+                size: self.config.disk_bytes,
+            },
         };
         let op = self.op()?;
         let node = self.clone();
@@ -499,7 +522,7 @@ impl Node {
         }
         let imported = match &disk {
             NewDisk::Import(path) => Some(path.clone()),
-            NewDisk::Base(_) => None,
+            NewDisk::Base { .. } => None,
         };
         let made = {
             let dir = self.dir.clone();
@@ -790,6 +813,13 @@ impl Node {
         if let Some(gone) = vm.take() {
             gone.stop(false).await;
         }
+        let meminfo = fs::read_to_string("/proc/meminfo")
+            .map_err(|e| ApiError::internal(format!("reading /proc/meminfo: {e}")))?;
+        memory_room(
+            mem_available(&meminfo),
+            entry.record.memory_mib.saturating_mul(MIB),
+            self.config.min_free_memory,
+        )?;
         let slot = self
             .slots()
             .pop_first()
@@ -1103,7 +1133,13 @@ fn make(dir: &Path, disk: &NewDisk, record: &Record, config: &SandboxConfig) -> 
         let config_file = crate::create_private(&staging.join(config::CONFIG))?;
         (&config_file).write_all(&serde_json::to_vec(config)?)?;
         let disk = match disk {
-            NewDisk::Base(base) => crate::clone_file(base, &staging.join(DISK))?,
+            NewDisk::Base { path, size } => {
+                let disk = crate::clone_file(path, &staging.join(DISK))?;
+                if disk.metadata()?.len() < *size {
+                    disk.set_len(*size)?;
+                }
+                disk
+            }
             NewDisk::Import(path) => {
                 fs::rename(path, staging.join(DISK))
                     .with_context(|| format!("moving {} in", path.display()))?;
@@ -1169,6 +1205,53 @@ fn restore_disk(dir: &Path, record: Record, boot: u64, from: &Path) -> Result<()
     vm::open(from)?.sync_all()?;
     fs::rename(from, dir.join(DISK)).with_context(|| format!("moving {} in", from.display()))?;
     File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Bytes free for an unprivileged writer on the filesystem of `path`.
+fn free_bytes(path: &Path) -> Result<u64, ApiError> {
+    let file = File::open(path)?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatvfs(file.as_raw_fd(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+/// A new sandbox is refused while the state directory has less than
+/// `reserve` free: guests share it, and one that fills it fails them all.
+fn disk_room(free: u64, reserve: u64) -> Result<(), ApiError> {
+    if free < reserve {
+        return Err(ApiError::full(format!(
+            "this host has {} GiB of disk free and keeps {} GiB",
+            free / GIB,
+            reserve / GIB
+        )));
+    }
+    Ok(())
+}
+
+/// MemAvailable of `/proc/meminfo`, in bytes; 0 when it is missing.
+fn mem_available(meminfo: &str) -> u64 {
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|rest| rest.trim().strip_suffix("kB"))
+        .and_then(|kb| kb.trim().parse::<u64>().ok())
+        .map_or(0, |kb| kb.saturating_mul(1024))
+}
+
+/// A boot is refused unless the host could give the guest all of its
+/// memory and still keep `reserve`.
+fn memory_room(available: u64, memory: u64, reserve: u64) -> Result<(), ApiError> {
+    if available < memory.saturating_add(reserve) {
+        return Err(ApiError::full(format!(
+            "this host has {} MiB of memory available and a sandbox needs {} MiB with the {} MiB it keeps",
+            available / MIB,
+            memory / MIB,
+            reserve / MIB
+        )));
+    }
     Ok(())
 }
 
@@ -1344,6 +1427,71 @@ mod tests {
             .collect();
         assert_eq!(names, ["web-1.disk"]);
         fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn a_copy_of_the_base_is_grown_sparse_and_never_shrunk() {
+        use std::os::unix::fs::MetadataExt;
+        let state = scratch("grow");
+        let sandboxes = state.join("sandboxes");
+        fs::create_dir_all(&sandboxes).unwrap();
+        let base = state.join("base.disk");
+        fs::write(&base, vec![7u8; 8192]).unwrap();
+        let record = |id: &str| Record {
+            id: id.into(),
+            name: "web-1".into(),
+            created_at: 1,
+            cpus: 2,
+            memory_mib: 2048,
+        };
+        let config = secret_config();
+
+        let size = 64 * MIB;
+        let disk = NewDisk::Base {
+            path: base.clone(),
+            size,
+        };
+        make(&sandboxes, &disk, &record("sbx-a"), &config).unwrap();
+        let grown = sandboxes.join("sbx-a").join(DISK);
+        let meta = fs::metadata(&grown).unwrap();
+        assert_eq!(meta.len(), size);
+        assert!(meta.blocks() * 512 < size);
+        assert_eq!(fs::read(&grown).unwrap()[..8192], vec![7u8; 8192][..]);
+        assert_eq!(fs::metadata(&base).unwrap().len(), 8192);
+
+        let disk = NewDisk::Base {
+            path: base.clone(),
+            size: 4096,
+        };
+        make(&sandboxes, &disk, &record("sbx-b"), &config).unwrap();
+        assert_eq!(
+            fs::metadata(sandboxes.join("sbx-b").join(DISK))
+                .unwrap()
+                .len(),
+            8192
+        );
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn room_on_the_host() {
+        assert!(disk_room(10 * GIB, 10 * GIB).is_ok());
+        let full = disk_room(10 * GIB - 1, 10 * GIB).unwrap_err();
+        assert_eq!(full.code(), "node_full");
+
+        assert!(memory_room(3 * GIB, 2 * GIB, GIB).is_ok());
+        assert_eq!(
+            memory_room(3 * GIB - 1, 2 * GIB, GIB).unwrap_err().code(),
+            "node_full"
+        );
+        assert!(memory_room(u64::MAX, u64::MAX, GIB).is_ok());
+        assert!(memory_room(0, 0, 0).is_ok());
+
+        let meminfo =
+            "MemTotal:       32768000 kB\nMemFree:         1000 kB\nMemAvailable:    2097152 kB\n";
+        assert_eq!(mem_available(meminfo), 2 * GIB);
+        assert_eq!(mem_available("MemTotal: 1 kB\n"), 0);
+        assert_eq!(mem_available("MemAvailable: lots kB\n"), 0);
     }
 
     #[test]

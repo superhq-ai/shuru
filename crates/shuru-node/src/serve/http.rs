@@ -102,6 +102,11 @@ impl ApiError {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
     }
 
+    /// The host has too little disk or memory left for what was asked.
+    pub fn full(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, "node_full", message)
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }

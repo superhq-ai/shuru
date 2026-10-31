@@ -50,6 +50,18 @@ pub struct ServeArgs {
     /// Guest memory of each new sandbox, in MiB.
     #[arg(long, default_value_t = 2048)]
     memory: u64,
+    /// Size of the disk of each new sandbox, in GiB. Its copy of a smaller
+    /// base disk is grown, sparse, and the guest grows its filesystem to it
+    /// at boot; 0 keeps the size of the base disk.
+    #[arg(long, default_value_t = 0)]
+    disk_size: u64,
+    /// Refuse new sandboxes while the state directory has less free, in GiB.
+    #[arg(long, default_value_t = 10)]
+    min_free_disk: u64,
+    /// Refuse a boot unless the host has the memory of the sandbox and this
+    /// much more available, in MiB.
+    #[arg(long, default_value_t = 1024)]
+    min_free_memory: u64,
     /// Give each sandbox a network through a jailed shuru-netd. It reaches
     /// public addresses only.
     #[arg(long)]
