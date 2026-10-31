@@ -29,6 +29,10 @@ const DESTINATIONS_KEPT: usize = 4096;
 const REPORT_EVERY: Duration = Duration::from_secs(10);
 /// The longest host name kept, as DNS allows.
 const HOST_MAX: usize = 253;
+/// How far the egress pace lets the guest run ahead before it holds bytes
+/// back. Timers keep about a millisecond, so a hold for every payload
+/// would leave far slower than the pace.
+const EGRESS_SLACK: Duration = Duration::from_millis(10);
 
 /// Where the record of what a guest opened goes: one JSON line per
 /// connection, and the SYNs held back or refused per interval. `close`
@@ -249,7 +253,7 @@ impl Egress {
             .as_ref()?
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        bucket.owe(n as f64, now)
+        bucket.owe(n as f64, now, EGRESS_SLACK)
     }
 
     pub(crate) fn sent(&self, n: usize) {
@@ -400,12 +404,12 @@ impl Bucket {
     }
 
     /// Takes `n` even past empty, and answers how long until the debt is
-    /// paid back.
-    fn owe(&mut self, n: f64, now: Instant) -> Option<Duration> {
+    /// paid back, once it is more than `slack` of the rate.
+    fn owe(&mut self, n: f64, now: Instant, slack: Duration) -> Option<Duration> {
         self.refill(now);
         self.tokens -= n;
-        (self.tokens < 0.0)
-            .then(|| Duration::from_secs_f64(-self.tokens / f64::from(self.rate.per_second)))
+        let wait = -self.tokens / f64::from(self.rate.per_second);
+        (wait > slack.as_secs_f64()).then(|| Duration::from_secs_f64(wait))
     }
 }
 
@@ -662,6 +666,9 @@ mod tests {
         assert_eq!(egress.spend(500, now), Some(Duration::from_secs(1)));
         let later = now + Duration::from_secs(3);
         assert_eq!(egress.spend(1000, later), None, "paid back and full again");
+        // A debt within the slack is let through and paid back later.
+        assert_eq!(egress.spend(5, later), None);
+        assert_eq!(egress.spend(10, later), Some(Duration::from_millis(15)));
     }
 
     #[test]
