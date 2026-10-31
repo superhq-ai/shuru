@@ -90,10 +90,11 @@ does not count, nor do managed services.
 
 `usage` is an addition to the Sprites API, for whatever meters the host:
 `running`, `boot`, a number for the run of the VM that grows with every
-start, and the CPU time (`cpu_usec`) and memory (`memory_bytes`) the
-cgroup of that run shows. Once the VM stops, `cpu_usec` is what its last
-run used in all and `ended` when it stopped, so a meter misses nothing at
-the end of a run; `boot` and `ended` are in milliseconds, and `boot` is
+start, the CPU time (`cpu_usec`) and memory (`memory_bytes`) the cgroup
+of that run shows, and the bytes its guest has sent out through netd
+(`egress_bytes`). Once the VM stops, `cpu_usec` and `egress_bytes` are what
+its last run used in all and `ended` when it stopped, so a meter misses
+nothing at the end of a run; `boot` and `ended` are in milliseconds, and `boot` is
 null for a sandbox that has not run since serve started.
 
 Each sandbox keeps a directory under the state directory

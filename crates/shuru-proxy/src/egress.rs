@@ -1,6 +1,7 @@
 //! Which new connections the guest may open, decided on its SYN: ports
-//! refused outright, and a pace for the rest. And the record of what it
-//! opened, for tracing an abuse report to a sandbox.
+//! refused outright, and a pace for the rest. The bytes it sends out, in
+//! all and at a pace. And the record of what it opened, for tracing an
+//! abuse report to a sandbox.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
@@ -28,6 +29,10 @@ const DESTINATIONS_KEPT: usize = 4096;
 const REPORT_EVERY: Duration = Duration::from_secs(10);
 /// The longest host name kept, as DNS allows.
 const HOST_MAX: usize = 253;
+/// How far the egress pace lets the guest run ahead before it holds bytes
+/// back. Timers keep about a millisecond, so a hold for every payload
+/// would leave far slower than the pace.
+const EGRESS_SLACK: Duration = Duration::from_millis(10);
 
 /// Where the record of what a guest opened goes: one JSON line per
 /// connection, and the SYNs held back or refused per interval. `close`
@@ -220,6 +225,42 @@ fn rfc3339(at: SystemTime) -> String {
         .unwrap_or_default()
 }
 
+/// The bytes the guest sent out, in all, and the pace they may leave at.
+pub struct Egress {
+    bytes: AtomicU64,
+    pace: Option<Mutex<Bucket>>,
+}
+
+impl Egress {
+    pub(crate) fn new(rate: Option<Rate>, now: Instant) -> Self {
+        Egress {
+            bytes: AtomicU64::new(0),
+            pace: rate
+                .filter(|rate| rate.per_second > 0)
+                .map(|rate| Mutex::new(Bucket::new(rate, now))),
+        }
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Spends `n` bytes of the pace, and answers how long to hold them
+    /// back before they leave.
+    pub(crate) fn spend(&self, n: usize, now: Instant) -> Option<Duration> {
+        let mut bucket = self
+            .pace
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        bucket.owe(n as f64, now, EGRESS_SLACK)
+    }
+
+    pub(crate) fn sent(&self, n: usize) {
+        self.bytes.fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
 /// Bytes each way on one connection, and the host its TLS ClientHello
 /// named, filled in as the relay runs.
 #[derive(Default)]
@@ -360,6 +401,15 @@ impl Bucket {
 
     fn take(&mut self) {
         self.tokens -= 1.0;
+    }
+
+    /// Takes `n` even past empty, and answers how long until the debt is
+    /// paid back, once it is more than `slack` of the rate.
+    fn owe(&mut self, n: f64, now: Instant, slack: Duration) -> Option<Duration> {
+        self.refill(now);
+        self.tokens -= n;
+        let wait = -self.tokens / f64::from(self.rate.per_second);
+        (wait > slack.as_secs_f64()).then(|| Duration::from_secs_f64(wait))
     }
 }
 
@@ -600,5 +650,39 @@ mod tests {
         }
         let later = now + Duration::from_secs(1);
         assert_eq!(gate.admit((host(2), 443), later), Verdict::Open);
+    }
+
+    #[test]
+    fn egress_leaves_at_its_pace_after_the_burst() {
+        let now = Instant::now();
+        let rate = Rate {
+            per_second: 1000,
+            burst: 1000,
+        };
+        let egress = Egress::new(Some(rate), now);
+        assert_eq!(egress.spend(1000, now), None);
+        assert_eq!(egress.spend(500, now), Some(Duration::from_millis(500)));
+        // Every connection waits out the debt of all of them.
+        assert_eq!(egress.spend(500, now), Some(Duration::from_secs(1)));
+        let later = now + Duration::from_secs(3);
+        assert_eq!(egress.spend(1000, later), None, "paid back and full again");
+        // A debt within the slack is let through and paid back later.
+        assert_eq!(egress.spend(5, later), None);
+        assert_eq!(egress.spend(10, later), Some(Duration::from_millis(15)));
+    }
+
+    #[test]
+    fn egress_without_a_pace_is_only_counted() {
+        let now = Instant::now();
+        let egress = Egress::new(None, now);
+        assert_eq!(egress.spend(usize::MAX, now), None);
+        egress.sent(1500);
+        egress.sent(500);
+        assert_eq!(egress.bytes(), 2000);
+        let zero = Rate {
+            per_second: 0,
+            burst: 0,
+        };
+        assert_eq!(Egress::new(Some(zero), now).spend(1, now), None);
     }
 }

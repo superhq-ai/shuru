@@ -38,7 +38,7 @@ const NPROC: u64 = 64;
 const SANDBOX_PIDS: u64 = 2 * NPROC;
 const GUEST_PORT: u32 = 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
-const FLOWS_TIMEOUT: Duration = Duration::from_secs(2);
+const NETD_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a stopping process has to answer, writing what it holds,
 /// before it is killed.
 const STOP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -201,11 +201,25 @@ impl Jailed {
 
 /// The open connections of a guest, asked of its netd over `control`.
 pub fn flows(control: &UnixStream) -> Result<Vec<shuru_proxy::FlowAge>> {
-    control.set_read_timeout(Some(FLOWS_TIMEOUT))?;
-    control::send(control, &Request::Flows, &[])?;
+    match ask_netd(control, &Request::Flows)? {
+        Response::Flows { flows } => Ok(flows),
+        response => bail!("shuru-netd answered {response:?}"),
+    }
+}
+
+/// The bytes a guest has sent out, asked of its netd over `control`.
+pub fn egress(control: &UnixStream) -> Result<u64> {
+    match ask_netd(control, &Request::Egress)? {
+        Response::Egress { bytes } => Ok(bytes),
+        response => bail!("shuru-netd answered {response:?}"),
+    }
+}
+
+fn ask_netd(control: &UnixStream, request: &Request) -> Result<Response> {
+    control.set_read_timeout(Some(NETD_TIMEOUT))?;
+    control::send(control, request, &[])?;
     match control::receive::<Response>(control, 0)? {
-        Some((Response::Flows { flows }, _)) => Ok(flows),
-        Some((response, _)) => bail!("shuru-netd answered {response:?}"),
+        Some((response, _)) => Ok(response),
         None => bail!("shuru-netd is gone"),
     }
 }
@@ -479,6 +493,12 @@ pub struct KernelBoot<'a> {
     pub verbose: bool,
 }
 
+/// What a VM used in all.
+pub struct Used {
+    pub usage: Usage,
+    pub egress_bytes: u64,
+}
+
 /// A running VM. Dropping it kills the VMM before netd, and both before
 /// their cgroup and directory go.
 pub struct Vm {
@@ -608,9 +628,10 @@ impl Vm {
         }
     }
 
-    /// Stops the VM and answers what its cgroup used in all, read once
-    /// nothing in it runs.
-    pub fn stop(self) -> Option<Usage> {
+    /// Stops the VM and answers what it used in all: its cgroup, read once
+    /// nothing in it runs, and the bytes its guest sent out, asked of netd
+    /// once the guest can send no more.
+    pub fn stop(self) -> Option<Used> {
         let Vm {
             vmm,
             network,
@@ -619,12 +640,20 @@ impl Vm {
             ..
         } = self;
         vmm.stop();
+        let mut egress_bytes = 0;
         if let Some(network) = network {
+            match egress(&network.netd.control) {
+                Ok(bytes) => egress_bytes = bytes,
+                Err(e) => eprintln!("shuru-node: asking netd what the guest sent: {e:#}"),
+            }
             network.netd.stop();
         }
-        let used = sandbox.usage().ok();
+        let usage = sandbox.usage().ok();
         drop((sandbox, dir));
-        used
+        Some(Used {
+            usage: usage?,
+            egress_bytes,
+        })
     }
 }
 

@@ -4,11 +4,13 @@ use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, AcquireError, OwnedSemaphorePermit, Semaphore};
+use tokio::time::Sleep;
 
-use crate::egress::Tally;
+use crate::egress::{Egress, Tally};
 use crate::stack::{ConnectionId, StackCommand};
 
 /// Largest single send toward the guest. Must not exceed TO_GUEST_BUDGET.
@@ -16,12 +18,15 @@ const SEND_CHUNK: usize = 64 * 1024;
 
 /// Guest data for one connection. Taking a payload returns its bytes to
 /// the budget of the stack, so the stack reads more from the guest only as fast
-/// as the connection consumes it.
+/// as the connection consumes it. A payload over the egress pace is held
+/// back first, which slows the guest the same way.
 pub struct GuestRx {
     id: ConnectionId,
     data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     cmd_tx: mpsc::UnboundedSender<StackCommand>,
     tally: Arc<Tally>,
+    egress: Arc<Egress>,
+    held: Option<(Vec<u8>, Pin<Box<Sleep>>)>,
 }
 
 impl GuestRx {
@@ -30,12 +35,15 @@ impl GuestRx {
         data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
         cmd_tx: mpsc::UnboundedSender<StackCommand>,
         tally: Arc<Tally>,
+        egress: Arc<Egress>,
     ) -> Self {
         GuestRx {
             id,
             data_rx,
             cmd_tx,
             tally,
+            egress,
+            held: None,
         }
     }
 
@@ -44,17 +52,36 @@ impl GuestRx {
     }
 
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
-        let polled = self.data_rx.poll_recv(cx);
-        if let Poll::Ready(Some(data)) = &polled {
-            self.tally
-                .up
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
-            let _ = self.cmd_tx.send(StackCommand::Consumed {
-                id: self.id,
-                n: data.len(),
-            });
+        let (data, mut wait) = match self.held.take() {
+            Some(held) => held,
+            None => {
+                let data = match self.data_rx.poll_recv(cx) {
+                    Poll::Ready(Some(data)) => data,
+                    polled => return polled,
+                };
+                match self.egress.spend(data.len(), Instant::now()) {
+                    Some(delay) => (data, Box::pin(tokio::time::sleep(delay))),
+                    None => return Poll::Ready(Some(self.release(data))),
+                }
+            }
+        };
+        if wait.as_mut().poll(cx).is_pending() {
+            self.held = Some((data, wait));
+            return Poll::Pending;
         }
-        polled
+        Poll::Ready(Some(self.release(data)))
+    }
+
+    fn release(&self, data: Vec<u8>) -> Vec<u8> {
+        self.tally
+            .up
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.egress.sent(data.len());
+        let _ = self.cmd_tx.send(StackCommand::Consumed {
+            id: self.id,
+            n: data.len(),
+        });
+        data
     }
 }
 

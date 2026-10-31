@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::ProxyConfig;
 use crate::dns;
-use crate::egress::Tally;
+use crate::egress::{Egress, Tally};
 use crate::secrets::SecretResolver;
 use crate::stack::{ConnectionId, StackCommand, StackEvent, TcpConnection};
 use crate::stream::{ChannelStream, GuestRx, GuestTx};
@@ -46,6 +46,7 @@ struct Shared {
     secrets: SecretResolver,
     upstream_ssl: SslConnector,
     allowed_ips: AllowedIps,
+    egress: Arc<Egress>,
 }
 
 /// The guest side of one proxied connection.
@@ -70,12 +71,13 @@ impl ProxyEngine {
         ca: CertificateAuthority,
         placeholders: HashMap<String, String>,
         allowed_ips: AllowedIps,
-        upstream_ssl: SslConnector,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        let upstream_ssl = upstream_connector(&config)?;
+        let egress = Arc::new(Egress::new(config.egress_rate, std::time::Instant::now()));
         let config = Arc::new(config);
         let secrets = SecretResolver::new(config.clone(), placeholders);
 
-        ProxyEngine {
+        Ok(ProxyEngine {
             event_rx,
             cmd_tx,
             connections: HashMap::new(),
@@ -85,8 +87,14 @@ impl ProxyEngine {
                 secrets,
                 upstream_ssl,
                 allowed_ips,
+                egress,
             }),
-        }
+        })
+    }
+
+    /// The bytes the guest sent out.
+    pub fn egress(&self) -> Arc<Egress> {
+        self.shared.egress.clone()
     }
 
     /// Run the proxy event loop.
@@ -136,7 +144,13 @@ impl ProxyEngine {
         let tally = Arc::new(Tally::default());
         let guest = Guest {
             id: conn.id,
-            rx: GuestRx::new(conn.id, data_rx, self.cmd_tx.clone(), tally.clone()),
+            rx: GuestRx::new(
+                conn.id,
+                data_rx,
+                self.cmd_tx.clone(),
+                tally.clone(),
+                self.shared.egress.clone(),
+            ),
             tx: GuestTx::new(conn.id, self.cmd_tx.clone(), conn.to_guest, tally.clone()),
             cmd_tx: self.cmd_tx.clone(),
         };

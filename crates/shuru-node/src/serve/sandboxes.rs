@@ -100,10 +100,14 @@ pub struct GuestAddr {
     pub placeholders: Arc<HashMap<String, String>>,
 }
 
+/// The control connection of a netd. One request at a time: whoever
+/// holds it reads the answer to their own.
+type Netd = Arc<Mutex<UnixStream>>;
+
 struct Running {
     guest: GuestAddr,
     /// The control connection of its netd, if it has a network.
-    netd: Option<Arc<Mutex<UnixStream>>>,
+    netd: Option<Netd>,
     slot: u32,
     boot: u64,
     alive: Arc<AtomicBool>,
@@ -137,12 +141,14 @@ pub struct Entry {
 }
 
 /// The last run of a VM to stop: its boot, when it stopped, in
-/// milliseconds, and the CPU time it used in all.
+/// milliseconds, and the CPU time it used and the bytes it sent out in
+/// all.
 #[derive(Clone, Copy)]
 struct Ended {
     boot: u64,
     at_ms: u64,
     cpu_usec: u64,
+    egress_bytes: u64,
 }
 
 /// What a VM of a sandbox has used. `boot` tells one run of the VM from
@@ -153,6 +159,25 @@ pub struct RunUsage {
     pub boot: Option<u64>,
     pub ended_ms: Option<u64>,
     pub usage: cgroup::Usage,
+    pub egress_bytes: u64,
+}
+
+/// The bytes the guest behind `netd` has sent out.
+async fn egress(netd: Netd) -> Result<u64, ApiError> {
+    let asked = tokio::task::spawn_blocking(move || {
+        let netd = netd.lock().unwrap_or_else(|e| e.into_inner());
+        vm::egress(&netd)
+    })
+    .await;
+    match asked {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(e)) => Err(ApiError::internal(format!(
+            "asking netd what the guest sent: {e:#}"
+        ))),
+        Err(e) => Err(ApiError::internal(format!(
+            "asking netd what the guest sent: {e}"
+        ))),
+    }
 }
 
 impl Entry {
@@ -197,11 +222,16 @@ impl Entry {
         {
             let usage = cgroup::usage(&running.slot.to_string())
                 .map_err(|e| ApiError::internal(format!("reading the sandbox cgroup: {e}")))?;
+            let egress_bytes = match running.netd.clone() {
+                Some(netd) => egress(netd).await?,
+                None => 0,
+            };
             return Ok(RunUsage {
                 running: true,
                 boot: Some(running.boot),
                 ended_ms: None,
                 usage,
+                egress_bytes,
             });
         }
         drop(vm);
@@ -214,6 +244,7 @@ impl Entry {
                 cpu_usec: ended.map_or(0, |ended| ended.cpu_usec),
                 memory_bytes: 0,
             },
+            egress_bytes: ended.map_or(0, |ended| ended.egress_bytes),
         })
     }
 
@@ -230,7 +261,7 @@ impl Entry {
     }
 
     /// The netd control connection of a running sandbox with a network.
-    pub async fn netd_if_running(&self) -> Option<Arc<Mutex<UnixStream>>> {
+    pub async fn netd_if_running(&self) -> Option<Netd> {
         let vm = self.vm.lock().await;
         vm.as_ref()
             .filter(|running| running.alive.load(Ordering::Acquire))
@@ -896,7 +927,7 @@ impl Node {
         entry.activity.restart();
         *vm = Some(Running {
             guest: guest.clone(),
-            netd: netd.map(|netd| Arc::new(Mutex::new(netd))),
+            netd,
             slot,
             boot,
             alive,
@@ -916,7 +947,7 @@ impl Node {
         slot: u32,
         boot: u64,
         alive: Arc<AtomicBool>,
-        ready: tokio::sync::oneshot::Sender<Result<(GuestAddr, Option<UnixStream>)>>,
+        ready: tokio::sync::oneshot::Sender<Result<(GuestAddr, Option<Netd>)>>,
         stop: mpsc::Receiver<bool>,
     ) {
         let name = &entry.record.name;
@@ -945,11 +976,12 @@ impl Node {
             network
                 .netd
                 .control()
+                .map(|control| Arc::new(Mutex::new(control)))
                 .map_err(|e| eprintln!("shuru-node: the netd of sandbox {name}: {e}"))
                 .ok()
         });
         alive.store(true, Ordering::Release);
-        let graceful = if ready.send(Ok((guest, netd))).is_err() {
+        let graceful = if ready.send(Ok((guest, netd.clone()))).is_err() {
             false
         } else {
             loop {
@@ -970,11 +1002,18 @@ impl Node {
                 eprintln!("shuru-node: shutting down sandbox {name}: {e:#}");
             }
         }
-        if let Some(used) = vm.stop() {
+        let used = {
+            let _netd = netd
+                .as_ref()
+                .map(|netd| netd.lock().unwrap_or_else(|e| e.into_inner()));
+            vm.stop()
+        };
+        if let Some(used) = used {
             *entry.ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ended {
                 boot,
                 at_ms: unix_millis(),
-                cpu_usec: used.cpu_usec,
+                cpu_usec: used.usage.cpu_usec,
+                egress_bytes: used.egress_bytes,
             });
         }
         self.release(slot);

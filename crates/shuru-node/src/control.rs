@@ -113,6 +113,8 @@ pub enum Request {
     },
     /// The open connections of the guest, for netd.
     Flows,
+    /// The bytes the guest sent out, for netd.
+    Egress,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -130,6 +132,10 @@ pub enum Response {
     },
     Flows {
         flows: Vec<shuru_proxy::FlowAge>,
+    },
+    /// In all, since netd started.
+    Egress {
+        bytes: u64,
     },
     Error {
         message: String,

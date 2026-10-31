@@ -12,6 +12,7 @@ members = [
     "crates/shuru-store",
     "crates/shuru-guest",
 ]
+exclude = ["vendor"]
 # shuru-darwin and shuru-linux are platform-specific — only pulled in
 # transitively via shuru-vm's cfg'd deps. shuru-node runs on Linux nodes
 # only. Excluded from default builds so `cargo check` doesn't fail on the
@@ -25,6 +26,11 @@ default-members = [
     "crates/shuru-store",
     "crates/shuru-guest",
 ]
+
+# smoltcp 0.12.0 with an upstream fix no release carries yet; see
+# vendor/smoltcp/SHURU.md.
+[patch.crates-io]
+smoltcp = { path = "vendor/smoltcp" }
 
 [profile.release]
 opt-level = "z"

@@ -11,7 +11,7 @@ mod substitute;
 mod tls;
 
 pub use config::ProxyConfig;
-pub use egress::EgressLog;
+pub use egress::{Egress, EgressLog};
 pub use flows::{FlowAge, Flows};
 
 use std::collections::HashMap;
@@ -51,6 +51,8 @@ pub struct ProxyHandle {
     ca_key_pem: String,
     /// The open connections of the guest and when each last carried bytes.
     pub flows: Arc<Flows>,
+    /// The bytes the guest sent out.
+    pub egress: Arc<Egress>,
 }
 
 /// What a guest keeps from the proxy that served it: the CA it trusts and
@@ -198,7 +200,6 @@ pub fn start_session(
             (CertificateAuthority::new()?, placeholders)
         }
     };
-    let upstream_ssl = proxy::upstream_connector(&config)?;
     let ca_cert_pem = ca.ca_cert_pem();
     let ca_key_pem = ca.ca_key_pem();
 
@@ -211,6 +212,15 @@ pub fn start_session(
     let flows = Arc::new(Flows::default());
     let stack_flows = flows.clone();
     let gate = egress::Gate::new(&config, std::time::Instant::now());
+    let mut engine = ProxyEngine::new(
+        config,
+        event_rx,
+        cmd_tx,
+        ca,
+        placeholders.clone(),
+        allowed_ips,
+    )?;
+    let egress = engine.egress();
 
     let stack_thread = std::thread::Builder::new()
         .name("shuru-netstack".into())
@@ -219,9 +229,6 @@ pub fn start_session(
             stack.run();
         })?;
 
-    let proxy_config = config;
-    let proxy_placeholders = placeholders.clone();
-    let proxy_allowed_ips = allowed_ips.clone();
     let runtime_thread = std::thread::Builder::new()
         .name("shuru-proxy".into())
         .spawn(move || {
@@ -231,18 +238,7 @@ pub fn start_session(
                 .build()
                 .expect("failed to create tokio runtime for proxy");
 
-            rt.block_on(async move {
-                let mut engine = ProxyEngine::new(
-                    proxy_config,
-                    event_rx,
-                    cmd_tx,
-                    ca,
-                    proxy_placeholders,
-                    proxy_allowed_ips,
-                    upstream_ssl,
-                );
-                engine.run().await;
-            });
+            rt.block_on(engine.run());
         })?;
 
     info!("proxy started");
@@ -254,5 +250,6 @@ pub fn start_session(
         ca_cert_pem,
         ca_key_pem,
         flows,
+        egress,
     })
 }
