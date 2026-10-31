@@ -8,6 +8,7 @@ mod files;
 mod guest;
 mod http;
 mod hub;
+mod idle;
 mod ports;
 mod sandboxes;
 mod ws;
@@ -63,6 +64,10 @@ pub struct ServeArgs {
     /// How many sandboxes may run at once, one per slot.
     #[arg(long, default_value_t = 64)]
     max_running: u32,
+    /// Stop a running sandbox, as `stop` does, once nothing has used it for
+    /// this many seconds; 0 never does.
+    #[arg(long, default_value_t = 30)]
+    idle_park: u64,
     /// The directory holding the statically linked shuru-vmm and
     /// shuru-netd. Defaults to the one holding this binary.
     #[arg(long)]
@@ -82,7 +87,8 @@ pub fn serve(args: ServeArgs) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let served = runtime.block_on(accept(node, listener));
+    let idle_park = (args.idle_park > 0).then(|| Duration::from_secs(args.idle_park));
+    let served = runtime.block_on(accept(node, listener, idle_park));
     let _ = fs::remove_file(&args.socket);
     served
 }
@@ -115,8 +121,15 @@ fn bind(path: &Path) -> Result<UnixListener> {
 }
 
 /// Serves until SIGTERM or SIGINT, then shuts every running guest down.
-async fn accept(node: Arc<Node>, listener: UnixListener) -> Result<()> {
+async fn accept(
+    node: Arc<Node>,
+    listener: UnixListener,
+    idle_park: Option<Duration>,
+) -> Result<()> {
     let listener = tokio::net::UnixListener::from_std(listener)?;
+    if let Some(after) = idle_park {
+        tokio::spawn(idle::watch(node.clone(), after));
+    }
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     loop {

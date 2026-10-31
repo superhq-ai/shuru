@@ -693,9 +693,13 @@ async fn watch(
 ) -> Result<Response<Body>, ApiError> {
     let key = ws::key(&request)?;
     let addr = node.guest(entry).await?;
-    ws::upgrade(&mut request, &key, MAX_WATCH_MESSAGE, move |socket| {
-        follow(socket, addr)
-    })
+    ws::upgrade(
+        &mut request,
+        &key,
+        MAX_WATCH_MESSAGE,
+        entry.busy(),
+        move |socket| follow(socket, addr),
+    )
 }
 
 async fn follow(socket: ws::Socket, addr: GuestAddr) {

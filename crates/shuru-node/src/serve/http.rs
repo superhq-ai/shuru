@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use super::idle::Busy;
 use super::sandboxes::{Entry, Node};
 use super::{exec, files, ports, ws};
 
@@ -257,7 +258,19 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
         _ => return Err(ApiError::not_found(format!("no route {path}"))),
     };
     let method = request.method().clone();
-    match (&method, segments.as_slice()) {
+    // What uses the guest keeps it from an idle park. What a host polls,
+    // such as usage and the session list, does not.
+    let busy = match (&method, segments.as_slice()) {
+        (&Method::GET, [name, "exec"]) if ws::is_websocket(&request) => Some(name),
+        (&Method::GET, [_, "exec"]) => None,
+        (_, [name, "exec", ..] | [name, "fs", _] | [name, "proxy"] | [name, "ports", "watch"]) => {
+            Some(name)
+        }
+        _ => None,
+    }
+    .and_then(|name| node.get(name).ok())
+    .map(|entry| entry.busy());
+    let response = match (&method, segments.as_slice()) {
         (&Method::GET, []) => list(&node, &request),
         (&Method::POST, []) => create(&node, request).await,
         (&Method::GET, [name]) => {
@@ -269,6 +282,23 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
             let mut response = Response::new(full(Bytes::new()));
             *response.status_mut() = StatusCode::NO_CONTENT;
             Ok(response)
+        }
+        (&Method::POST, [name, "stop"]) => {
+            node.stop(name).await?;
+            let mut response = Response::new(full(Bytes::new()));
+            *response.status_mut() = StatusCode::NO_CONTENT;
+            Ok(response)
+        }
+        (&Method::POST, [name, "park"]) => {
+            let parked = node.park(name).await?;
+            Ok(json_response(
+                StatusCode::OK,
+                &json!({
+                    "disk": parked.disk.to_string_lossy(),
+                    "boot": parked.boot,
+                    "size": parked.size,
+                }),
+            ))
         }
         (&Method::GET, [name, "exec"]) => {
             let entry = node.get(name)?;
@@ -326,9 +356,42 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
             | [_, "exec", _, "kill"]
             | [_, "proxy"]
             | [_, "ports", "watch"]
+            | [_, "stop"]
+            | [_, "park"]
             | [_, "usage"],
         ) => Err(ApiError::not_allowed(&method, &path)),
         _ => Err(ApiError::not_found(format!("no route {path}"))),
+    }?;
+    Ok(match busy {
+        Some(busy) => response.map(|body| Held { body, _busy: busy }.boxed()),
+        None => response,
+    })
+}
+
+/// A response body that keeps its sandbox from an idle park until it is
+/// done or the client goes away.
+struct Held {
+    body: Body,
+    _busy: Busy,
+}
+
+impl hyper::body::Body for Held {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<io::Result<Frame<Bytes>>>> {
+        Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
     }
 }
 
@@ -371,13 +434,24 @@ fn list(node: &Node, request: &Request<Incoming>) -> Result<Response<Body>, ApiE
 #[derive(Deserialize)]
 struct CreateRequest {
     name: String,
+    /// A disk under the import directory to move in, in place of a copy of
+    /// the base disk.
+    disk: Option<String>,
+    #[serde(default = "yes")]
+    start: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 async fn create(node: &Arc<Node>, request: Request<Incoming>) -> Result<Response<Body>, ApiError> {
     let body = read_body(request.into_body(), MAX_JSON_BODY).await?;
     let create: CreateRequest = serde_json::from_slice(&body)
         .map_err(|e| ApiError::bad_request(format!("the body: {e}")))?;
-    let entry = node.create(create.name).await?;
+    let entry = node
+        .create(create.name, create.disk.as_deref(), create.start)
+        .await?;
     Ok(json_response(StatusCode::CREATED, &sandbox_json(&entry)))
 }
 

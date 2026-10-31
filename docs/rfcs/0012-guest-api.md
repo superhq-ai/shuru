@@ -41,8 +41,42 @@ POST   /v1/sandboxes                  { "name": "web-1" }
 GET    /v1/sandboxes                  ?prefix= &max_results= &continuation_token=
 GET    /v1/sandboxes/{name}
 DELETE /v1/sandboxes/{name}
+POST   /v1/sandboxes/{name}/stop
+POST   /v1/sandboxes/{name}/park
 GET    /v1/sandboxes/{name}/usage
 ```
+
+`stop` is another addition: it shuts the guest down, so its disk is
+synced, and stops the VM, leaving the sandbox cold. It answers 204, and
+does nothing to a sandbox that is not running. A host stops a sandbox it
+no longer wants to run, such as one whose owner has run out of credit.
+
+`park` is another: it stops the sandbox as `stop` does, then, under the
+lock that boots its VM, makes a reflink copy of its disk at
+`<state_dir>/parked/<name>.disk`, written under another name, synced and
+renamed over any copy there. It answers 200 with `disk`, the path of the
+copy, `boot`, the boot of the last run (0 if it has not run since it was
+made or imported), and `size`, the size of the disk in bytes. The copy
+belongs to the caller, which tells by `boot` whether the disk changed
+since a copy it stored before.
+
+Create takes two more fields. `disk` names a file under
+`<state_dir>/import/` to make the sandbox from, in place of a copy of
+the base disk; it is renamed into the sandbox directory, so it must be on
+the same filesystem, and a path that leads anywhere else, links
+followed, is refused with 400. `start: false` leaves the new sandbox
+cold; the default is `true`. A name that exists answers 409, and a create
+that fails leaves the file where it was.
+
+With `--idle-park <seconds>` (default 30, 0 turns it off) the agent stops
+a running sandbox, as `stop` does, once nothing has used it for that
+long. Requests that use the guest (exec, attach, kill, the filesystem,
+proxy and the ports watch) count while they are in flight, upgraded
+connections while they are open, and exec sessions while their process
+runs. The agent asks the guest for its sessions before it stops a
+sandbox, and every 5 seconds while one runs, so the clock restarts from
+the last time one was seen. What a host polls (get, usage, the session
+list, stop, park and delete) does not count, nor do managed services.
 
 `usage` is an addition to the Sprites API, for whatever meters the host:
 `running`, `boot`, a number for the run of the VM that grows with every
@@ -53,8 +87,10 @@ the end of a run; `boot` and `ended` are in milliseconds, and `boot` is
 null for a sandbox that has not run since serve started.
 
 Each sandbox keeps a directory under the state directory
-(`/var/lib/shuru/sandboxes/<id>/`) with `sandbox.json` (id, name, size)
-and its working disk, a reflink copy of the base disk the agent is given.
+(`/var/lib/shuru/sandboxes/<id>/`) with `sandbox.json` (id, name, size,
+and the boot of its last run, written before the VM runs so a restart
+still knows it) and its working disk, a reflink copy of the base disk the
+agent is given.
 Create writes the directory under another name, syncs it and renames it
 into place, as a snapshot is written (RFC 0009), then boots the VM.
 

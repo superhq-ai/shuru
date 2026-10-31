@@ -24,7 +24,7 @@ use super::http::{
     timestamp, ApiError, Body,
 };
 use super::hub::{Attachment, Event, Input};
-use super::sandboxes::{Entry, Node};
+use super::sandboxes::{Entry, GuestAddr, Node};
 use super::{guest, ws};
 
 const MAX_STDIN: usize = 10 << 20;
@@ -198,9 +198,13 @@ pub async fn websocket(
         }
     };
 
-    ws::upgrade(&mut request, &key, MAX_MESSAGE, move |socket| {
-        bridge(socket, attachment)
-    })
+    ws::upgrade(
+        &mut request,
+        &key,
+        MAX_MESSAGE,
+        entry.busy(),
+        move |socket| bridge(socket, attachment),
+    )
 }
 
 /// Carries a session between a WebSocket and its hub. Binary messages
@@ -357,23 +361,26 @@ fn session_json(info: &SessionInfo) -> Value {
     })
 }
 
+/// The session table of a running guest.
+pub async fn sessions(addr: &GuestAddr) -> Result<Vec<SessionInfo>, ApiError> {
+    let mut guest = guest::connect(addr, &addr.calls).await?;
+    guest::write_frame(&mut guest.stream, frame::SESSION_LIST, &[]).await?;
+    match guest::read_frame(&mut guest.stream).await? {
+        Some((frame::SESSION_LIST_RESP, payload)) => {
+            Ok(serde_json::from_slice::<SessionList>(&payload)
+                .map_err(|e| ApiError::internal(format!("the guest session list: {e}")))?
+                .sessions)
+        }
+        Some((frame::ERROR, payload)) => Err(guest::guest_error(&payload)),
+        _ => Err(ApiError::internal("the guest did not list its sessions")),
+    }
+}
+
 /// The sessions of a running sandbox. One that is not running has none.
 pub async fn list(entry: &Entry) -> Result<Response<Body>, ApiError> {
     let sessions = match entry.guest_if_running().await {
         None => Vec::new(),
-        Some(addr) => {
-            let mut guest = guest::connect(&addr, &addr.calls).await?;
-            guest::write_frame(&mut guest.stream, frame::SESSION_LIST, &[]).await?;
-            match guest::read_frame(&mut guest.stream).await? {
-                Some((frame::SESSION_LIST_RESP, payload)) => {
-                    serde_json::from_slice::<SessionList>(&payload)
-                        .map_err(|e| ApiError::internal(format!("the guest session list: {e}")))?
-                        .sessions
-                }
-                Some((frame::ERROR, payload)) => return Err(guest::guest_error(&payload)),
-                _ => return Err(ApiError::internal("the guest did not list its sessions")),
-            }
-        }
+        Some(addr) => sessions(&addr).await?,
     };
     let body = json!({
         "sessions": sessions.iter().map(session_json).collect::<Vec<_>>(),

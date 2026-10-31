@@ -15,6 +15,7 @@ use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
 
 use super::http::{full, ApiError, Body};
+use super::idle::Busy;
 
 pub type Socket = WebSocketStream<TokioIo<Upgraded>>;
 
@@ -51,11 +52,12 @@ pub fn key(request: &Request<Incoming>) -> Result<HeaderValue, ApiError> {
 }
 
 /// Answers the upgrade, then runs `serve` on the socket once the client
-/// has it.
+/// has it. The sandbox stays `busy` while the socket is open.
 pub fn upgrade<F, Fut>(
     request: &mut Request<Incoming>,
     key: &HeaderValue,
     max_message: usize,
+    busy: Busy,
     serve: F,
 ) -> Result<Response<Body>, ApiError>
 where
@@ -66,6 +68,7 @@ where
         .map_err(|e| ApiError::internal(e.to_string()))?;
     let upgrade = hyper::upgrade::on(request);
     tokio::spawn(async move {
+        let _busy = busy;
         let Ok(upgraded) = upgrade.await else {
             return;
         };

@@ -45,9 +45,13 @@ pub async fn proxy(
 ) -> Result<Response<Body>, ApiError> {
     let key = ws::key(&request)?;
     let addr = node.guest(entry).await?;
-    ws::upgrade(&mut request, &key, MAX_PROXY_MESSAGE, move |socket| {
-        carry(socket, addr)
-    })
+    ws::upgrade(
+        &mut request,
+        &key,
+        MAX_PROXY_MESSAGE,
+        entry.busy(),
+        move |socket| carry(socket, addr),
+    )
 }
 
 async fn carry(mut socket: ws::Socket, addr: GuestAddr) {
@@ -203,9 +207,13 @@ pub async fn watch(
         }
         None => return Err(ApiError::internal("the guest closed the connection")),
     };
-    ws::upgrade(&mut request, &key, MAX_WATCH_MESSAGE, move |socket| {
-        follow(socket, conn, first)
-    })
+    ws::upgrade(
+        &mut request,
+        &key,
+        MAX_WATCH_MESSAGE,
+        entry.busy(),
+        move |socket| follow(socket, conn, first),
+    )
 }
 
 async fn follow(socket: ws::Socket, conn: Conn, first: Value) {

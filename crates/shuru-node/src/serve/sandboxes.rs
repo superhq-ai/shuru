@@ -20,6 +20,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::http::ApiError;
 use super::hub::Hubs;
+use super::idle::{Activity, Busy};
 use super::ServeArgs;
 use crate::vm::{self, Host, KernelBoot, NetworkPolicy, Vm};
 use shuru_node::cgroup;
@@ -35,7 +36,7 @@ const CALLS: usize = vm::VSOCK_CONNECTIONS - STREAMS - 1;
 /// More creates, deletes and boots than ever run at once.
 const OPS: u32 = 1 << 20;
 
-/// What `sandbox.json` holds.
+/// The settings of a sandbox.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Record {
     pub id: String,
@@ -44,6 +45,32 @@ pub struct Record {
     pub created_at: u64,
     pub cpus: usize,
     pub memory_mib: u64,
+}
+
+/// What `sandbox.json` holds: the record, and the boot of the last run,
+/// written before the VM runs, so a restart still knows whether the disk
+/// may have changed since.
+#[derive(Serialize, Deserialize)]
+struct Stored {
+    #[serde(flatten)]
+    record: Record,
+    #[serde(default)]
+    last_boot: u64,
+}
+
+/// Where the disk of a new sandbox comes from.
+enum NewDisk {
+    /// A copy of the base disk.
+    Base(PathBuf),
+    /// A file under the import directory, moved in.
+    Import(PathBuf),
+}
+
+/// A copy of the disk of a stopped sandbox, for the caller to keep.
+pub struct Parked {
+    pub disk: PathBuf,
+    pub boot: u64,
+    pub size: u64,
 }
 
 /// Where the guest agent of a running sandbox answers, the budgets its
@@ -83,7 +110,11 @@ pub struct Entry {
     running: Arc<AtomicBool>,
     deleted: AtomicBool,
     last_running_at: AtomicU64,
+    /// The boot of the last run, 0 if none since the sandbox was made or
+    /// imported.
+    last_boot: AtomicU64,
     ended: Mutex<Option<Ended>>,
+    activity: Arc<Activity>,
 }
 
 /// The last run of a VM to stop: its boot, when it stopped, in
@@ -108,6 +139,15 @@ pub struct RunUsage {
 impl Entry {
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Acquire)
+    }
+
+    pub fn activity(&self) -> &Arc<Activity> {
+        &self.activity
+    }
+
+    /// Keeps the sandbox from an idle park until dropped.
+    pub fn busy(&self) -> Busy {
+        self.activity.busy()
     }
 
     pub fn last_running_at(&self) -> Option<u64> {
@@ -176,6 +216,8 @@ pub struct Node {
     config: Config,
     host: Host,
     dir: PathBuf,
+    parked: PathBuf,
+    import: PathBuf,
     sandboxes: Mutex<BTreeMap<String, Arc<Entry>>>,
     slots: Mutex<BTreeSet<u32>>,
     last_boot: AtomicU64,
@@ -207,10 +249,23 @@ impl Node {
             .with_context(|| format!("{}", args.state_dir.display()))?;
         let lock = lock(&args.state_dir.join("serve.lock"))?;
         let dir = args.state_dir.join("sandboxes");
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .recursive(true)
-            .create(&dir)?;
+        let parked = args.state_dir.join("parked");
+        let import = args.state_dir.join("import");
+        for dir in [&dir, &parked, &import] {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(dir)
+                .with_context(|| format!("{}", dir.display()))?;
+        }
+        let parked = fs::canonicalize(parked)?;
+        let import = fs::canonicalize(import)?;
+        for item in fs::read_dir(&parked)? {
+            let path = item?.path();
+            if path.extension().is_some_and(|ext| ext == "partial") {
+                let _ = fs::remove_file(path);
+            }
+        }
 
         let mut slots = BTreeSet::new();
         for slot in args.first_slot..last_slot {
@@ -239,6 +294,8 @@ impl Node {
             },
             host,
             dir,
+            parked,
+            import,
             sandboxes: Mutex::new(BTreeMap::new()),
             slots: Mutex::new(slots),
             last_boot: AtomicU64::new(0),
@@ -251,7 +308,8 @@ impl Node {
     }
 
     /// Reads the sandboxes an earlier run left. None of them runs yet; the
-    /// first request for one boots it.
+    /// first request for one boots it. Boots go on from the last any of them
+    /// had, should the clock have gone back.
     fn load(&self) -> Result<()> {
         let mut sandboxes = self.sandboxes();
         for item in fs::read_dir(&self.dir)? {
@@ -265,8 +323,8 @@ impl Node {
                 }
                 continue;
             }
-            let record = match read_record(&item.path()) {
-                Ok(record) => record,
+            let Stored { record, last_boot } = match read_record(&item.path()) {
+                Ok(stored) => stored,
                 Err(e) => {
                     eprintln!("shuru-node: skipping {}: {e:#}", item.path().display());
                     continue;
@@ -279,7 +337,8 @@ impl Node {
                 eprintln!("shuru-node: skipping {}", item.path().display());
                 continue;
             }
-            let entry = Entry::new(record, item.path());
+            self.last_boot.fetch_max(last_boot, Ordering::Relaxed);
+            let entry = Entry::new(record, item.path(), last_boot);
             sandboxes.insert(entry.record.name.clone(), Arc::new(entry));
         }
         Ok(())
@@ -291,6 +350,14 @@ impl Node {
 
     fn slots(&self) -> MutexGuard<'_, BTreeSet<u32>> {
         self.slots.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn entries(&self) -> Vec<Arc<Entry>> {
+        self.sandboxes().values().cloned().collect()
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
     }
 
     pub fn get(&self, name: &str) -> Result<Arc<Entry>, ApiError> {
@@ -316,17 +383,27 @@ impl Node {
         (page, more)
     }
 
-    /// Creates a sandbox with its own copy of the base disk and boots it.
-    /// Runs to the end even if the caller goes away.
-    pub async fn create(self: &Arc<Self>, name: String) -> Result<Arc<Entry>, ApiError> {
+    /// Creates a sandbox with its own copy of the base disk, or with `disk`
+    /// moved in from the import directory, and boots it if `start`. Runs to
+    /// the end even if the caller goes away.
+    pub async fn create(
+        self: &Arc<Self>,
+        name: String,
+        disk: Option<&str>,
+        start: bool,
+    ) -> Result<Arc<Entry>, ApiError> {
         if !valid_name(&name) {
             return Err(ApiError::bad_request(
                 "a name is 1 to 63 lowercase letters, digits and dashes, not starting or ending with a dash",
             ));
         }
+        let disk = match disk {
+            Some(disk) => NewDisk::Import(import_path(&self.import, disk)?),
+            None => NewDisk::Base(self.config.base_disk.clone()),
+        };
         let op = self.op()?;
         let node = self.clone();
-        tokio::spawn(async move { node.create_now(name, op).await })
+        tokio::spawn(async move { node.create_now(name, disk, start, op).await })
             .await
             .map_err(|e| ApiError::internal(format!("{e}")))?
     }
@@ -348,6 +425,8 @@ impl Node {
     async fn create_now(
         self: Arc<Self>,
         name: String,
+        disk: NewDisk,
+        start: bool,
         _op: OwnedSemaphorePermit,
     ) -> Result<Arc<Entry>, ApiError> {
         let mut token = [0u8; 16];
@@ -359,7 +438,7 @@ impl Node {
             cpus: self.config.cpus,
             memory_mib: self.config.memory_mib,
         };
-        let entry = Arc::new(Entry::new(record.clone(), self.dir.join(&record.id)));
+        let entry = Arc::new(Entry::new(record.clone(), self.dir.join(&record.id), 0));
         // Held until the sandbox runs, so nothing reaches it half made.
         let mut vm = entry.vm.lock().await;
         {
@@ -369,19 +448,27 @@ impl Node {
             }
             sandboxes.insert(name.clone(), entry.clone());
         }
+        let imported = match &disk {
+            NewDisk::Import(path) => Some(path.clone()),
+            NewDisk::Base(_) => None,
+        };
         let made = {
             let dir = self.dir.clone();
-            let base = self.config.base_disk.clone();
-            tokio::task::spawn_blocking(move || make(&dir, &base, &record))
+            tokio::task::spawn_blocking(move || make(&dir, &disk, &record))
                 .await
                 .map_err(anyhow::Error::from)
                 .and_then(|made| made)
         };
         let started = match made {
-            Ok(()) => self.start(&entry, &mut vm).await,
+            Ok(()) if start => self.start(&entry, &mut vm).await.map(drop),
+            Ok(()) => Ok(()),
             Err(e) => Err(ApiError::internal(format!("creating the sandbox: {e:#}"))),
         };
         if let Err(e) = started {
+            if let Some(path) = imported {
+                // Back where it was, so the caller still has it.
+                let _ = fs::rename(entry.dir.join(DISK), path);
+            }
             if let Err(e) = self.bury(&entry).await {
                 eprintln!("shuru-node: removing sandbox {}: {e:#}", entry.record.id);
             }
@@ -412,6 +499,64 @@ impl Node {
             node.bury(&entry)
                 .await
                 .map_err(|e| ApiError::internal(format!("removing the sandbox: {e:#}")))
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("{e}")))?
+    }
+
+    /// Shuts the guest down, so its disk is synced, and stops the VM. The
+    /// sandbox and its disk stay; the next request that needs the guest
+    /// boots it again. Stopping a sandbox that is not running does nothing.
+    pub async fn stop(self: &Arc<Self>, name: &str) -> Result<(), ApiError> {
+        let op = self.op()?;
+        let entry = self.get(name)?;
+        stop_when(op, entry, |_| true).await.map(drop)
+    }
+
+    /// Stops the VM of a sandbox nothing has used for `after`, as `stop`
+    /// does. It looks again with the lock on the VM held, so a request that
+    /// came in meanwhile keeps it running. True means it stopped.
+    pub async fn stop_idle(
+        self: &Arc<Self>,
+        entry: &Arc<Entry>,
+        after: Duration,
+    ) -> Result<bool, ApiError> {
+        let op = self.op()?;
+        stop_when(op, entry.clone(), move |entry| {
+            entry.activity.idle(Instant::now(), after)
+        })
+        .await
+    }
+
+    /// Stops the VM as `stop` does, then, with the lock on the VM still
+    /// held so nothing boots it meanwhile, copies the disk to
+    /// `parked/<name>.disk` in place of any copy there.
+    pub async fn park(self: &Arc<Self>, name: &str) -> Result<Parked, ApiError> {
+        let op = self.op()?;
+        let entry = self.get(name)?;
+        let parked = self.parked.clone();
+        tokio::spawn(async move {
+            let _op = op;
+            let mut vm = entry.vm.lock().await;
+            if entry.deleted.load(Ordering::Acquire) {
+                return Err(ApiError::not_found(format!(
+                    "no sandbox {}",
+                    entry.record.name
+                )));
+            }
+            if let Some(running) = vm.take() {
+                running.stop(true).await;
+            }
+            let boot = entry.last_boot.load(Ordering::Acquire);
+            let disk = entry.dir.join(DISK);
+            let name = entry.record.name.clone();
+            let (disk, size) =
+                tokio::task::spawn_blocking(move || park_copy(&disk, &parked, &name))
+                    .await
+                    .map_err(|e| ApiError::internal(format!("{e}")))?
+                    .map_err(|e| ApiError::internal(format!("parking the disk: {e:#}")))?;
+            drop(vm);
+            Ok(Parked { disk, boot, size })
         })
         .await
         .map_err(|e| ApiError::internal(format!("{e}")))?
@@ -504,6 +649,21 @@ impl Node {
             .pop_first()
             .ok_or_else(|| ApiError::unavailable("this host runs as many sandboxes as it may"))?;
         let boot = self.next_boot();
+        let saved = {
+            let dir = entry.dir.clone();
+            let record = entry.record.clone();
+            tokio::task::spawn_blocking(move || save_boot(&dir, record, boot))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|saved| saved)
+        };
+        if let Err(e) = saved {
+            self.slots().insert(slot);
+            return Err(ApiError::internal(format!(
+                "saving the sandbox record: {e:#}"
+            )));
+        }
+        entry.last_boot.store(boot, Ordering::Release);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
         let alive = entry.running.clone();
@@ -534,6 +694,7 @@ impl Node {
             Err(_) => return Err(ApiError::internal("the VM thread ended")),
         };
         entry.last_running_at.store(unix_now(), Ordering::Relaxed);
+        entry.activity.restart();
         *vm = Some(Running {
             guest: guest.clone(),
             slot,
@@ -550,12 +711,19 @@ impl Node {
     /// moved on.
     fn next_boot(&self) -> u64 {
         let now = unix_millis();
-        let next = |last: u64| now.max(last + 1);
-        self.last_boot
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
-                Some(next(last))
-            })
-            .map_or(now, next)
+        let mut last = self.last_boot.load(Ordering::Relaxed);
+        loop {
+            let boot = now.max(last + 1);
+            match self.last_boot.compare_exchange_weak(
+                last,
+                boot,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return boot,
+                Err(seen) => last = seen,
+            }
+        }
     }
 
     fn hold(
@@ -668,7 +836,7 @@ impl Node {
 }
 
 impl Entry {
-    fn new(record: Record, dir: PathBuf) -> Entry {
+    fn new(record: Record, dir: PathBuf, last_boot: u64) -> Entry {
         Entry {
             record,
             dir,
@@ -676,9 +844,40 @@ impl Entry {
             running: Arc::new(AtomicBool::new(false)),
             deleted: AtomicBool::new(false),
             last_running_at: AtomicU64::new(0),
+            last_boot: AtomicU64::new(last_boot),
             ended: Mutex::new(None),
+            activity: Arc::default(),
         }
     }
+}
+
+/// Stops the VM of `entry` as `Node::stop` does, if `when` still holds
+/// once the lock on the VM is held. Runs to the end even if the caller goes
+/// away.
+async fn stop_when(
+    op: OwnedSemaphorePermit,
+    entry: Arc<Entry>,
+    when: impl FnOnce(&Entry) -> bool + Send + 'static,
+) -> Result<bool, ApiError> {
+    tokio::spawn(async move {
+        let _op = op;
+        let mut vm = entry.vm.lock().await;
+        if entry.deleted.load(Ordering::Acquire) {
+            return Err(ApiError::not_found(format!(
+                "no sandbox {}",
+                entry.record.name
+            )));
+        }
+        if !when(&entry) {
+            return Ok(false);
+        }
+        if let Some(running) = vm.take() {
+            running.stop(true).await;
+        }
+        Ok(true)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("{e}")))?
 }
 
 fn shut_down(vm: &Vm) -> Result<()> {
@@ -703,17 +902,29 @@ fn lock(path: &Path) -> Result<File> {
 }
 
 /// Writes the sandbox directory under another name, syncs it and renames
-/// it into place, so a crash never leaves one that looks complete.
-fn make(dir: &Path, base_disk: &Path, record: &Record) -> Result<()> {
+/// it into place, so a crash never leaves one that looks complete. An
+/// imported disk goes back where it was if this fails.
+fn make(dir: &Path, disk: &NewDisk, record: &Record) -> Result<()> {
     let staging = dir.join(format!(".{}.partial", record.id));
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&staging)
         .with_context(|| format!("{}", staging.display()))?;
     let made = (|| {
-        let disk = crate::clone_file(base_disk, &staging.join(DISK))?;
         let file = crate::create_private(&staging.join(RECORD))?;
-        serde_json::to_writer(&file, record)?;
+        let stored = Stored {
+            record: record.clone(),
+            last_boot: 0,
+        };
+        serde_json::to_writer(&file, &stored)?;
+        let disk = match disk {
+            NewDisk::Base(base) => crate::clone_file(base, &staging.join(DISK))?,
+            NewDisk::Import(path) => {
+                fs::rename(path, staging.join(DISK))
+                    .with_context(|| format!("moving {} in", path.display()))?;
+                vm::open(&staging.join(DISK))?
+            }
+        };
         for file in [&disk, &file] {
             file.sync_all()?;
         }
@@ -723,14 +934,72 @@ fn make(dir: &Path, base_disk: &Path, record: &Record) -> Result<()> {
         Ok(())
     })();
     if made.is_err() {
+        if let NewDisk::Import(path) = disk {
+            let _ = fs::rename(staging.join(DISK), path);
+        }
         let _ = fs::remove_dir_all(&staging);
     }
     made
 }
 
-fn read_record(dir: &Path) -> Result<Record> {
+fn read_record(dir: &Path) -> Result<Stored> {
     let file = vm::open(&dir.join(RECORD))?;
     serde_json::from_reader(file).context("reading the sandbox record")
+}
+
+/// Puts `boot` in `sandbox.json` in place of the last one.
+fn save_boot(dir: &Path, record: Record, boot: u64) -> Result<()> {
+    let partial = dir.join(format!(".{RECORD}.partial"));
+    let _ = fs::remove_file(&partial);
+    let file = crate::create_private(&partial)?;
+    let stored = Stored {
+        record,
+        last_boot: boot,
+    };
+    serde_json::to_writer(&file, &stored)?;
+    file.sync_all()?;
+    fs::rename(&partial, dir.join(RECORD))?;
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// The file `disk` names, which must be under the import directory once
+/// links are followed.
+fn import_path(import: &Path, disk: &str) -> Result<PathBuf, ApiError> {
+    let refused =
+        || ApiError::bad_request(format!("disk: expected a file under {}", import.display()));
+    let path = fs::canonicalize(disk).map_err(|_| refused())?;
+    if !path.starts_with(import) {
+        return Err(refused());
+    }
+    match fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => Ok(path),
+        _ => Err(refused()),
+    }
+}
+
+/// Copies `disk` to `<parked>/<name>.disk` through a file synced under
+/// another name, so a crash never leaves a cut copy there. The answer is
+/// the copy and its size.
+fn park_copy(disk: &Path, parked: &Path, name: &str) -> Result<(PathBuf, u64)> {
+    let target = parked.join(format!("{name}.disk"));
+    let partial = parked.join(format!(".{name}.disk.partial"));
+    let _ = fs::remove_file(&partial);
+    let copied = (|| {
+        let copy = crate::clone_file(disk, &partial)?;
+        copy.sync_all()?;
+        let size = copy.metadata()?.len();
+        fs::rename(&partial, &target)?;
+        File::open(parked)?.sync_all()?;
+        Ok(size)
+    })();
+    match copied {
+        Ok(size) => Ok((target, size)),
+        Err(e) => {
+            let _ = fs::remove_file(&partial);
+            Err(e)
+        }
+    }
 }
 
 fn valid_name(name: &str) -> bool {
@@ -766,5 +1035,138 @@ mod tests {
         for name in ["", "-a", "a-", "A", "a_b", "a.b", "a/b", &"a".repeat(64)] {
             assert!(!valid_name(name), "{name}");
         }
+    }
+
+    /// A fresh directory of its own for `test`.
+    fn scratch(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("shuru-{test}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::canonicalize(dir).unwrap()
+    }
+
+    #[test]
+    fn imports_only_files_under_the_import_directory() {
+        let state = scratch("import");
+        let import = state.join("import");
+        fs::create_dir_all(import.join("deeper")).unwrap();
+        for file in ["import/a.disk", "import/deeper/b.disk", "outside.disk"] {
+            fs::write(state.join(file), b"disk").unwrap();
+        }
+        std::os::unix::fs::symlink(state.join("outside.disk"), import.join("link.disk")).unwrap();
+
+        let ok = |path: PathBuf| import_path(&import, path.to_str().unwrap()).unwrap();
+        assert_eq!(ok(import.join("a.disk")), import.join("a.disk"));
+        assert_eq!(
+            ok(import.join("deeper/b.disk")),
+            import.join("deeper/b.disk")
+        );
+        assert_eq!(ok(import.join("deeper/../a.disk")), import.join("a.disk"));
+        for refused in [
+            state.join("outside.disk"),
+            import.join("../outside.disk"),
+            import.join("link.disk"),
+            import.join("missing.disk"),
+            import.join("deeper"),
+            import.clone(),
+        ] {
+            let e = import_path(&import, refused.to_str().unwrap()).unwrap_err();
+            assert_eq!(e.code(), "bad_request", "{}", refused.display());
+        }
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn a_park_replaces_the_copy_before() {
+        let state = scratch("park");
+        let parked = state.join("parked");
+        fs::create_dir_all(&parked).unwrap();
+        let disk = state.join("disk");
+        fs::write(&disk, b"first").unwrap();
+        let (copy, size) = park_copy(&disk, &parked, "web-1").unwrap();
+        assert_eq!(copy, parked.join("web-1.disk"));
+        assert_eq!(size, 5);
+
+        // A crash left a cut copy, and the disk changed since.
+        fs::write(parked.join(".web-1.disk.partial"), b"cut").unwrap();
+        fs::write(&disk, b"second run").unwrap();
+        let (copy, size) = park_copy(&disk, &parked, "web-1").unwrap();
+        assert_eq!(fs::read(&copy).unwrap(), b"second run");
+        assert_eq!(size, 10);
+        assert_eq!(fs::read(&disk).unwrap(), b"second run");
+        let names: Vec<_> = fs::read_dir(&parked)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["web-1.disk"]);
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn an_import_moves_the_disk_in_or_leaves_it() {
+        let state = scratch("make");
+        let sandboxes = state.join("sandboxes");
+        fs::create_dir_all(&sandboxes).unwrap();
+        let imported = state.join("import.disk");
+        fs::write(&imported, b"stored").unwrap();
+        let record = |id: &str| Record {
+            id: id.into(),
+            name: "web-1".into(),
+            created_at: 1,
+            cpus: 2,
+            memory_mib: 2048,
+        };
+
+        make(
+            &sandboxes,
+            &NewDisk::Import(imported.clone()),
+            &record("sbx-a"),
+        )
+        .unwrap();
+        assert!(!imported.exists());
+        let dir = sandboxes.join("sbx-a");
+        assert_eq!(fs::read(dir.join(DISK)).unwrap(), b"stored");
+        assert_eq!(read_record(&dir).unwrap().last_boot, 0);
+
+        // The directory exists already, so the make fails at its last step.
+        fs::write(&imported, b"again").unwrap();
+        fs::create_dir_all(sandboxes.join("sbx-b/taken")).unwrap();
+        assert!(make(
+            &sandboxes,
+            &NewDisk::Import(imported.clone()),
+            &record("sbx-b")
+        )
+        .is_err());
+        assert_eq!(fs::read(&imported).unwrap(), b"again");
+        assert!(!sandboxes.join(".sbx-b.partial").exists());
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn the_last_boot_is_kept_in_the_record() {
+        let dir = scratch("boot");
+        let record = Record {
+            id: "sbx-a".into(),
+            name: "web-1".into(),
+            created_at: 1,
+            cpus: 2,
+            memory_mib: 2048,
+        };
+        // A record written before boots were kept.
+        fs::write(dir.join(RECORD), serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(read_record(&dir).unwrap().last_boot, 0);
+        save_boot(&dir, record.clone(), 17).unwrap();
+        save_boot(&dir, record, 18).unwrap();
+        let stored = read_record(&dir).unwrap();
+        assert_eq!(
+            (stored.record.name.as_str(), stored.last_boot),
+            ("web-1", 18)
+        );
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [RECORD]);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
