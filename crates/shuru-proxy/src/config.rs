@@ -12,6 +12,25 @@ pub struct ExposeHostMapping {
     pub guest_port: u16,
 }
 
+/// A token bucket: `burst` at once, refilled at `per_second`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rate {
+    pub per_second: u32,
+    pub burst: u32,
+}
+
+/// Bounds on new connections from the guest. A SYN over either bound is
+/// held back, not refused, so the guest retransmits it and slows down.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConnectionRate {
+    /// Every new connection.
+    pub connections: Rate,
+    /// Connections to an address and port the guest has not reached
+    /// lately. Scans touch a new one with every SYN; real work returns to
+    /// the same few.
+    pub destinations: Rate,
+}
+
 /// Configuration for the proxy engine.
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -34,6 +53,10 @@ pub struct ProxyConfig {
     /// cannot reach the host, its network or a metadata service. Turns
     /// `expose_host` off.
     pub public_only: bool,
+    /// Destination ports the guest is refused outright, as a closed port.
+    pub deny_ports: Vec<u16>,
+    /// How fast the guest may open connections. None leaves it unbounded.
+    pub connection_rate: Option<ConnectionRate>,
     /// PEM roots for verifying upstream servers when relaying secrets.
     /// None reads the system store from disk.
     pub upstream_roots: Option<Vec<u8>>,
@@ -48,6 +71,8 @@ impl Default for ProxyConfig {
             expose_host: Vec::new(),
             config_dir: None,
             public_only: false,
+            deny_ports: Vec::new(),
+            connection_rate: None,
             upstream_roots: None,
         }
     }

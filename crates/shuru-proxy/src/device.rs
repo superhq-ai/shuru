@@ -133,6 +133,11 @@ impl VZDevice {
     pub fn pending_frames(&self) -> impl Iterator<Item = &[u8]> {
         self.pending_rx.iter().map(|v| v.as_slice())
     }
+
+    /// Drops the pending frames `keep` says no to, before smoltcp sees them.
+    pub fn retain_pending(&mut self, mut keep: impl FnMut(&[u8]) -> bool) {
+        self.pending_rx.retain(|frame| keep(frame));
+    }
 }
 
 pub struct VZRxToken {

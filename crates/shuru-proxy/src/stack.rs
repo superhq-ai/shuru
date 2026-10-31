@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 use crate::device::{DrainStatus, VZDevice};
+use crate::egress::{Gate, Verdict};
 use crate::flows::Flows;
 
 /// Gateway IP inside the virtual network (host-side smoltcp).
@@ -34,7 +35,7 @@ const TCP_RX_BUF_SIZE: usize = 512 * 1024;
 const TCP_TX_BUF_SIZE: usize = 256 * 1024;
 // Hard ceiling on live TCP sockets, listening or connected. At the buffer
 // sizes above this bounds the netstack at 384 MiB no matter what the guest
-// does; SYNs beyond it are dropped and the guest retransmits.
+// does; SYNs beyond it are held back and the guest retransmits.
 const MAX_TCP_SOCKETS: usize = 512;
 
 // Bytes in flight between the stack and the engine on one connection, in
@@ -130,6 +131,9 @@ pub struct NetworkStack {
     recv_buf: Vec<u8>,
     /// Reusable scratch map for inspect_pending_frames.
     syn_scratch: HashMap<(Ipv4Address, u16), usize>,
+    /// SYNs to let through per destination, where the rest are held back.
+    held: HashMap<(Ipv4Address, u16), usize>,
+    gate: Gate,
     event_tx: mpsc::UnboundedSender<StackEvent>,
     cmd_rx: mpsc::UnboundedReceiver<StackCommand>,
     flows: Arc<Flows>,
@@ -141,6 +145,7 @@ impl NetworkStack {
         event_tx: mpsc::UnboundedSender<StackEvent>,
         cmd_rx: mpsc::UnboundedReceiver<StackCommand>,
         flows: Arc<Flows>,
+        gate: Gate,
     ) -> Self {
         let mut device = VZDevice::new(host_fd);
 
@@ -189,6 +194,8 @@ impl NetworkStack {
             dns_inflight: Arc::new(Semaphore::new(MAX_DNS_INFLIGHT)),
             recv_buf: vec![0u8; RECV_CHUNK],
             syn_scratch: HashMap::new(),
+            held: HashMap::new(),
+            gate,
             event_tx,
             cmd_rx,
             flows,
@@ -355,6 +362,7 @@ impl NetworkStack {
         // Drain into a local vec to release &mut self borrow on syn_scratch
         let syn_entries: Vec<_> = self.syn_scratch.drain().collect();
         let mut live_sockets = self.sockets.iter().count();
+        let now = std::time::Instant::now();
         for ((dst_ip, dst_port), syn_count) in syn_entries {
             let existing = self
                 .listening
@@ -362,13 +370,29 @@ impl NetworkStack {
                 .map_or(0, |v| v.len());
             let needed = syn_count.saturating_sub(existing);
 
-            for _ in 0..needed {
+            for added in 0..needed {
+                // A SYN without a listener gets a reset from smoltcp, the
+                // answer of a closed port. One held back never reaches it.
+                let keep = existing + added;
                 if live_sockets >= MAX_TCP_SOCKETS {
                     warn!(
-                        "SYN → {}:{} dropped: {} TCP sockets live, limit {}",
+                        "SYN → {}:{} held: {} TCP sockets live, limit {}",
                         dst_ip, dst_port, live_sockets, MAX_TCP_SOCKETS
                     );
+                    self.held.insert((dst_ip, dst_port), keep);
                     break;
+                }
+                match self.gate.admit((dst_ip, dst_port), now) {
+                    Verdict::Open => {}
+                    Verdict::Refuse => {
+                        debug!("SYN → {dst_ip}:{dst_port} refused: port denied");
+                        break;
+                    }
+                    Verdict::Wait => {
+                        debug!("SYN → {dst_ip}:{dst_port} held: over the connection rate");
+                        self.held.insert((dst_ip, dst_port), keep);
+                        break;
+                    }
                 }
                 debug!("SYN → {}:{}, adding listener", dst_ip, dst_port);
 
@@ -393,6 +417,24 @@ impl NetworkStack {
                     .or_default()
                     .push(handle);
             }
+        }
+
+        if !self.held.is_empty() {
+            let held = &mut self.held;
+            self.device.retain_pending(|frame| {
+                let Some(dst) = Self::parse_syn_dst(frame) else {
+                    return true;
+                };
+                match held.get_mut(&dst) {
+                    Some(0) => false,
+                    Some(keep) => {
+                        *keep -= 1;
+                        true
+                    }
+                    None => true,
+                }
+            });
+            held.clear();
         }
     }
 
@@ -630,5 +672,272 @@ async fn sleep_or_pending(micros: Option<u64>) {
         Some(0) => {} // immediate; loop will continue without awaiting wakers
         Some(us) => tokio::time::sleep(std::time::Duration::from_micros(us)).await,
         None => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use smoltcp::phy::ChecksumCapabilities;
+    use smoltcp::wire::{
+        ArpOperation, ArpPacket, ArpRepr, EthernetProtocol, EthernetRepr, IpProtocol, Ipv4Repr,
+        TcpControl, TcpRepr, TcpSeqNumber,
+    };
+
+    use super::*;
+    use crate::config::{ConnectionRate, ProxyConfig, Rate};
+
+    const GUEST_MAC: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+    const GUEST_IP: Ipv4Address = Ipv4Address::new(10, 0, 0, 2);
+    const REMOTE: Ipv4Address = Ipv4Address::new(93, 184, 216, 34);
+
+    #[derive(Debug, PartialEq)]
+    enum Answer {
+        SynAck,
+        Reset,
+    }
+
+    /// A stack on one end of a socketpair, the guest on the other.
+    struct Rig {
+        guest: RawFd,
+        cmd_tx: Option<mpsc::UnboundedSender<StackCommand>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        _events: mpsc::UnboundedReceiver<StackEvent>,
+    }
+
+    impl Rig {
+        fn new(config: &ProxyConfig) -> Self {
+            let (guest, host) = crate::create_socketpair().unwrap();
+            let (event_tx, events) = mpsc::unbounded_channel();
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let gate = Gate::new(config, std::time::Instant::now());
+            let thread = std::thread::spawn(move || {
+                let mut stack =
+                    NetworkStack::new(host, event_tx, cmd_rx, Arc::new(Flows::default()), gate);
+                stack.run();
+                unsafe { libc::close(host) };
+            });
+            let rig = Rig {
+                guest,
+                cmd_tx: Some(cmd_tx),
+                thread: Some(thread),
+                _events: events,
+            };
+            rig.resolve_gateway();
+            rig
+        }
+
+        /// What a guest does before its first connection; it also tells
+        /// the stack where the guest is, so its first answer is not lost
+        /// to a lookup of its own.
+        fn resolve_gateway(&self) {
+            let request = ArpRepr::EthernetIpv4 {
+                operation: ArpOperation::Request,
+                source_hardware_addr: GUEST_MAC,
+                source_protocol_addr: GUEST_IP,
+                target_hardware_addr: EthernetAddress([0; 6]),
+                target_protocol_addr: GATEWAY_IP,
+            };
+            self.send_arp(request, EthernetAddress::BROADCAST);
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut buf = vec![0u8; 65536];
+            while std::time::Instant::now() < deadline {
+                let n = unsafe {
+                    libc::recv(
+                        self.guest,
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                if n > 0 {
+                    let frame = EthernetFrame::new_checked(&buf[..n as usize]).unwrap();
+                    if frame.ethertype() == EthernetProtocol::Arp {
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("the gateway never answered ARP");
+        }
+
+        fn syn(&self, dst_port: u16, src_port: u16) {
+            let tcp = TcpRepr {
+                src_port,
+                dst_port,
+                control: TcpControl::Syn,
+                seq_number: TcpSeqNumber(1000),
+                ack_number: None,
+                window_len: 64240,
+                window_scale: None,
+                max_seg_size: Some(1460),
+                sack_permitted: false,
+                sack_ranges: [None; 3],
+                timestamp: None,
+                payload: &[],
+            };
+            let ip = Ipv4Repr {
+                src_addr: GUEST_IP,
+                dst_addr: REMOTE,
+                next_header: IpProtocol::Tcp,
+                payload_len: tcp.buffer_len(),
+                hop_limit: 64,
+            };
+            let eth = EthernetRepr {
+                src_addr: GUEST_MAC,
+                dst_addr: GATEWAY_MAC,
+                ethertype: EthernetProtocol::Ipv4,
+            };
+            let mut buf = vec![0u8; eth.buffer_len() + ip.buffer_len() + tcp.buffer_len()];
+            let mut frame = EthernetFrame::new_unchecked(&mut buf[..]);
+            eth.emit(&mut frame);
+            let mut packet = Ipv4Packet::new_unchecked(frame.payload_mut());
+            ip.emit(&mut packet, &ChecksumCapabilities::default());
+            let mut segment = TcpPacket::new_unchecked(packet.payload_mut());
+            tcp.emit(
+                &mut segment,
+                &IpAddress::Ipv4(GUEST_IP),
+                &IpAddress::Ipv4(REMOTE),
+                &ChecksumCapabilities::default(),
+            );
+            self.send(&buf);
+        }
+
+        fn send(&self, frame: &[u8]) {
+            let n = unsafe { libc::send(self.guest, frame.as_ptr().cast(), frame.len(), 0) };
+            assert!(n > 0, "send failed: {}", std::io::Error::last_os_error());
+        }
+
+        /// What the stack answers the SYN from `src_port` within `wait`,
+        /// answering its ARP requests for the guest on the way.
+        fn answer(&self, src_port: u16, wait: Duration) -> Option<Answer> {
+            let deadline = std::time::Instant::now() + wait;
+            let mut buf = vec![0u8; 65536];
+            while std::time::Instant::now() < deadline {
+                let n = unsafe {
+                    libc::recv(
+                        self.guest,
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                if n <= 0 {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                let frame = EthernetFrame::new_checked(&buf[..n as usize]).unwrap();
+                match frame.ethertype() {
+                    EthernetProtocol::Arp => self.arp_reply(&frame),
+                    EthernetProtocol::Ipv4 => {
+                        let packet = Ipv4Packet::new_checked(frame.payload()).unwrap();
+                        let segment = TcpPacket::new_checked(packet.payload()).unwrap();
+                        if segment.dst_port() != src_port {
+                            continue;
+                        }
+                        if segment.rst() {
+                            return Some(Answer::Reset);
+                        }
+                        if segment.syn() && segment.ack() {
+                            return Some(Answer::SynAck);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+
+        fn arp_reply(&self, frame: &EthernetFrame<&[u8]>) {
+            let request =
+                ArpRepr::parse(&ArpPacket::new_checked(frame.payload()).unwrap()).unwrap();
+            let ArpRepr::EthernetIpv4 {
+                operation: ArpOperation::Request,
+                source_hardware_addr,
+                source_protocol_addr,
+                ..
+            } = request
+            else {
+                return;
+            };
+            let reply = ArpRepr::EthernetIpv4 {
+                operation: ArpOperation::Reply,
+                source_hardware_addr: GUEST_MAC,
+                source_protocol_addr: GUEST_IP,
+                target_hardware_addr: source_hardware_addr,
+                target_protocol_addr: source_protocol_addr,
+            };
+            self.send_arp(reply, source_hardware_addr);
+        }
+
+        fn send_arp(&self, arp: ArpRepr, to: EthernetAddress) {
+            let eth = EthernetRepr {
+                src_addr: GUEST_MAC,
+                dst_addr: to,
+                ethertype: EthernetProtocol::Arp,
+            };
+            let mut buf = vec![0u8; eth.buffer_len() + arp.buffer_len()];
+            let mut out = EthernetFrame::new_unchecked(&mut buf[..]);
+            eth.emit(&mut out);
+            arp.emit(&mut ArpPacket::new_unchecked(out.payload_mut()));
+            self.send(&buf);
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            self.cmd_tx.take();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            unsafe { libc::close(self.guest) };
+        }
+    }
+
+    fn paced(destinations: Rate) -> ProxyConfig {
+        ProxyConfig {
+            deny_ports: vec![25],
+            connection_rate: Some(ConnectionRate {
+                connections: Rate {
+                    per_second: 1000,
+                    burst: 1000,
+                },
+                destinations,
+            }),
+            ..Default::default()
+        }
+    }
+
+    const SHORT: Duration = Duration::from_millis(300);
+
+    #[test]
+    fn a_denied_port_is_answered_as_closed() {
+        let rig = Rig::new(&paced(Rate {
+            per_second: 10,
+            burst: 10,
+        }));
+        rig.syn(25, 40001);
+        assert_eq!(rig.answer(40001, SHORT), Some(Answer::Reset));
+        rig.syn(443, 40002);
+        assert_eq!(rig.answer(40002, SHORT), Some(Answer::SynAck));
+    }
+
+    #[test]
+    fn a_syn_over_the_rate_gets_no_answer_until_it_comes_again() {
+        let rig = Rig::new(&paced(Rate {
+            per_second: 2,
+            burst: 2,
+        }));
+        rig.syn(443, 40001);
+        assert_eq!(rig.answer(40001, SHORT), Some(Answer::SynAck));
+        rig.syn(80, 40002);
+        assert_eq!(rig.answer(40002, SHORT), Some(Answer::SynAck));
+        // Neither a reset nor a handshake: the guest is left to retransmit.
+        rig.syn(8080, 40003);
+        assert_eq!(rig.answer(40003, SHORT), None);
+        std::thread::sleep(Duration::from_millis(300));
+        rig.syn(8080, 40003);
+        assert_eq!(rig.answer(40003, SHORT), Some(Answer::SynAck));
     }
 }
