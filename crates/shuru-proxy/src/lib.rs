@@ -1,6 +1,7 @@
 pub mod config;
 mod device;
 mod dns;
+mod egress;
 mod flows;
 mod proxy;
 mod secrets;
@@ -208,11 +209,12 @@ pub fn start_session(
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let flows = Arc::new(Flows::default());
     let stack_flows = flows.clone();
+    let gate = egress::Gate::new(&config, std::time::Instant::now());
 
     let stack_thread = std::thread::Builder::new()
         .name("shuru-netstack".into())
         .spawn(move || {
-            let mut stack = NetworkStack::new(host_fd, event_tx, cmd_rx, stack_flows);
+            let mut stack = NetworkStack::new(host_fd, event_tx, cmd_rx, stack_flows, gate);
             stack.run();
         })?;
 

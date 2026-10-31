@@ -10,10 +10,27 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use anyhow::{bail, Context, Result};
 use shuru_node::control::{self, NetdConfig, Request, Response};
 use shuru_node::seccomp;
-use shuru_proxy::config::{NetworkConfig, SecretConfig};
+use shuru_proxy::config::{ConnectionRate, NetworkConfig, Rate, SecretConfig};
 use shuru_proxy::ProxyConfig;
 
 const CONTROL_FD: i32 = 3;
+
+/// Mail submission and relay. A guest on a shared host sends mail through
+/// an HTTP API, not from the address of the host.
+const SMTP: [u16; 4] = [25, 465, 587, 2525];
+
+/// Room for an install or a page load with many hosts, too little for a
+/// scan or a flood to get far from the address of the host.
+const CONNECTION_RATE: ConnectionRate = ConnectionRate {
+    connections: Rate {
+        per_second: 50,
+        burst: 200,
+    },
+    destinations: Rate {
+        per_second: 5,
+        burst: 100,
+    },
+};
 
 fn main() {
     if let Err(e) = run() {
@@ -79,6 +96,8 @@ fn start(
             allow: config.allow,
         },
         public_only: true,
+        deny_ports: SMTP.to_vec(),
+        connection_rate: Some(CONNECTION_RATE),
         upstream_roots: Some(config.upstream_roots.into_bytes()),
         ..Default::default()
     };
