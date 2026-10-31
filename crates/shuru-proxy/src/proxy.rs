@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::ProxyConfig;
 use crate::dns;
+use crate::egress::Tally;
 use crate::secrets::SecretResolver;
 use crate::stack::{ConnectionId, StackCommand, StackEvent, TcpConnection};
 use crate::stream::{ChannelStream, GuestRx, GuestTx};
@@ -132,17 +133,27 @@ impl ProxyEngine {
     fn handle_new_connection(&mut self, conn: TcpConnection) {
         let (data_tx, data_rx) = mpsc::unbounded_channel();
         self.connections.insert(conn.id, data_tx);
+        let tally = Arc::new(Tally::default());
         let guest = Guest {
             id: conn.id,
-            rx: GuestRx::new(conn.id, data_rx, self.cmd_tx.clone()),
-            tx: GuestTx::new(conn.id, self.cmd_tx.clone(), conn.to_guest),
+            rx: GuestRx::new(conn.id, data_rx, self.cmd_tx.clone(), tally.clone()),
+            tx: GuestTx::new(conn.id, self.cmd_tx.clone(), conn.to_guest, tally.clone()),
             cmd_tx: self.cmd_tx.clone(),
         };
         let shared = self.shared.clone();
+        let opened = shared
+            .config
+            .egress_log
+            .as_ref()
+            .map(|log| log.open(conn.dst, tally.clone()));
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(guest, conn.dst, &shared).await {
+            let result = handle_connection(guest, conn.dst, &shared, &tally).await;
+            if let Err(e) = &result {
                 debug!("connection to {} ended: {e}", conn.dst);
+            }
+            if let Some(opened) = opened {
+                opened.end(result.is_ok());
             }
         });
     }
@@ -172,6 +183,7 @@ async fn handle_connection(
     mut guest: Guest,
     dst: SocketAddr,
     shared: &Shared,
+    tally: &Tally,
 ) -> anyhow::Result<()> {
     let config = &shared.config;
     if config.public_only && !crate::config::is_public(dst.ip()) {
@@ -251,6 +263,9 @@ async fn handle_connection(
 
         let sni = extract_sni(&tls_buf);
         debug!("TLS to {dst}, SNI: {sni:?}");
+        if let Some(host) = &sni {
+            tally.set_host(host);
+        }
 
         // When a domain allowlist is active, verify the SNI matches an
         // allowed domain. This prevents connecting to non-allowed services

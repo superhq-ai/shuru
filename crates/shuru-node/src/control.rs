@@ -75,6 +75,9 @@ pub struct NetdConfig {
     /// The proxy session a restored guest was saved with.
     #[serde(default)]
     pub session: Option<shuru_proxy::Session>,
+    /// The name of the sandbox, on each line of its egress log.
+    #[serde(default)]
+    pub sandbox: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -39,6 +39,9 @@ const SANDBOX_PIDS: u64 = 2 * NPROC;
 const GUEST_PORT: u32 = 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 const FLOWS_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a stopping process has to answer, writing what it holds,
+/// before it is killed.
+const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const INSTALL_CA: &str =
     "printf '%s' \"$SHURU_PROXY_CA\" > /usr/local/share/ca-certificates/shuru-proxy.crt \
     && update-ca-certificates --fresh > /dev/null 2>&1";
@@ -183,7 +186,10 @@ impl Jailed {
     }
 
     pub fn stop(self) {
-        let _ = control::send(&self.control, &Request::Stop, &[]);
+        if control::send(&self.control, &Request::Stop, &[]).is_ok() {
+            let _ = self.control.set_read_timeout(Some(STOP_TIMEOUT));
+            let _ = control::receive::<Response>(&self.control, 0);
+        }
     }
 
     /// Another handle on the control connection, to ask the running
@@ -316,6 +322,7 @@ pub fn start_network(
     ca_bundle: &Path,
     netd: Jailed,
     saved: Option<(shuru_proxy::Session, [u8; 6])>,
+    sandbox: &str,
 ) -> Result<Network> {
     let mut secrets = policy
         .secrets
@@ -347,6 +354,7 @@ pub fn start_network(
         secrets,
         upstream_roots,
         session,
+        sandbox: sandbox.to_owned(),
     };
     let response = netd
         .configure(&Request::ConfigureNetwork(config), &[host_end.as_raw_fd()])
@@ -453,6 +461,8 @@ pub fn open(path: &Path) -> Result<File> {
 
 /// A kernel to boot in a fresh jail.
 pub struct KernelBoot<'a> {
+    /// Names the sandbox in its egress log.
+    pub name: &'a str,
     pub slot: u32,
     pub kernel: &'a Path,
     pub initrd: &'a Path,
@@ -510,6 +520,7 @@ impl Vm {
                     spec.ca_bundle,
                     netd,
                     None,
+                    spec.name,
                 )?)
             }
             None => None,

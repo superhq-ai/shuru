@@ -57,6 +57,9 @@ pub struct ProxyConfig {
     pub deny_ports: Vec<u16>,
     /// How fast the guest may open connections. None leaves it unbounded.
     pub connection_rate: Option<ConnectionRate>,
+    /// Where each connection the guest opened is recorded. None keeps no
+    /// record.
+    pub egress_log: Option<crate::egress::EgressLog>,
     /// PEM roots for verifying upstream servers when relaying secrets.
     /// None reads the system store from disk.
     pub upstream_roots: Option<Vec<u8>>,
@@ -73,6 +76,7 @@ impl Default for ProxyConfig {
             public_only: false,
             deny_ports: Vec::new(),
             connection_rate: None,
+            egress_log: None,
             upstream_roots: None,
         }
     }

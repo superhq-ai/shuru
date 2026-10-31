@@ -11,6 +11,7 @@ mod substitute;
 mod tls;
 
 pub use config::ProxyConfig;
+pub use egress::EgressLog;
 pub use flows::{FlowAge, Flows};
 
 use std::collections::HashMap;

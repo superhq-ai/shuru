@@ -1,12 +1,14 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, AcquireError, OwnedSemaphorePermit, Semaphore};
 
+use crate::egress::Tally;
 use crate::stack::{ConnectionId, StackCommand};
 
 /// Largest single send toward the guest. Must not exceed TO_GUEST_BUDGET.
@@ -19,18 +21,21 @@ pub struct GuestRx {
     id: ConnectionId,
     data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     cmd_tx: mpsc::UnboundedSender<StackCommand>,
+    tally: Arc<Tally>,
 }
 
 impl GuestRx {
-    pub fn new(
+    pub(crate) fn new(
         id: ConnectionId,
         data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
         cmd_tx: mpsc::UnboundedSender<StackCommand>,
+        tally: Arc<Tally>,
     ) -> Self {
         GuestRx {
             id,
             data_rx,
             cmd_tx,
+            tally,
         }
     }
 
@@ -41,6 +46,9 @@ impl GuestRx {
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
         let polled = self.data_rx.poll_recv(cx);
         if let Poll::Ready(Some(data)) = &polled {
+            self.tally
+                .up
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
             let _ = self.cmd_tx.send(StackCommand::Consumed {
                 id: self.id,
                 n: data.len(),
@@ -58,15 +66,22 @@ pub struct GuestTx {
     id: ConnectionId,
     cmd_tx: mpsc::UnboundedSender<StackCommand>,
     budget: Arc<Semaphore>,
+    tally: Arc<Tally>,
 }
 
 impl GuestTx {
-    pub fn new(
+    pub(crate) fn new(
         id: ConnectionId,
         cmd_tx: mpsc::UnboundedSender<StackCommand>,
         budget: Arc<Semaphore>,
+        tally: Arc<Tally>,
     ) -> Self {
-        GuestTx { id, cmd_tx, budget }
+        GuestTx {
+            id,
+            cmd_tx,
+            budget,
+            tally,
+        }
     }
 
     pub async fn send(&self, data: &[u8]) -> io::Result<()> {
@@ -87,7 +102,11 @@ impl GuestTx {
                 id: self.id,
                 payload: chunk.to_vec(),
             })
-            .map_err(|_| closed())
+            .map_err(|_| closed())?;
+        self.tally
+            .down
+            .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        Ok(())
     }
 }
 
