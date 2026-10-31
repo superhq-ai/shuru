@@ -528,9 +528,10 @@ impl Node {
         Ok(entry)
     }
 
-    /// Stops the VM and removes the sandbox with its disk. Runs to the end
-    /// even if the caller goes away.
-    pub async fn delete(self: &Arc<Self>, name: &str) -> Result<(), ApiError> {
+    /// Stops the VM and removes the sandbox with its disk. With
+    /// `if_stopped`, a sandbox running when the lock is taken is left be
+    /// and answers 409. Runs to the end even if the caller goes away.
+    pub async fn delete(self: &Arc<Self>, name: &str, if_stopped: bool) -> Result<(), ApiError> {
         let op = self.op()?;
         let entry = self.get(name)?;
         let node = self.clone();
@@ -538,6 +539,9 @@ impl Node {
             let _op = op;
             let mut vm = entry.vm.lock().await;
             present(&entry)?;
+            if if_stopped {
+                still_stopped(&entry, &vm)?;
+            }
             if let Some(running) = vm.take() {
                 running.stop(false).await;
             }
@@ -575,8 +579,9 @@ impl Node {
 
     /// Stops the VM as `stop` does, then, with the lock on the VM still
     /// held so nothing boots it meanwhile, copies the disk to
-    /// `parked/<name>.disk` in place of any copy there.
-    pub async fn park(self: &Arc<Self>, name: &str) -> Result<Parked, ApiError> {
+    /// `parked/<name>.disk` in place of any copy there. With `if_stopped`,
+    /// a sandbox running when the lock is taken is left be and answers 409.
+    pub async fn park(self: &Arc<Self>, name: &str, if_stopped: bool) -> Result<Parked, ApiError> {
         let op = self.op()?;
         let entry = self.get(name)?;
         let parked = self.parked.clone();
@@ -584,6 +589,9 @@ impl Node {
             let _op = op;
             let mut vm = entry.vm.lock().await;
             present(&entry)?;
+            if if_stopped {
+                still_stopped(&entry, &vm)?;
+            }
             if let Some(running) = vm.take() {
                 running.stop(true).await;
             }
@@ -1010,6 +1018,21 @@ fn present(entry: &Entry) -> Result<(), ApiError> {
     if entry.deleted.load(Ordering::Acquire) {
         return Err(ApiError::not_found(format!(
             "no sandbox {}",
+            entry.record.name
+        )));
+    }
+    Ok(())
+}
+
+/// A host that saw a sandbox stopped acts on it only while it stays so: a
+/// request may have booted it since, and is using it.
+fn still_stopped(entry: &Entry, vm: &Option<Running>) -> Result<(), ApiError> {
+    if vm
+        .as_ref()
+        .is_some_and(|running| running.alive.load(Ordering::Acquire))
+    {
+        return Err(ApiError::conflict(format!(
+            "sandbox {} is running",
             entry.record.name
         )));
     }

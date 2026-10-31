@@ -196,6 +196,17 @@ pub fn parse_bool(key: &str, value: &str) -> Result<bool, ApiError> {
     }
 }
 
+/// `if_stopped=true` on a park or delete.
+fn if_stopped<B>(request: &Request<B>) -> Result<bool, ApiError> {
+    let mut if_stopped = false;
+    for (key, value) in query_pairs(request.uri().query()) {
+        if key == "if_stopped" {
+            if_stopped = parse_bool(&key, &value)?;
+        }
+    }
+    Ok(if_stopped)
+}
+
 pub fn parse_number<T: std::str::FromStr>(key: &str, value: &str) -> Result<T, ApiError> {
     value
         .parse()
@@ -281,7 +292,7 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
             Ok(json_response(StatusCode::OK, &sandbox_json(&entry)))
         }
         (&Method::DELETE, [name]) => {
-            node.delete(name).await?;
+            node.delete(name, if_stopped(&request)?).await?;
             Ok(no_content())
         }
         (&Method::POST, [name, "stop"]) => {
@@ -312,7 +323,7 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
             Ok(json_response(StatusCode::OK, &sandbox_json(&entry)))
         }
         (&Method::POST, [name, "park"]) => {
-            let parked = node.park(name).await?;
+            let parked = node.park(name, if_stopped(&request)?).await?;
             Ok(json_response(
                 StatusCode::OK,
                 &json!({

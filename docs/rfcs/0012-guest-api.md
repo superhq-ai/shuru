@@ -40,9 +40,9 @@ host brings that.
 POST   /v1/sandboxes                  { "name": "web-1" }
 GET    /v1/sandboxes                  ?prefix= &max_results= &continuation_token=
 GET    /v1/sandboxes/{name}
-DELETE /v1/sandboxes/{name}
+DELETE /v1/sandboxes/{name}           ?if_stopped=
 POST   /v1/sandboxes/{name}/stop
-POST   /v1/sandboxes/{name}/park
+POST   /v1/sandboxes/{name}/park         ?if_stopped=
 GET    /v1/sandboxes/{name}/usage
 PUT    /v1/sandboxes/{name}/config       { "env": {...}, "secrets": {...} }
 POST   /v1/sandboxes/{name}/checkpoint
@@ -62,6 +62,12 @@ copy, `boot`, the boot of the last run (0 if it has not run since it was
 made or imported), and `size`, the size of the disk in bytes. The copy
 belongs to the caller, which tells by `boot` whether the disk changed
 since a copy it stored before.
+
+A host that saw a sandbox stopped and wants to park or delete it only
+while it stays stopped passes `if_stopped=true`. Under the same lock, a
+sandbox whose VM runs by then, because a request booted it, is left
+running and the call answers 409, so the request that woke it is not cut
+off. Looking first and acting after would leave that request a window.
 
 Create takes two more fields. `disk` names a file under
 `<state_dir>/import/` to make the sandbox from, in place of a copy of
