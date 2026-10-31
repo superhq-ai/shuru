@@ -3,6 +3,7 @@
 //! can reach the socket; whatever exposes the API further brings its own
 //! authentication.
 
+mod config;
 mod exec;
 mod files;
 mod guest;

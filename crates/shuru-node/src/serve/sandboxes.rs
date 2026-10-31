@@ -1,10 +1,11 @@
 //! The sandboxes on this host. Each keeps a directory under the state
-//! directory with its settings and working disk. A running sandbox has a
-//! thread of its own that boots the VM, holds it and stops it; the jailed
-//! processes are its children and die with it.
+//! directory with its settings, its config and its working disk. A running
+//! sandbox has a thread of its own that boots the VM, holds it and stops
+//! it; the jailed processes are its children and die with it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use shuru_proto::hello::Identity;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use super::config::{self, SandboxConfig};
+use super::guest;
 use super::http::ApiError;
 use super::hub::Hubs;
 use super::idle::{Activity, Busy};
@@ -29,6 +32,7 @@ const RECORD: &str = "sandbox.json";
 const DISK: &str = "disk";
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const WATCH_INTERVAL: Duration = Duration::from_secs(1);
+const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 /// Guest connections for exec sessions; the rest of what the VM takes
 /// goes to short calls, and one stays for the shutdown.
 const STREAMS: usize = vm::VSOCK_CONNECTIONS * 3 / 4;
@@ -73,8 +77,16 @@ pub struct Parked {
     pub size: u64,
 }
 
+/// A copy of the disk of a sandbox, running or not, for the caller to
+/// keep.
+pub struct Checkpoint {
+    pub disk: PathBuf,
+    pub size: u64,
+}
+
 /// Where the guest agent of a running sandbox answers, the budgets its
-/// connections come from, and its exec sessions with clients.
+/// connections come from, its exec sessions with clients, and the
+/// placeholders its secrets were given at boot.
 #[derive(Clone)]
 pub struct GuestAddr {
     pub vsock: PathBuf,
@@ -82,6 +94,7 @@ pub struct GuestAddr {
     pub streams: Arc<Semaphore>,
     pub calls: Arc<Semaphore>,
     pub hubs: Arc<Hubs>,
+    pub placeholders: Arc<HashMap<String, String>>,
 }
 
 struct Running {
@@ -115,6 +128,7 @@ pub struct Entry {
     last_boot: AtomicU64,
     ended: Mutex<Option<Ended>>,
     activity: Arc<Activity>,
+    config: Mutex<Arc<SandboxConfig>>,
 }
 
 /// The last run of a VM to stop: its boot, when it stopped, in
@@ -148,6 +162,13 @@ impl Entry {
     /// Keeps the sandbox from an idle park until dropped.
     pub fn busy(&self) -> Busy {
         self.activity.busy()
+    }
+
+    pub fn config(&self) -> Arc<SandboxConfig> {
+        self.config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn last_running_at(&self) -> Option<u64> {
@@ -218,6 +239,7 @@ pub struct Node {
     dir: PathBuf,
     parked: PathBuf,
     import: PathBuf,
+    checkpoints: PathBuf,
     sandboxes: Mutex<BTreeMap<String, Arc<Entry>>>,
     slots: Mutex<BTreeSet<u32>>,
     last_boot: AtomicU64,
@@ -251,7 +273,8 @@ impl Node {
         let dir = args.state_dir.join("sandboxes");
         let parked = args.state_dir.join("parked");
         let import = args.state_dir.join("import");
-        for dir in [&dir, &parked, &import] {
+        let checkpoints = args.state_dir.join("checkpoints");
+        for dir in [&dir, &parked, &import, &checkpoints] {
             fs::DirBuilder::new()
                 .mode(0o700)
                 .recursive(true)
@@ -260,11 +283,16 @@ impl Node {
         }
         let parked = fs::canonicalize(parked)?;
         let import = fs::canonicalize(import)?;
+        let checkpoints = fs::canonicalize(checkpoints)?;
         for item in fs::read_dir(&parked)? {
             let path = item?.path();
             if path.extension().is_some_and(|ext| ext == "partial") {
                 let _ = fs::remove_file(path);
             }
+        }
+        // Copies handed to callers of an earlier run, which are gone.
+        for item in fs::read_dir(&checkpoints)? {
+            let _ = fs::remove_file(item?.path());
         }
 
         let mut slots = BTreeSet::new();
@@ -296,6 +324,7 @@ impl Node {
             dir,
             parked,
             import,
+            checkpoints,
             sandboxes: Mutex::new(BTreeMap::new()),
             slots: Mutex::new(slots),
             last_boot: AtomicU64::new(0),
@@ -323,8 +352,10 @@ impl Node {
                 }
                 continue;
             }
-            let Stored { record, last_boot } = match read_record(&item.path()) {
-                Ok(stored) => stored,
+            let read = read_record(&item.path())
+                .and_then(|stored| Ok((stored, config::read(&item.path())?)));
+            let (Stored { record, last_boot }, config) = match read {
+                Ok(read) => read,
                 Err(e) => {
                     eprintln!("shuru-node: skipping {}: {e:#}", item.path().display());
                     continue;
@@ -338,7 +369,7 @@ impl Node {
                 continue;
             }
             self.last_boot.fetch_max(last_boot, Ordering::Relaxed);
-            let entry = Entry::new(record, item.path(), last_boot);
+            let entry = Entry::new(record, item.path(), last_boot, config);
             sandboxes.insert(entry.record.name.clone(), Arc::new(entry));
         }
         Ok(())
@@ -390,6 +421,7 @@ impl Node {
         self: &Arc<Self>,
         name: String,
         disk: Option<&str>,
+        config: SandboxConfig,
         start: bool,
     ) -> Result<Arc<Entry>, ApiError> {
         if !valid_name(&name) {
@@ -397,15 +429,26 @@ impl Node {
                 "a name is 1 to 63 lowercase letters, digits and dashes, not starting or ending with a dash",
             ));
         }
+        self.check_config(&config)?;
         let disk = match disk {
             Some(disk) => NewDisk::Import(import_path(&self.import, disk)?),
             None => NewDisk::Base(self.config.base_disk.clone()),
         };
         let op = self.op()?;
         let node = self.clone();
-        tokio::spawn(async move { node.create_now(name, disk, start, op).await })
+        tokio::spawn(async move { node.create_now(name, disk, config, start, op).await })
             .await
             .map_err(|e| ApiError::internal(format!("{e}")))?
+    }
+
+    /// Secrets reach a guest only through the proxy of its network.
+    fn check_config(&self, config: &SandboxConfig) -> Result<(), ApiError> {
+        if !config.secrets.is_empty() && self.config.network.is_none() {
+            return Err(ApiError::bad_request(
+                "secrets: this host gives sandboxes no network (--allow-net)",
+            ));
+        }
+        Ok(())
     }
 
     /// Admits an operation that shutdown waits for, unless it has begun.
@@ -426,6 +469,7 @@ impl Node {
         self: Arc<Self>,
         name: String,
         disk: NewDisk,
+        config: SandboxConfig,
         start: bool,
         _op: OwnedSemaphorePermit,
     ) -> Result<Arc<Entry>, ApiError> {
@@ -438,7 +482,12 @@ impl Node {
             cpus: self.config.cpus,
             memory_mib: self.config.memory_mib,
         };
-        let entry = Arc::new(Entry::new(record.clone(), self.dir.join(&record.id), 0));
+        let entry = Arc::new(Entry::new(
+            record.clone(),
+            self.dir.join(&record.id),
+            0,
+            config,
+        ));
         // Held until the sandbox runs, so nothing reaches it half made.
         let mut vm = entry.vm.lock().await;
         {
@@ -454,7 +503,8 @@ impl Node {
         };
         let made = {
             let dir = self.dir.clone();
-            tokio::task::spawn_blocking(move || make(&dir, &disk, &record))
+            let config = entry.config();
+            tokio::task::spawn_blocking(move || make(&dir, &disk, &record, &config))
                 .await
                 .map_err(anyhow::Error::from)
                 .and_then(|made| made)
@@ -487,12 +537,7 @@ impl Node {
         tokio::spawn(async move {
             let _op = op;
             let mut vm = entry.vm.lock().await;
-            if entry.deleted.load(Ordering::Acquire) {
-                return Err(ApiError::not_found(format!(
-                    "no sandbox {}",
-                    entry.record.name
-                )));
-            }
+            present(&entry)?;
             if let Some(running) = vm.take() {
                 running.stop(false).await;
             }
@@ -538,12 +583,7 @@ impl Node {
         tokio::spawn(async move {
             let _op = op;
             let mut vm = entry.vm.lock().await;
-            if entry.deleted.load(Ordering::Acquire) {
-                return Err(ApiError::not_found(format!(
-                    "no sandbox {}",
-                    entry.record.name
-                )));
-            }
+            present(&entry)?;
             if let Some(running) = vm.take() {
                 running.stop(true).await;
             }
@@ -557,6 +597,109 @@ impl Node {
                     .map_err(|e| ApiError::internal(format!("parking the disk: {e:#}")))?;
             drop(vm);
             Ok(Parked { disk, boot, size })
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("{e}")))?
+    }
+
+    /// Replaces the env and secrets of the sandbox. Env reaches the next
+    /// exec; secrets reach the next boot, since netd holds them for the
+    /// run.
+    pub async fn configure(
+        self: &Arc<Self>,
+        name: &str,
+        config: SandboxConfig,
+    ) -> Result<(), ApiError> {
+        self.check_config(&config)?;
+        let op = self.op()?;
+        let entry = self.get(name)?;
+        tokio::spawn(async move {
+            let _op = op;
+            // Held so the sandbox directory is in place and stays.
+            let _vm = entry.vm.lock().await;
+            present(&entry)?;
+            let config = Arc::new(config);
+            let saved = {
+                let dir = entry.dir.clone();
+                let config = config.clone();
+                tokio::task::spawn_blocking(move || replace_json(&dir, config::CONFIG, &*config))
+                    .await
+                    .map_err(|e| ApiError::internal(format!("{e}")))?
+            };
+            saved.map_err(|e| ApiError::internal(format!("saving the config: {e:#}")))?;
+            *entry.config.lock().unwrap_or_else(|e| e.into_inner()) = config;
+            Ok(())
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("{e}")))?
+    }
+
+    /// Copies the disk to `checkpoints/<name>.<random>.disk` for the
+    /// caller, who deletes it, with the lock on the VM held so nothing
+    /// boots or stops it meanwhile. A running sandbox syncs first and keeps
+    /// running; its copy is the disk as a crash at that instant would leave
+    /// it, which the ext4 journal recovers from.
+    pub async fn checkpoint(self: &Arc<Self>, name: &str) -> Result<Checkpoint, ApiError> {
+        let op = self.op()?;
+        let entry = self.get(name)?;
+        let checkpoints = self.checkpoints.clone();
+        tokio::spawn(async move {
+            let _op = op;
+            let vm = entry.vm.lock().await;
+            present(&entry)?;
+            let live = vm
+                .as_ref()
+                .filter(|running| running.alive.load(Ordering::Acquire))
+                .map(|running| running.guest.clone());
+            if let Some(addr) = &live {
+                tokio::time::timeout(SYNC_TIMEOUT, guest::sync(addr))
+                    .await
+                    .map_err(|_| ApiError::internal("the guest did not sync in time"))??;
+            }
+            let disk = entry.dir.join(DISK);
+            let name = entry.record.name.clone();
+            let live = live.is_some();
+            let (disk, size) = tokio::task::spawn_blocking(move || {
+                checkpoint_copy(&disk, &checkpoints, &name, live)
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("{e}")))?
+            .map_err(|e| ApiError::internal(format!("copying the disk: {e:#}")))?;
+            drop(vm);
+            Ok(Checkpoint { disk, size })
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("{e}")))?
+    }
+
+    /// Stops the VM as `stop` does, then, with the lock on the VM still
+    /// held, renames `disk` from the import directory over the sandbox
+    /// disk. The sandbox is left cold at a new boot, so a host sees that
+    /// its disk changed; the next request boots it.
+    pub async fn restore(self: &Arc<Self>, name: &str, disk: &str) -> Result<Arc<Entry>, ApiError> {
+        let disk = import_path(&self.import, disk)?;
+        let op = self.op()?;
+        let entry = self.get(name)?;
+        let node = self.clone();
+        tokio::spawn(async move {
+            let _op = op;
+            let mut vm = entry.vm.lock().await;
+            present(&entry)?;
+            if let Some(running) = vm.take() {
+                running.stop(true).await;
+            }
+            let boot = node.next_boot();
+            entry.last_boot.store(boot, Ordering::Release);
+            let restored = {
+                let dir = entry.dir.clone();
+                let record = entry.record.clone();
+                tokio::task::spawn_blocking(move || restore_disk(&dir, record, boot, &disk))
+                    .await
+                    .map_err(|e| ApiError::internal(format!("{e}")))?
+            };
+            restored.map_err(|e| ApiError::internal(format!("restoring the disk: {e:#}")))?;
+            drop(vm);
+            Ok(entry)
         })
         .await
         .map_err(|e| ApiError::internal(format!("{e}")))?
@@ -616,12 +759,7 @@ impl Node {
         tokio::spawn(async move {
             let _op = op;
             let mut vm = entry.vm.lock().await;
-            if entry.deleted.load(Ordering::Acquire) {
-                return Err(ApiError::not_found(format!(
-                    "no sandbox {}",
-                    entry.record.name
-                )));
-            }
+            present(&entry)?;
             if let Some(running) = vm.as_ref() {
                 if running.alive.load(Ordering::Acquire) {
                     return Ok(running.guest.clone());
@@ -706,24 +844,8 @@ impl Node {
         Ok(guest)
     }
 
-    /// A number for a VM start, above that of any start before it: the
-    /// time in milliseconds, or one past the last when the clock has not
-    /// moved on.
     fn next_boot(&self) -> u64 {
-        let now = unix_millis();
-        let mut last = self.last_boot.load(Ordering::Relaxed);
-        loop {
-            let boot = now.max(last + 1);
-            match self.last_boot.compare_exchange_weak(
-                last,
-                boot,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return boot,
-                Err(seen) => last = seen,
-            }
-        }
+        boot_after(&self.last_boot, unix_millis())
     }
 
     fn hold(
@@ -750,6 +872,12 @@ impl Node {
             streams: Arc::new(Semaphore::new(STREAMS)),
             calls: Arc::new(Semaphore::new(CALLS)),
             hubs: Arc::default(),
+            placeholders: Arc::new(
+                vm.network
+                    .as_ref()
+                    .map(|network| network.session.placeholders.clone())
+                    .unwrap_or_default(),
+            ),
         };
         alive.store(true, Ordering::Release);
         let graceful = if ready.send(Ok(guest)).is_err() {
@@ -794,9 +922,13 @@ impl Node {
         }
     }
 
+    /// Boots the VM with the node network and the secrets of the sandbox.
+    /// A guest given secrets trusts the proxy CA before it counts as
+    /// running.
     fn boot(&self, entry: &Entry, slot: u32) -> Result<Vm> {
         let config = &self.config;
         let disk = entry.dir.join(DISK);
+        let secrets = entry.config().netd_secrets();
         let vm = Vm::boot(
             &self.host,
             &KernelBoot {
@@ -807,6 +939,7 @@ impl Node {
                 cpus: entry.record.cpus,
                 memory_bytes: entry.record.memory_mib << 20,
                 network: config.network.as_ref(),
+                secrets: &secrets,
                 ca_bundle: &config.ca_bundle,
                 verbose: config.verbose,
             },
@@ -814,6 +947,11 @@ impl Node {
             &mut Vec::new(),
         )?;
         drop(vm.connect()?);
+        if let Some(network) = &vm.network {
+            if !network.session.placeholders.is_empty() {
+                vm.install_ca(&network.session.ca_cert_pem)?;
+            }
+        }
         Ok(vm)
     }
 
@@ -836,7 +974,7 @@ impl Node {
 }
 
 impl Entry {
-    fn new(record: Record, dir: PathBuf, last_boot: u64) -> Entry {
+    fn new(record: Record, dir: PathBuf, last_boot: u64, config: SandboxConfig) -> Entry {
         Entry {
             record,
             dir,
@@ -847,8 +985,35 @@ impl Entry {
             last_boot: AtomicU64::new(last_boot),
             ended: Mutex::new(None),
             activity: Arc::default(),
+            config: Mutex::new(Arc::new(config)),
         }
     }
+}
+
+/// A number for a VM start, or a restore, above that of any before it:
+/// `now` in milliseconds, or one past `last` when the clock has not moved
+/// on.
+fn boot_after(last: &AtomicU64, now: u64) -> u64 {
+    let mut seen = last.load(Ordering::Relaxed);
+    loop {
+        let boot = now.max(seen + 1);
+        match last.compare_exchange_weak(seen, boot, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return boot,
+            Err(newer) => seen = newer,
+        }
+    }
+}
+
+/// Refuses a sandbox deleted while its caller waited for the lock on its
+/// VM.
+fn present(entry: &Entry) -> Result<(), ApiError> {
+    if entry.deleted.load(Ordering::Acquire) {
+        return Err(ApiError::not_found(format!(
+            "no sandbox {}",
+            entry.record.name
+        )));
+    }
+    Ok(())
 }
 
 /// Stops the VM of `entry` as `Node::stop` does, if `when` still holds
@@ -862,12 +1027,7 @@ async fn stop_when(
     tokio::spawn(async move {
         let _op = op;
         let mut vm = entry.vm.lock().await;
-        if entry.deleted.load(Ordering::Acquire) {
-            return Err(ApiError::not_found(format!(
-                "no sandbox {}",
-                entry.record.name
-            )));
-        }
+        present(&entry)?;
         if !when(&entry) {
             return Ok(false);
         }
@@ -904,7 +1064,7 @@ fn lock(path: &Path) -> Result<File> {
 /// Writes the sandbox directory under another name, syncs it and renames
 /// it into place, so a crash never leaves one that looks complete. An
 /// imported disk goes back where it was if this fails.
-fn make(dir: &Path, disk: &NewDisk, record: &Record) -> Result<()> {
+fn make(dir: &Path, disk: &NewDisk, record: &Record, config: &SandboxConfig) -> Result<()> {
     let staging = dir.join(format!(".{}.partial", record.id));
     fs::DirBuilder::new()
         .mode(0o700)
@@ -917,6 +1077,8 @@ fn make(dir: &Path, disk: &NewDisk, record: &Record) -> Result<()> {
             last_boot: 0,
         };
         serde_json::to_writer(&file, &stored)?;
+        let config_file = crate::create_private(&staging.join(config::CONFIG))?;
+        (&config_file).write_all(&serde_json::to_vec(config)?)?;
         let disk = match disk {
             NewDisk::Base(base) => crate::clone_file(base, &staging.join(DISK))?,
             NewDisk::Import(path) => {
@@ -925,7 +1087,7 @@ fn make(dir: &Path, disk: &NewDisk, record: &Record) -> Result<()> {
                 vm::open(&staging.join(DISK))?
             }
         };
-        for file in [&disk, &file] {
+        for file in [&disk, &file, &config_file] {
             file.sync_all()?;
         }
         File::open(&staging)?.sync_all()?;
@@ -949,16 +1111,40 @@ fn read_record(dir: &Path) -> Result<Stored> {
 
 /// Puts `boot` in `sandbox.json` in place of the last one.
 fn save_boot(dir: &Path, record: Record, boot: u64) -> Result<()> {
-    let partial = dir.join(format!(".{RECORD}.partial"));
-    let _ = fs::remove_file(&partial);
-    let file = crate::create_private(&partial)?;
     let stored = Stored {
         record,
         last_boot: boot,
     };
-    serde_json::to_writer(&file, &stored)?;
-    file.sync_all()?;
-    fs::rename(&partial, dir.join(RECORD))?;
+    replace_json(dir, RECORD, &stored)
+}
+
+/// Writes `value` as `dir/name`, readable by root only, through a file
+/// synced under another name, so a crash leaves the old one or the new.
+fn replace_json(dir: &Path, name: &str, value: &impl Serialize) -> Result<()> {
+    let partial = dir.join(format!(".{name}.partial"));
+    let _ = fs::remove_file(&partial);
+    let written = (|| {
+        let file = crate::create_private(&partial)?;
+        (&file).write_all(&serde_json::to_vec(value)?)?;
+        file.sync_all()?;
+        fs::rename(&partial, dir.join(name))?;
+        File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&partial);
+    }
+    written
+}
+
+/// Puts `boot` in the record of the sandbox in `dir`, then renames `from`
+/// over its disk. The boot moves first, so a crash between the two leaves
+/// at worst a new boot on the old disk, which only costs a host a copy it
+/// did not need, never the restored disk under the boot before.
+fn restore_disk(dir: &Path, record: Record, boot: u64, from: &Path) -> Result<()> {
+    save_boot(dir, record, boot)?;
+    vm::open(from)?.sync_all()?;
+    fs::rename(from, dir.join(DISK)).with_context(|| format!("moving {} in", from.display()))?;
     File::open(dir)?.sync_all()?;
     Ok(())
 }
@@ -997,6 +1183,41 @@ fn park_copy(disk: &Path, parked: &Path, name: &str) -> Result<(PathBuf, u64)> {
         Ok(size) => Ok((target, size)),
         Err(e) => {
             let _ = fs::remove_file(&partial);
+            Err(e)
+        }
+    }
+}
+
+/// Copies `disk` to `<checkpoints>/<name>.<random>.disk`. A `live` disk,
+/// which its VM writes meanwhile, is only copied by sharing its blocks,
+/// which takes all of them at one instant; a plain copy could mix blocks
+/// from before and after a write. The answer is the copy and its size.
+fn checkpoint_copy(
+    disk: &Path,
+    checkpoints: &Path,
+    name: &str,
+    live: bool,
+) -> Result<(PathBuf, u64)> {
+    let mut token = [0u8; 8];
+    getrandom::fill(&mut token).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let target = checkpoints.join(format!("{name}.{}.disk", vm::hex(&token)));
+    let copied = (|| {
+        let copy = if live {
+            let from = vm::open(disk)?;
+            let copy = crate::create_private(&target)?;
+            if !shuru_linux::reflink(&copy, &from)? {
+                bail!("the state directory cannot share blocks between files, which copying the disk of a running sandbox takes");
+            }
+            copy
+        } else {
+            crate::clone_file(disk, &target)?
+        };
+        Ok(copy.metadata()?.len())
+    })();
+    match copied {
+        Ok(size) => Ok((target, size)),
+        Err(e) => {
+            let _ = fs::remove_file(&target);
             Err(e)
         }
     }
@@ -1117,16 +1338,20 @@ mod tests {
             memory_mib: 2048,
         };
 
+        let config = secret_config();
         make(
             &sandboxes,
             &NewDisk::Import(imported.clone()),
             &record("sbx-a"),
+            &config,
         )
         .unwrap();
         assert!(!imported.exists());
         let dir = sandboxes.join("sbx-a");
         assert_eq!(fs::read(dir.join(DISK)).unwrap(), b"stored");
         assert_eq!(read_record(&dir).unwrap().last_boot, 0);
+        assert_private(&dir.join(config::CONFIG));
+        assert_eq!(config::read(&dir).unwrap().secrets["TOKEN"].value, "s3cret");
 
         // The directory exists already, so the make fails at its last step.
         fs::write(&imported, b"again").unwrap();
@@ -1134,7 +1359,8 @@ mod tests {
         assert!(make(
             &sandboxes,
             &NewDisk::Import(imported.clone()),
-            &record("sbx-b")
+            &record("sbx-b"),
+            &config,
         )
         .is_err());
         assert_eq!(fs::read(&imported).unwrap(), b"again");
@@ -1168,5 +1394,118 @@ mod tests {
             .collect();
         assert_eq!(names, [RECORD]);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn secret_config() -> SandboxConfig {
+        SandboxConfig::parse(
+            Some(serde_json::json!({ "A": "1" })),
+            Some(serde_json::json!({
+                "TOKEN": { "value": "s3cret", "hosts": ["api.example.com"] }
+            })),
+        )
+        .unwrap()
+    }
+
+    fn assert_private(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{}", path.display());
+    }
+
+    fn record() -> Record {
+        Record {
+            id: "sbx-a".into(),
+            name: "web-1".into(),
+            created_at: 1,
+            cpus: 2,
+            memory_mib: 2048,
+        }
+    }
+
+    #[test]
+    fn a_config_replaces_the_one_before() {
+        let dir = scratch("config");
+        replace_json(&dir, config::CONFIG, &SandboxConfig::default()).unwrap();
+        assert!(config::read(&dir).unwrap().secrets.is_empty());
+        // A crash left a cut copy.
+        fs::write(dir.join(format!(".{}.partial", config::CONFIG)), b"{").unwrap();
+        replace_json(&dir, config::CONFIG, &secret_config()).unwrap();
+        let read = config::read(&dir).unwrap();
+        assert_eq!(read.env["A"], "1");
+        assert_eq!(read.secrets["TOKEN"].hosts, ["api.example.com"]);
+        assert_private(&dir.join(config::CONFIG));
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [config::CONFIG]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn boots_only_move_forward() {
+        let last = AtomicU64::new(0);
+        assert_eq!(boot_after(&last, 1000), 1000);
+        // The clock went back, or has not moved.
+        assert_eq!(boot_after(&last, 400), 1001);
+        assert_eq!(boot_after(&last, 1001), 1002);
+        assert_eq!(boot_after(&last, 5000), 5000);
+        assert_eq!(last.load(Ordering::Relaxed), 5000);
+    }
+
+    #[test]
+    fn a_restore_moves_the_boot_then_the_disk() {
+        let state = scratch("restore");
+        let dir = state.join("sbx-a");
+        let import = state.join("import");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&import).unwrap();
+        save_boot(&dir, record(), 17).unwrap();
+        fs::write(dir.join(DISK), b"before").unwrap();
+        fs::write(import.join("v3.disk"), b"checkpoint").unwrap();
+
+        let from = import_path(&import, import.join("v3.disk").to_str().unwrap()).unwrap();
+        restore_disk(&dir, record(), 18, &from).unwrap();
+        assert_eq!(fs::read(dir.join(DISK)).unwrap(), b"checkpoint");
+        assert!(!from.exists());
+        assert_eq!(read_record(&dir).unwrap().last_boot, 18);
+
+        // Gone before the move: the boot still moved, the disk stays.
+        assert!(restore_disk(&dir, record(), 19, &from).is_err());
+        assert_eq!(fs::read(dir.join(DISK)).unwrap(), b"checkpoint");
+        assert_eq!(read_record(&dir).unwrap().last_boot, 19);
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn a_checkpoint_is_a_copy_of_its_own() {
+        let state = scratch("checkpoint");
+        let checkpoints = state.join("checkpoints");
+        fs::create_dir_all(&checkpoints).unwrap();
+        let disk = state.join("disk");
+        fs::write(&disk, b"running").unwrap();
+
+        let (first, size) = checkpoint_copy(&disk, &checkpoints, "web-1", false).unwrap();
+        let (second, _) = checkpoint_copy(&disk, &checkpoints, "web-1", false).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(size, 7);
+        for copy in [&first, &second] {
+            let file_name = copy.file_name().unwrap().to_str().unwrap();
+            assert!(file_name.starts_with("web-1.") && file_name.ends_with(".disk"));
+            assert_eq!(copy.parent(), Some(checkpoints.as_path()));
+            assert_eq!(fs::read(copy).unwrap(), b"running");
+            assert_private(copy);
+        }
+        fs::write(&disk, b"changed").unwrap();
+        assert_eq!(fs::read(&first).unwrap(), b"running");
+
+        // A live disk is copied only where blocks can be shared, and a
+        // refusal leaves nothing behind.
+        let before = fs::read_dir(&checkpoints).unwrap().count();
+        match checkpoint_copy(&disk, &checkpoints, "web-1", true) {
+            Ok((copy, _)) => assert_eq!(fs::read(copy).unwrap(), b"changed"),
+            Err(_) => assert_eq!(fs::read_dir(&checkpoints).unwrap().count(), before),
+        }
+        fs::remove_dir_all(&state).unwrap();
     }
 }

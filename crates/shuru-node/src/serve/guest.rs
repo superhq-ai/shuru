@@ -1,10 +1,11 @@
 //! Guest connections for the API: the hello on a blocking thread, then
 //! frames over the async socket.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
-use shuru_proto::{frame, SessionInfo};
+use shuru_proto::{frame, ExecRequest, SessionInfo};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -74,6 +75,41 @@ pub async fn session_info(guest: &mut UnixStream) -> Result<SessionInfo, ApiErro
             "the guest answered with frame {kind:#x}"
         ))),
         None => Err(ApiError::internal("the guest closed the connection")),
+    }
+}
+
+/// Runs `sync` in the guest, so what its processes wrote is on the disk.
+pub async fn sync(addr: &GuestAddr) -> Result<(), ApiError> {
+    let mut guest = connect(addr, &addr.calls).await?;
+    let request = ExecRequest {
+        argv: vec!["sync".into()],
+        env: HashMap::new(),
+        tty: None,
+        rows: None,
+        cols: None,
+        cwd: None,
+        id: None,
+    };
+    send_json(&mut guest.stream, frame::EXEC_REQ, &request).await?;
+    loop {
+        match read_frame(&mut guest.stream).await? {
+            Some((frame::EXIT, payload)) => {
+                return match exit_byte(&payload) {
+                    0 => Ok(()),
+                    code => Err(ApiError::internal(format!(
+                        "sync in the guest exited with {code}"
+                    ))),
+                }
+            }
+            Some((frame::ERROR, payload)) => {
+                return Err(ApiError::internal(format!(
+                    "sync in the guest: {}",
+                    String::from_utf8_lossy(&payload)
+                )))
+            }
+            Some(_) => {}
+            None => return Err(ApiError::internal("the guest closed the connection")),
+        }
     }
 }
 

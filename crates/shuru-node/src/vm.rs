@@ -3,6 +3,7 @@
 //! connection. Shared by `run`, `restore` and `serve`.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -20,8 +21,8 @@ use shuru_node::cgroup::{Limits, Sandbox, Usage};
 use shuru_node::control::{self, Boot, Disk, NetdConfig, Request, Response, Secret, VmmConfig};
 use shuru_node::firewall::{self, NETD_UID_BASE};
 use shuru_node::jail::{self, Handoff, Jail};
-use shuru_proto::frame;
 use shuru_proto::hello::Identity;
+use shuru_proto::{frame, ExecRequest};
 
 const RUN_DIR: &str = "/run/shuru";
 /// Each slot is one byte of this file, held with an open file description
@@ -37,6 +38,10 @@ const NPROC: u64 = 64;
 const SANDBOX_PIDS: u64 = 2 * NPROC;
 const GUEST_PORT: u32 = 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
+const INSTALL_CA: &str =
+    "printf '%s' \"$SHURU_PROXY_CA\" > /usr/local/share/ca-certificates/shuru-proxy.crt \
+    && update-ca-certificates --fresh > /dev/null 2>&1";
+const INSTALL_CA_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The sandbox directory: a control socket per jailed process, the vsock
 /// socket, and the empty mount point for their roots. Only root can enter
@@ -283,20 +288,27 @@ pub struct Network {
     pub session: shuru_proxy::Session,
 }
 
-/// Configures `netd`. A restore passes the session and MAC the guest was
+/// Configures `netd` with the secrets of the policy and those `given`
+/// with their values. A restore passes the session and MAC the guest was
 /// saved with: it trusts that CA, holds those placeholders and has the
 /// gateway in its neighbour table under that MAC.
 pub fn start_network(
     policy: &NetworkPolicy,
+    given: &HashMap<String, Secret>,
     ca_bundle: &Path,
     netd: Jailed,
     saved: Option<(shuru_proxy::Session, [u8; 6])>,
 ) -> Result<Network> {
-    let secrets = policy
+    let mut secrets = policy
         .secrets
         .iter()
         .map(|spec| secret(spec))
-        .collect::<Result<_>>()?;
+        .collect::<Result<HashMap<_, _>>>()?;
+    secrets.extend(
+        given
+            .iter()
+            .map(|(name, secret)| (name.clone(), secret.clone())),
+    );
     let upstream_roots =
         fs::read_to_string(ca_bundle).with_context(|| format!("{}", ca_bundle.display()))?;
     let (vm_end, host_end) = shuru_proxy::create_socketpair()?;
@@ -433,6 +445,8 @@ pub struct KernelBoot<'a> {
     /// A network through a jailed shuru-netd, reaching public addresses
     /// only.
     pub network: Option<&'a NetworkPolicy>,
+    /// Secrets valued here, besides those of the policy.
+    pub secrets: &'a HashMap<String, Secret>,
     pub ca_bundle: &'a Path,
     pub verbose: bool,
 }
@@ -472,7 +486,13 @@ impl Vm {
         let network = match spec.network {
             Some(policy) => {
                 let netd = host.spawn_netd(spec.slot, &dir, &mut sandbox)?;
-                Some(start_network(policy, spec.ca_bundle, netd, None)?)
+                Some(start_network(
+                    policy,
+                    spec.secrets,
+                    spec.ca_bundle,
+                    netd,
+                    None,
+                )?)
             }
             None => None,
         };
@@ -527,6 +547,36 @@ impl Vm {
     /// A new guest connection, waiting for the agent to listen.
     pub fn connect(&self) -> Result<UnixStream> {
         connect_guest(&self.dir.vsock(), &self.identity, &self.vmm)
+    }
+
+    /// Has the guest trust the proxy CA of its session, which the proxy
+    /// signs with for the hosts it sends secrets to.
+    pub fn install_ca(&self, ca_cert_pem: &str) -> Result<()> {
+        let mut guest = self.connect()?;
+        guest.set_read_timeout(Some(INSTALL_CA_TIMEOUT))?;
+        let request = ExecRequest {
+            argv: ["sh", "-c", INSTALL_CA].map(str::to_string).to_vec(),
+            env: HashMap::from([("SHURU_PROXY_CA".to_string(), ca_cert_pem.to_string())]),
+            tty: None,
+            rows: None,
+            cols: None,
+            cwd: None,
+            id: None,
+        };
+        frame::send_json(&mut guest, frame::EXEC_REQ, &request)?;
+        loop {
+            match frame::read_frame(&mut guest).context("installing the proxy CA")? {
+                Some((frame::EXIT, payload)) => match frame::parse_exit_code(&payload) {
+                    Some(0) => return Ok(()),
+                    code => bail!("installing the proxy CA in the guest failed: {code:?}"),
+                },
+                Some((frame::ERROR, payload)) => {
+                    bail!("guest error: {}", String::from_utf8_lossy(&payload))
+                }
+                Some(_) => {}
+                None => bail!("the guest closed the connection"),
+            }
+        }
     }
 
     /// Stops the VM and answers what its cgroup used in all, read once

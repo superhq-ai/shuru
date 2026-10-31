@@ -30,10 +30,6 @@ use vm::{
     KernelBoot, NetworkPolicy, RunDir, Vm, VSOCK_CONNECTIONS,
 };
 
-const INSTALL_CA: &str =
-    "printf '%s' \"$SHURU_PROXY_CA\" > /usr/local/share/ca-certificates/shuru-proxy.crt \
-    && update-ca-certificates --fresh > /dev/null 2>&1";
-
 #[derive(Parser)]
 #[command(name = "shuru-node", version)]
 struct Cli {
@@ -190,6 +186,7 @@ fn run(args: RunArgs) -> Result<i32> {
             cpus: args.cpus,
             memory_bytes: args.memory << 20,
             network: policy.as_ref(),
+            secrets: &HashMap::new(),
             ca_bundle: &args.ca_bundle,
             verbose: args.common.verbose,
         },
@@ -201,13 +198,7 @@ fn run(args: RunArgs) -> Result<i32> {
     let mut env = HashMap::new();
     if let Some(network) = &vm.network {
         if !network.session.placeholders.is_empty() {
-            let guest = vm.connect()?;
-            let ca = network.session.ca_cert_pem.clone();
-            let ca = HashMap::from([("SHURU_PROXY_CA".to_string(), ca)]);
-            let argv = ["sh", "-c", INSTALL_CA].map(str::to_string).to_vec();
-            if exec(guest, argv, ca)? != 0 {
-                bail!("installing the proxy CA in the guest failed");
-            }
+            vm.install_ca(&network.session.ca_cert_pem)?;
             env = network.session.placeholders.clone();
         }
     }
@@ -466,6 +457,7 @@ fn restore(args: RestoreArgs) -> Result<i32> {
             let saved_session = (saved.session.clone(), unhex(&saved.mac)?);
             Some(start_network(
                 &saved.policy,
+                &HashMap::new(),
                 &args.ca_bundle,
                 netd,
                 Some(saved_session),

@@ -25,7 +25,7 @@ use super::http::{
 };
 use super::hub::{Attachment, Event, Input};
 use super::sandboxes::{Entry, GuestAddr, Node};
-use super::{guest, ws};
+use super::{config, guest, ws};
 
 const MAX_STDIN: usize = 10 << 20;
 const MAX_MESSAGE: usize = 1 << 20;
@@ -94,6 +94,13 @@ fn start_request(query: Option<&str>, websocket: bool) -> Result<(SessionStart, 
     Ok((start, stdin))
 }
 
+/// Puts the sandbox env and the placeholders of its secrets under the env
+/// the request asked for.
+fn give_env(entry: &Entry, addr: &GuestAddr, start: &mut SessionStart) {
+    let request = std::mem::take(&mut start.exec.env);
+    start.exec.env = config::exec_env(&entry.config().env, &addr.placeholders, request);
+}
+
 fn tagged(stream: u8, data: &[u8]) -> Bytes {
     let mut tagged = Vec::with_capacity(1 + data.len());
     tagged.push(stream);
@@ -116,13 +123,14 @@ pub async fn http(
     entry: &Arc<Entry>,
     request: Request<Incoming>,
 ) -> Result<Response<Body>, ApiError> {
-    let (start, stdin) = start_request(request.uri().query(), false)?;
+    let (mut start, stdin) = start_request(request.uri().query(), false)?;
     let input = if stdin {
         read_body(request.into_body(), MAX_STDIN).await?
     } else {
         Bytes::new()
     };
     let addr = node.guest(entry).await?;
+    give_env(entry, &addr, &mut start);
     let mut attachment = addr.hubs.start(&addr, &start).await?;
     let (tx, rx) = mpsc::channel(16);
     let feed = feed(attachment.input(), input);
@@ -174,8 +182,9 @@ pub async fn websocket(
     let query = request.uri().query();
     let attachment = match session {
         None => {
-            let (start, _) = start_request(query, true)?;
+            let (mut start, _) = start_request(query, true)?;
             let addr = node.guest(entry).await?;
+            give_env(entry, &addr, &mut start);
             addr.hubs.start(&addr, &start).await?
         }
         Some(id) => {

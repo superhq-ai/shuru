@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use super::config::SandboxConfig;
 use super::idle::Busy;
 use super::sandboxes::{Entry, Node};
 use super::{exec, files, ports, ws};
@@ -28,6 +29,8 @@ use super::{exec, files, ports, ws};
 pub type Body = BoxBody<Bytes, io::Error>;
 
 pub const MAX_JSON_BODY: usize = 64 * 1024;
+/// A create or a config, room for the env and secrets with JSON escapes.
+const MAX_CONFIG_BODY: usize = 1 << 20;
 const DEFAULT_PAGE: usize = 50;
 const MAX_PAGE: usize = 500;
 
@@ -279,15 +282,34 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
         }
         (&Method::DELETE, [name]) => {
             node.delete(name).await?;
-            let mut response = Response::new(full(Bytes::new()));
-            *response.status_mut() = StatusCode::NO_CONTENT;
-            Ok(response)
+            Ok(no_content())
         }
         (&Method::POST, [name, "stop"]) => {
             node.stop(name).await?;
-            let mut response = Response::new(full(Bytes::new()));
-            *response.status_mut() = StatusCode::NO_CONTENT;
-            Ok(response)
+            Ok(no_content())
+        }
+        (&Method::PUT, [name, "config"]) => {
+            let body = read_body(request.into_body(), MAX_CONFIG_BODY).await?;
+            let put: ConfigRequest = parse_json(&body)?;
+            let config = SandboxConfig::parse(put.env, put.secrets)?;
+            node.configure(name, config).await?;
+            Ok(no_content())
+        }
+        (&Method::POST, [name, "checkpoint"]) => {
+            let checkpoint = node.checkpoint(name).await?;
+            Ok(json_response(
+                StatusCode::OK,
+                &json!({
+                    "disk": checkpoint.disk.to_string_lossy(),
+                    "size": checkpoint.size,
+                }),
+            ))
+        }
+        (&Method::POST, [name, "restore"]) => {
+            let body = read_body(request.into_body(), MAX_JSON_BODY).await?;
+            let restore: RestoreRequest = parse_json(&body)?;
+            let entry = node.restore(name, &restore.disk).await?;
+            Ok(json_response(StatusCode::OK, &sandbox_json(&entry)))
         }
         (&Method::POST, [name, "park"]) => {
             let parked = node.park(name).await?;
@@ -358,7 +380,10 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
             | [_, "ports", "watch"]
             | [_, "stop"]
             | [_, "park"]
-            | [_, "usage"],
+            | [_, "usage"]
+            | [_, "config"]
+            | [_, "checkpoint"]
+            | [_, "restore"],
         ) => Err(ApiError::not_allowed(&method, &path)),
         _ => Err(ApiError::not_found(format!("no route {path}"))),
     }?;
@@ -431,6 +456,8 @@ fn list(node: &Node, request: &Request<Incoming>) -> Result<Response<Body>, ApiE
     Ok(json_response(StatusCode::OK, &body))
 }
 
+/// `env` and `secrets` stay JSON until checked, so no message serde gives
+/// can quote a value.
 #[derive(Deserialize)]
 struct CreateRequest {
     name: String,
@@ -439,31 +466,58 @@ struct CreateRequest {
     disk: Option<String>,
     #[serde(default = "yes")]
     start: bool,
+    env: Option<Value>,
+    secrets: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct ConfigRequest {
+    env: Option<Value>,
+    secrets: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct RestoreRequest {
+    disk: String,
 }
 
 fn yes() -> bool {
     true
 }
 
+fn parse_json<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, ApiError> {
+    serde_json::from_slice(body).map_err(|e| ApiError::bad_request(format!("the body: {e}")))
+}
+
+fn no_content() -> Response<Body> {
+    let mut response = Response::new(full(Bytes::new()));
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    response
+}
+
 async fn create(node: &Arc<Node>, request: Request<Incoming>) -> Result<Response<Body>, ApiError> {
-    let body = read_body(request.into_body(), MAX_JSON_BODY).await?;
-    let create: CreateRequest = serde_json::from_slice(&body)
-        .map_err(|e| ApiError::bad_request(format!("the body: {e}")))?;
+    let body = read_body(request.into_body(), MAX_CONFIG_BODY).await?;
+    let create: CreateRequest = parse_json(&body)?;
+    let config = SandboxConfig::parse(create.env, create.secrets)?;
     let entry = node
-        .create(create.name, create.disk.as_deref(), create.start)
+        .create(create.name, create.disk.as_deref(), config, create.start)
         .await?;
     Ok(json_response(StatusCode::CREATED, &sandbox_json(&entry)))
 }
 
 /// A sandbox is `running` while its VM is up and `cold` otherwise; a cold
-/// sandbox keeps its disk, and the next request boots it.
+/// sandbox keeps its disk, and the next request boots it. Its env and
+/// secrets show as names only.
 fn sandbox_json(entry: &Entry) -> Value {
     let record = &entry.record;
     let created = timestamp(record.created_at);
+    let config = entry.config();
     json!({
         "id": record.id,
         "name": record.name,
         "status": if entry.is_running() { "running" } else { "cold" },
+        "env": config.env.keys().collect::<Vec<_>>(),
+        "secrets": config.secrets.keys().collect::<Vec<_>>(),
         "url": null,
         "url_settings": null,
         "created_at": created,
