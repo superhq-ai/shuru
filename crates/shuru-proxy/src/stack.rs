@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 use crate::device::{DrainStatus, VZDevice};
+use crate::flows::Flows;
 
 /// Gateway IP inside the virtual network (host-side smoltcp).
 pub const GATEWAY_IP: Ipv4Address = Ipv4Address::new(10, 0, 0, 1);
@@ -131,6 +132,7 @@ pub struct NetworkStack {
     syn_scratch: HashMap<(Ipv4Address, u16), usize>,
     event_tx: mpsc::UnboundedSender<StackEvent>,
     cmd_rx: mpsc::UnboundedReceiver<StackCommand>,
+    flows: Arc<Flows>,
 }
 
 impl NetworkStack {
@@ -138,6 +140,7 @@ impl NetworkStack {
         host_fd: RawFd,
         event_tx: mpsc::UnboundedSender<StackEvent>,
         cmd_rx: mpsc::UnboundedReceiver<StackCommand>,
+        flows: Arc<Flows>,
     ) -> Self {
         let mut device = VZDevice::new(host_fd);
 
@@ -188,6 +191,7 @@ impl NetworkStack {
             syn_scratch: HashMap::new(),
             event_tx,
             cmd_rx,
+            flows,
         }
     }
 
@@ -305,6 +309,7 @@ impl NetworkStack {
                 if !self.connections.contains_key(&id.0) {
                     return;
                 }
+                self.flows.sent_to_guest(id.1);
                 self.pending_send.entry(id.0).or_default().extend(&payload);
             }
             StackCommand::Consumed { id, n } => {
@@ -488,6 +493,7 @@ impl NetworkStack {
                     self.listen_since.remove(&handle);
                     self.next_serial += 1;
                     self.serials.insert(handle, self.next_serial);
+                    self.flows.opened(self.next_serial);
                     self.connections.insert(handle, actual_dst);
                     self.to_host.insert(handle, 0);
                     let to_guest = Arc::new(Semaphore::new(TO_GUEST_BUDGET));
@@ -512,6 +518,7 @@ impl NetworkStack {
                         if let Some(in_flight) = self.to_host.get_mut(&handle) {
                             *in_flight += n + MESSAGE_COST;
                         }
+                        self.flows.sent_by_guest(self.serials[&handle]);
                         let _ = self.event_tx.send(StackEvent::Data {
                             id: ConnectionId(handle, self.serials[&handle]),
                             payload: self.recv_buf[..n].to_vec(),
@@ -560,7 +567,9 @@ impl NetworkStack {
         self.pending_send.remove(&handle);
         self.closing.remove(&handle);
         self.to_host.remove(&handle);
-        self.serials.remove(&handle);
+        if let Some(serial) = self.serials.remove(&handle) {
+            self.flows.closed(serial);
+        }
         if let Some(budget) = self.to_guest.remove(&handle) {
             budget.close();
         }

@@ -2,6 +2,8 @@
 
 Local-first microVM sandbox for AI agents on macOS, with experimental Linux support.
 
+<a href="https://nanite.run"><img src=".github/assets/nanite-banner.png" alt="Nanite: Shuru sandboxes in the cloud, ready in under a second" width="100%"></a>
+
 Shuru boots lightweight Linux VMs for AI agents. On macOS it uses Apple's Virtualization.framework. On Linux it uses a KVM backend that is now available as an experimental release build for ARM64 hosts. Every sandbox is ephemeral: the rootfs resets on every run, giving agents a disposable environment to execute code, install packages, and run tools without touching your host.
 
 > [!WARNING]

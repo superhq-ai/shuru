@@ -18,6 +18,12 @@ mod sessions;
 mod disk;
 
 #[cfg(target_os = "linux")]
+mod files;
+
+#[cfg(target_os = "linux")]
+mod ports;
+
+#[cfg(target_os = "linux")]
 mod guest {
     use std::io::{Read, Write};
     use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -26,16 +32,17 @@ mod guest {
 
     use shuru_proto::frame;
     use shuru_proto::{
-        ChmodRequest, CopyRequest, DirEntry, DiscardRequest, DownloadProgress, DownloadRequest,
+        ChmodRequest, ChownRequest, CopyRequest, DiscardRequest, DownloadProgress, DownloadRequest,
         ExecRequest, ForwardRequest, ForwardResponse, FsOkResponse, MkdirRequest, MountRequest,
-        MountResponse, ReadDirRequest, ReadDirResponse, ReadFileRequest, RemoveRequest,
-        RenameRequest, StatRequest, StatResponse, WatchEvent, WatchRequest, WriteFileRequest,
-        WriteFileResponse,
+        MountResponse, ReadDirRequest, ReadFileRequest, RemoveRequest, RenameRequest, StatRequest,
+        StatResponse, WatchEvent, WatchRequest, WriteFileRequest,
     };
     use shuru_proto::{VSOCK_PORT, VSOCK_PORT_FORWARD};
 
     // _IO('R', 0x07): reseed the kernel CRNG now rather than on its timer.
     const RNDRESEEDCRNG: libc::Ioctl = 0x5207;
+    const FORWARD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const FORWARD_STALL: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// Running execs, by the id the host started them with.
     static EXECS: std::sync::LazyLock<
@@ -605,7 +612,15 @@ mod guest {
                             continue;
                         }
                     };
-                    handle_watch(&req, writer);
+                    if req.detail {
+                        crate::files::watch(&req, writer);
+                    } else {
+                        handle_watch(&req, writer);
+                    }
+                    return;
+                }
+                frame::PORTS_WATCH_REQ => {
+                    crate::ports::watch(writer);
                     return;
                 }
                 frame::READ_FILE_REQ => {
@@ -628,7 +643,7 @@ mod guest {
                             continue;
                         }
                     };
-                    handle_write_file(&req, &mut reader, &mut writer);
+                    crate::files::write(&req, &mut reader, &mut writer);
                 }
                 frame::MKDIR_REQ => {
                     let req: MkdirRequest = match serde_json::from_slice(&payload) {
@@ -650,7 +665,7 @@ mod guest {
                             continue;
                         }
                     };
-                    handle_read_dir(&req, &mut writer);
+                    crate::files::read_dir(&req, &mut writer);
                 }
                 frame::STAT_REQ => {
                     let req: StatRequest = match serde_json::from_slice(&payload) {
@@ -705,7 +720,7 @@ mod guest {
                             continue;
                         }
                     };
-                    handle_copy(&req, &mut writer);
+                    crate::files::copy(&req, &mut writer);
                 }
                 frame::CHMOD_REQ => {
                     let req: ChmodRequest = match serde_json::from_slice(&payload) {
@@ -716,7 +731,18 @@ mod guest {
                             continue;
                         }
                     };
-                    handle_chmod(&req, &mut writer);
+                    crate::files::chmod(&req, &mut writer);
+                }
+                frame::CHOWN_REQ => {
+                    let req: ChownRequest = match serde_json::from_slice(&payload) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let msg = format!("invalid chown request: {}", e);
+                            let _ = frame::write_frame(&mut writer, frame::ERROR, msg.as_bytes());
+                            continue;
+                        }
+                    };
+                    crate::files::chown(&req, &mut writer);
                 }
                 frame::DOWNLOAD_REQ => {
                     let req: DownloadRequest = match serde_json::from_slice(&payload) {
@@ -785,47 +811,10 @@ mod guest {
         }
     }
 
-    fn handle_write_file(req: &WriteFileRequest, reader: &mut impl Read, writer: &mut impl Write) {
-        let respond = |writer: &mut _, error: Option<String>| {
-            let resp = WriteFileResponse {
-                ok: error.is_none(),
-                error,
-            };
-            let _ = frame::send_json(writer, frame::WRITE_FILE_RESP, &resp);
-        };
-
-        if let Some(parent) = std::path::Path::new(&req.path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let mut file =
-            std::fs::File::create(&req.path).map_err(|e| format!("write_file {}: {}", req.path, e));
-
-        // Every chunk is read even after a failure, so the host gets the
-        // error rather than a closed connection.
-        let mut received = 0u64;
-        while received < req.len {
-            let chunk = match frame::read_frame(reader) {
-                Ok(Some((frame::WRITE_FILE_DATA, chunk))) if !chunk.is_empty() => chunk,
-                _ => return respond(writer, Some("expected WRITE_FILE_DATA frame".into())),
-            };
-            received += chunk.len() as u64;
-            if received > req.len {
-                let msg = format!("length mismatch: expected {}, got {}", req.len, received);
-                return respond(writer, Some(msg));
-            }
-            if let Ok(f) = &mut file {
-                if let Err(e) = f.write_all(&chunk) {
-                    file = Err(format!("write_file {}: {}", req.path, e));
-                }
-            }
-        }
-        respond(writer, file.err());
-    }
-
     fn send_fs_ok(writer: &mut impl Write) {
         let resp = FsOkResponse {
             ok: true,
-            error: None,
+            ..Default::default()
         };
         let _ = frame::send_json(writer, frame::FS_OK_RESP, &resp);
     }
@@ -1001,32 +990,6 @@ mod guest {
         }
     }
 
-    fn handle_read_dir(req: &ReadDirRequest, writer: &mut impl Write) {
-        match std::fs::read_dir(&req.path) {
-            Ok(iter) => {
-                let mut entries = Vec::new();
-                for entry in iter.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let meta = entry.metadata();
-                    let (entry_type, size) = match &meta {
-                        Ok(m) if m.file_type().is_symlink() => ("symlink", m.len()),
-                        Ok(m) if m.is_dir() => ("dir", m.len()),
-                        Ok(m) => ("file", m.len()),
-                        Err(_) => ("file", 0),
-                    };
-                    entries.push(DirEntry {
-                        name,
-                        entry_type: entry_type.to_string(),
-                        size,
-                    });
-                }
-                let resp = ReadDirResponse { entries };
-                let _ = frame::send_json(writer, frame::READ_DIR_RESP, &resp);
-            }
-            Err(e) => send_fs_err(writer, format!("read_dir {}: {}", req.path, e)),
-        }
-    }
-
     fn handle_stat(req: &StatRequest, writer: &mut impl Write) {
         use std::os::unix::fs::MetadataExt;
         match std::fs::symlink_metadata(&req.path) {
@@ -1052,8 +1015,11 @@ mod guest {
     }
 
     fn handle_remove(req: &RemoveRequest, writer: &mut impl Write) {
-        let result = if req.recursive {
+        let is_dir = std::fs::symlink_metadata(&req.path).is_ok_and(|m| m.is_dir());
+        let result = if req.recursive && is_dir {
             std::fs::remove_dir_all(&req.path)
+        } else if req.recursive {
+            std::fs::remove_file(&req.path)
         } else {
             std::fs::remove_file(&req.path).or_else(|_| std::fs::remove_dir(&req.path))
         };
@@ -1164,76 +1130,6 @@ mod guest {
                 writer,
                 format!("rename {} -> {}: {}", req.old_path, req.new_path, e),
             ),
-        }
-    }
-
-    fn handle_copy(req: &CopyRequest, writer: &mut impl Write) {
-        let result = if req.recursive {
-            copy_dir_recursive(
-                std::path::Path::new(&req.src),
-                std::path::Path::new(&req.dst),
-            )
-        } else {
-            std::fs::copy(&req.src, &req.dst).map(|_| ())
-        };
-        match result {
-            Ok(()) => send_fs_ok(writer),
-            Err(e) => send_fs_err(writer, format!("copy {} -> {}: {}", req.src, req.dst, e)),
-        }
-    }
-
-    /// Iterative directory copy. Preserves permissions, detects self-copy
-    /// via dev+ino to prevent infinite loops.
-    /// Inspired by https://github.com/mdunsmuir/copy_dir (MIT).
-    fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-        use std::os::unix::fs::MetadataExt;
-
-        // Detect copying a directory into itself (would loop forever).
-        let dst_id = if dst.exists() {
-            let m = std::fs::metadata(dst)?;
-            Some((m.dev(), m.ino()))
-        } else {
-            std::fs::create_dir_all(dst)?;
-            let m = std::fs::metadata(dst)?;
-            Some((m.dev(), m.ino()))
-        };
-
-        let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
-        while let Some((s, d)) = stack.pop() {
-            let src_meta = std::fs::metadata(&s)?;
-            std::fs::create_dir_all(&d)?;
-
-            for entry in std::fs::read_dir(&s)? {
-                let entry = entry?;
-                let src_child = entry.path();
-                let dst_child = d.join(entry.file_name());
-                let ft = entry.file_type()?;
-
-                if ft.is_dir() {
-                    // Skip if this dir IS the destination (self-copy guard).
-                    let child_meta = std::fs::metadata(&src_child)?;
-                    let child_id = (child_meta.dev(), child_meta.ino());
-                    if dst_id == Some(child_id) {
-                        continue;
-                    }
-                    stack.push((src_child, dst_child));
-                } else {
-                    std::fs::copy(&src_child, &dst_child)?;
-                }
-            }
-
-            // Preserve source directory permissions.
-            std::fs::set_permissions(&d, src_meta.permissions())?;
-        }
-        Ok(())
-    }
-
-    fn handle_chmod(req: &ChmodRequest, writer: &mut impl Write) {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(req.mode);
-        match std::fs::set_permissions(&req.path, perms) {
-            Ok(()) => send_fs_ok(writer),
-            Err(e) => send_fs_err(writer, format!("chmod {}: {}", req.path, e)),
         }
     }
 
@@ -1477,7 +1373,6 @@ mod guest {
 
     fn handle_watch(req: &WatchRequest, mut writer: std::net::TcpStream) {
         use notify::{RecursiveMode, Watcher};
-        use std::os::unix::io::AsRawFd;
 
         // Watch the overlay mount directly. Linux >= 5.11 propagates inotify
         // events from the upper layer through to the merged mount, so we see
@@ -1514,8 +1409,6 @@ mod guest {
                 b.build().unwrap()
             })
         };
-
-        let vsock_raw = writer.as_raw_fd();
 
         loop {
             // Block until next event (or timeout to check vsock hangup)
@@ -1578,14 +1471,7 @@ mod guest {
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
 
-            // Check vsock hangup
-            let mut vfds = [libc::pollfd {
-                fd: vsock_raw,
-                events: 0,
-                revents: 0,
-            }];
-            unsafe { libc::poll(vfds.as_mut_ptr(), 1, 0) };
-            if vfds[0].revents & libc::POLLHUP != 0 {
+            if crate::files::hung_up(&writer) {
                 break;
             }
         }
@@ -1888,14 +1774,13 @@ mod guest {
             }
         };
 
-        // Connect to the target port on localhost inside the guest
-        let tcp_stream = match std::net::TcpStream::connect(("127.0.0.1", req.port)) {
+        let host = req.host.as_deref().unwrap_or("127.0.0.1");
+        let tcp_stream = match forward_connect(host, req.port) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("shuru-guest: forward to port {} failed: {}", req.port, e);
                 let resp = ForwardResponse {
                     status: "error".into(),
-                    message: Some(format!("connection refused: {}", e)),
+                    message: Some(format!("connect to {host}:{}: {e}", req.port)),
                 };
                 let _ = frame::send_json(&mut stream, frame::FWD_RESP, &resp);
                 return;
@@ -1912,18 +1797,52 @@ mod guest {
         }
 
         // Bidirectional relay between vsock and TCP
-        forward_relay(stream, tcp_stream);
+        forward_relay(stream, tcp_stream, req.whole_close);
     }
 
-    fn forward_relay(vsock: std::net::TcpStream, tcp: std::net::TcpStream) {
+    fn forward_connect(host: &str, port: u16) -> std::io::Result<std::net::TcpStream> {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+        // Loopback whatever the image has in /etc/hosts (RFC 6761).
+        let addrs: Vec<SocketAddr> = if host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+        {
+            vec![
+                (Ipv4Addr::LOCALHOST, port).into(),
+                (Ipv6Addr::LOCALHOST, port).into(),
+            ]
+        } else {
+            (host, port).to_socket_addrs()?.collect()
+        };
+        let mut last = None;
+        for addr in addrs {
+            match std::net::TcpStream::connect_timeout(&addr, FORWARD_CONNECT_TIMEOUT) {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no address found")
+        }))
+    }
+
+    fn forward_relay(vsock: std::net::TcpStream, tcp: std::net::TcpStream, whole_close: bool) {
         let mut vsock_read = vsock.try_clone().expect("clone vsock");
         let mut tcp_write = tcp.try_clone().expect("clone tcp");
         let mut tcp_read = tcp;
         let mut vsock_write = vsock;
+        // The host gives up on a stalled target, so the guest does too.
+        if whole_close {
+            let _ = tcp_write.set_write_timeout(Some(FORWARD_STALL));
+        }
 
         let t1 = std::thread::spawn(move || {
             let _ = std::io::copy(&mut vsock_read, &mut tcp_write);
-            let _ = tcp_write.shutdown(std::net::Shutdown::Write);
+            // Shutting down both ways also ends the read of the other thread.
+            let how = if whole_close {
+                std::net::Shutdown::Both
+            } else {
+                std::net::Shutdown::Write
+            };
+            let _ = tcp_write.shutdown(how);
         });
         let t2 = std::thread::spawn(move || {
             let _ = std::io::copy(&mut tcp_read, &mut vsock_write);

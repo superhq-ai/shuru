@@ -35,10 +35,14 @@ pub const WRITE_FILE_RESP: u8 = 0x17;
 // Port forwarding
 pub const FWD_REQ: u8 = 0x20;
 pub const FWD_RESP: u8 = 0x21;
+/// Answered by PORT_EVENT frames, a PortList first, until the host hangs up.
+pub const PORTS_WATCH_REQ: u8 = 0x22;
+pub const PORT_EVENT: u8 = 0x23;
 
 // File watching
 pub const WATCH_REQ: u8 = 0x30;
 pub const WATCH_EVENT: u8 = 0x31;
+pub const WATCH_DETAIL: u8 = 0x32;
 
 // Filesystem operations
 pub const MKDIR_REQ: u8 = 0x40;
@@ -51,6 +55,7 @@ pub const REMOVE_REQ: u8 = 0x46;
 pub const RENAME_REQ: u8 = 0x48;
 pub const COPY_REQ: u8 = 0x4A;
 pub const CHMOD_REQ: u8 = 0x4C;
+pub const CHOWN_REQ: u8 = 0x4D;
 
 // Overlay operations
 pub const DISCARD_REQ: u8 = 0x4E;

@@ -35,7 +35,7 @@ fn run() -> Result<()> {
     let Request::ConfigureNetwork(config) = request else {
         bail!("the first request must be the network configuration");
     };
-    let (_proxy, response) = match start(config, fds, log) {
+    let (proxy, response) = match start(config, fds, log) {
         Ok(started) => started,
         Err(e) => {
             let message = format!("{e:#}");
@@ -47,7 +47,7 @@ fn run() -> Result<()> {
 
     let mut stream = stream;
     loop {
-        serve(&stream);
+        serve(&stream, &proxy);
         stream = listener.accept().context("accepting the node")?.0;
     }
 }
@@ -90,13 +90,16 @@ fn start(
     Ok((handle, response))
 }
 
-fn serve(stream: &UnixStream) {
+fn serve(stream: &UnixStream, proxy: &shuru_proxy::ProxyHandle) {
     while let Ok(Some((request, _))) = control::receive::<Request>(stream, 0) {
         let response = match request {
             Request::Stop => {
                 let _ = control::send(stream, &Response::Ok, &[]);
                 std::process::exit(0);
             }
+            Request::Flows => Response::Flows {
+                flows: proxy.flows.ages(),
+            },
             _ => Response::Error {
                 message: "not a request for the network process".into(),
             },

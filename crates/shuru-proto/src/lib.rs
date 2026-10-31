@@ -54,6 +54,9 @@ pub struct SessionAttach {
     /// Replay from this output byte. Without it, everything still buffered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_offset: Option<u64>,
+    /// Become the owner now, in place of any owner there is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub take_owner: bool,
 }
 
 /// Offsets count the bytes of stdout and stderr together from the start of
@@ -150,6 +153,13 @@ pub struct PortMapping {
 #[derive(Serialize, Deserialize)]
 pub struct ForwardRequest {
     pub port: u16,
+    /// A name or address resolved in the guest; 127.0.0.1 when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// The host end never half closes, so the end of its input ends the
+    /// connection both ways.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub whole_close: bool,
 }
 
 /// Sent by the guest in response to a ForwardRequest.
@@ -158,6 +168,26 @@ pub struct ForwardResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// A listening TCP socket in the guest.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Port {
+    pub port: u16,
+    pub address: String,
+    /// The process that owns the socket, 0 when none was found.
+    pub pid: u32,
+}
+
+/// The payload of a PORT_EVENT frame: on a ports watch, the list of
+/// listening sockets first and then each change; on an exec session, a
+/// socket opened or closed by a process of the session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PortEvent {
+    PortList { ports: Vec<Port> },
+    PortOpened(Port),
+    PortClosed(Port),
 }
 
 // --- Mount protocol ---
@@ -189,26 +219,49 @@ pub struct ReadFileRequest {
     pub path: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct WriteFileRequest {
     pub path: String,
     pub len: u64,
+    /// Permission bits for the file, a new one or one already there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    /// Create missing parent directories. Without it they are created,
+    /// as before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mkdir: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct WriteFileResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The file as written, on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 // --- Filesystem operations protocol ---
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct FsOkResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The paths an operation created or changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    /// The bytes a copy wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    /// The ids a chown set, names resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -239,9 +292,19 @@ pub struct MkdirRequest {
     pub recursive: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct ReadDirRequest {
     pub path: String,
+    /// List the whole tree, each entry named by its path below `path`.
+    #[serde(default)]
+    pub recursive: bool,
+    /// Keep only entries that match this gitignore style pattern.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// Answer with as many READ_DIR_RESP frames as it takes, each with
+    /// `more` set but the last, instead of one frame.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -250,11 +313,19 @@ pub struct DirEntry {
     #[serde(rename = "type")]
     pub entry_type: String,
     pub size: u64,
+    /// The full `st_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    /// Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct ReadDirResponse {
     pub entries: Vec<DirEntry>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -293,18 +364,44 @@ pub struct RenameRequest {
     pub new_path: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct CopyRequest {
     pub src: String,
     pub dst: String,
     #[serde(default)]
     pub recursive: bool,
+    /// Keep owners and times as well as modes.
+    #[serde(default)]
+    pub preserve_attrs: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct ChmodRequest {
     pub path: String,
     pub mode: u32,
+    #[serde(default)]
+    pub recursive: bool,
+}
+
+/// A user or group by number or by name, a name looked up in the guest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Owner {
+    Id(u32),
+    Name(String),
+}
+
+/// Answered by FS_OK_RESP with `count`, `uid` and `gid`. An owner left
+/// out stays as it is.
+#[derive(Default, Serialize, Deserialize)]
+pub struct ChownRequest {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<Owner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<Owner>,
+    #[serde(default)]
+    pub recursive: bool,
 }
 
 // --- File watching protocol ---
@@ -314,6 +411,23 @@ pub struct WatchRequest {
     pub path: String,
     #[serde(default = "default_true")]
     pub recursive: bool,
+    /// Every change, directories included and nothing ignored: an
+    /// FS_OK_RESP once the watch is in place, then WATCH_DETAIL frames,
+    /// with an ERROR frame for a failure.
+    #[serde(default)]
+    pub detail: bool,
+}
+
+/// The payload of a WATCH_DETAIL frame.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct WatchDetail {
+    /// A `watch_kind`.
+    pub kind: u8,
+    pub path: String,
+    /// The size after the change, when the path is still there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    pub is_dir: bool,
 }
 
 fn default_true() -> bool {
@@ -326,6 +440,8 @@ pub mod watch_kind {
     pub const MODIFY: u8 = 0x02;
     pub const DELETE: u8 = 0x03;
     pub const RENAME: u8 = 0x04;
+    /// Owner, mode or times; only in WATCH_DETAIL.
+    pub const CHMOD: u8 = 0x05;
 
     /// The name the stdio protocol and the SDKs use for a kind.
     pub fn name(kind: u8) -> Option<&'static str> {
@@ -334,6 +450,7 @@ pub mod watch_kind {
             MODIFY => Some("modify"),
             DELETE => Some("delete"),
             RENAME => Some("rename"),
+            CHMOD => Some("chmod"),
             _ => None,
         }
     }
@@ -390,6 +507,25 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let req2: MountRequest = serde_json::from_str(&json).unwrap();
         assert!(!req2.read_only);
+    }
+
+    #[test]
+    fn port_events_are_tagged_by_type() {
+        let port = Port {
+            port: 8080,
+            address: "0.0.0.0".into(),
+            pid: 42,
+        };
+        let opened = serde_json::to_value(PortEvent::PortOpened(port.clone())).unwrap();
+        assert_eq!(
+            opened,
+            serde_json::json!({"type": "port_opened", "port": 8080, "address": "0.0.0.0", "pid": 42})
+        );
+        let list = PortEvent::PortList { ports: vec![port] };
+        let json = serde_json::to_value(&list).unwrap();
+        assert_eq!(json["type"], "port_list");
+        assert_eq!(json["ports"][0]["port"], 8080);
+        assert_eq!(serde_json::from_value::<PortEvent>(json).unwrap(), list);
     }
 }
 

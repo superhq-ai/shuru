@@ -17,7 +17,7 @@ use std::sync::{mpsc, Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use shuru_proto::frame;
-use shuru_proto::{KillEvent, SessionAttach, SessionKill, SessionList, SessionStart};
+use shuru_proto::{KillEvent, PortEvent, SessionAttach, SessionKill, SessionList, SessionStart};
 
 const MAX_RUNNING: usize = 128;
 
@@ -45,6 +45,10 @@ enum Cmd {
     Exited {
         id: u64,
         status: libc::c_int,
+    },
+    Port {
+        id: u64,
+        event: PortEvent,
     },
     #[cfg(test)]
     Inspect {
@@ -125,6 +129,14 @@ fn handle(conn: &mut TcpStream) -> Option<&'static Arc<Handle>> {
         error(conn, "exec sessions are unavailable");
     }
     handle
+}
+
+/// Tells the attachments of session `id` that one of its processes opened
+/// or closed a port.
+pub fn port_event(id: u64, event: PortEvent) {
+    if let Some(handle) = HANDLE.as_ref() {
+        handle.post(Cmd::Port { id, event });
+    }
 }
 
 pub fn start(req: SessionStart, mut conn: TcpStream) {
@@ -330,10 +342,15 @@ mod tests {
     }
 
     fn attach_session(id: &str, offset: Option<u64>) -> TcpStream {
+        attach_as(id, offset, false)
+    }
+
+    fn attach_as(id: &str, offset: Option<u64>, take_owner: bool) -> TcpStream {
         let (client, server) = pair();
         let req = SessionAttach {
             id: id.into(),
             output_offset: offset,
+            take_owner,
         };
         attach(req, server);
         client
@@ -507,6 +524,17 @@ mod tests {
         frame::write_frame(&mut other, frame::STDIN, b"two\n").unwrap();
         let (out, _, _) = drain(&mut other);
         assert_eq!(out, b"b=two\n");
+    }
+
+    #[test]
+    fn an_attachment_can_take_over_as_owner() {
+        let mut first = start_session(&["sh", "-c", "read a; echo \"a=$a\""], false, None);
+        let id = info(&mut first).id;
+        let mut second = attach_as(&id, None, true);
+        assert!(info(&mut second).is_owner);
+        frame::write_frame(&mut first, frame::STDIN, b"ignored\n").unwrap();
+        frame::write_frame(&mut second, frame::STDIN, b"x\n").unwrap();
+        assert_eq!(drain(&mut second).0, b"a=x\n");
     }
 
     #[test]

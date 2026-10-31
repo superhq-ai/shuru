@@ -77,10 +77,18 @@ pub struct NetdConfig {
     pub session: Option<shuru_proxy::Session>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Secret {
     pub value: String,
     pub hosts: Vec<String>,
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secret")
+            .field("hosts", &self.hosts)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,6 +108,8 @@ pub enum Request {
     Snapshot {
         resume: bool,
     },
+    /// The open connections of the guest, for netd.
+    Flows,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -114,6 +124,9 @@ pub enum Response {
     /// and trusts its CA for the hosts they are relayed to.
     Network {
         session: shuru_proxy::Session,
+    },
+    Flows {
+        flows: Vec<shuru_proxy::FlowAge>,
     },
     Error {
         message: String,

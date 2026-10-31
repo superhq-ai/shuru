@@ -1,14 +1,17 @@
 //! `shuru-node run` boots one jailed VM, runs a command in it and stops it,
 //! the way a node runs each sandbox. `shuru-node restore` does the same
-//! from a snapshot `run --snapshot-to` took.
+//! from a snapshot `run --snapshot-to` took. `shuru-node serve` keeps
+//! sandboxes running and serves the sandbox API for them.
 
-use std::cell::Cell;
+mod serve;
+mod vm;
+
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::Ipv4Addr;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -18,26 +21,14 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use shuru_node::cgroup::{Limits, Sandbox};
-use shuru_node::control::{self, Boot, Disk, NetdConfig, Request, Response, Secret, VmmConfig};
-use shuru_node::firewall::{self, NETD_UID_BASE};
-use shuru_node::jail::{self, Handoff, Jail};
+use shuru_node::cgroup::Sandbox;
+use shuru_node::control::{Boot, Disk, Request, VmmConfig};
 use shuru_proto::hello::{Identity, Restore, PROTOCOL_VERSION};
 use shuru_proto::{frame, ExecRequest};
-
-const RUN_DIR: &str = "/run/shuru";
-const VMM_UID_BASE: u32 = 100_000;
-const VSOCK_CONNECTIONS: usize = 128;
-const VMM_NOFILE: u64 = 512;
-// 256 proxied connections, each with a guest and an upstream side.
-const NETD_NOFILE: u64 = 1024;
-const NPROC: u64 = 64;
-const SANDBOX_PIDS: u64 = 2 * NPROC;
-const GUEST_PORT: u32 = 1024;
-const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
-const INSTALL_CA: &str =
-    "printf '%s' \"$SHURU_PROXY_CA\" > /usr/local/share/ca-certificates/shuru-proxy.crt \
-    && update-ca-certificates --fresh > /dev/null 2>&1";
+use vm::{
+    connect_guest, hex, new_identity, open, start_network, try_connect_guest, unhex, Host, Jailed,
+    KernelBoot, NetworkPolicy, RunDir, Vm, VSOCK_CONNECTIONS,
+};
 
 #[derive(Parser)]
 #[command(name = "shuru-node", version)]
@@ -53,6 +44,8 @@ enum Command {
     /// Restore a jailed VM from a snapshot, run one command in it and stop
     /// the VM.
     Restore(RestoreArgs),
+    /// Keep sandboxes and serve the sandbox API for them on a unix socket.
+    Serve(serve::ServeArgs),
 }
 
 #[derive(clap::Args)]
@@ -151,6 +144,7 @@ fn main() {
     let result = match Cli::parse().command {
         Command::Run(args) => run(args),
         Command::Restore(args) => restore(args),
+        Command::Serve(args) => serve::serve(args).map(|()| 0),
     };
     match result {
         Ok(code) => std::process::exit(code),
@@ -159,327 +153,6 @@ fn main() {
             std::process::exit(1);
         }
     }
-}
-
-/// The sandbox directory: a control socket per jailed process, the vsock
-/// socket, and the empty mount point for their roots. Only root can enter
-/// it.
-struct RunDir(PathBuf);
-
-impl RunDir {
-    fn create(slot: u32) -> Result<Self> {
-        let base = Path::new(RUN_DIR);
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .recursive(true)
-            .create(base)?;
-        let path = base.join(format!("sbx-{slot}"));
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .with_context(|| format!("slot {slot} is in use: {}", path.display()))?;
-        let dir = RunDir(path);
-        fs::DirBuilder::new().mode(0o555).create(dir.root())?;
-        Ok(dir)
-    }
-
-    fn root(&self) -> PathBuf {
-        self.0.join("root")
-    }
-
-    fn control(&self, name: &str) -> PathBuf {
-        self.0.join(format!("{name}.sock"))
-    }
-
-    fn vsock(&self) -> PathBuf {
-        self.0.join("vsock.sock")
-    }
-}
-
-impl Drop for RunDir {
-    fn drop(&mut self) {
-        for name in ["vmm", "netd"] {
-            let _ = fs::remove_file(self.control(name));
-        }
-        let _ = fs::remove_file(self.vsock());
-        let _ = fs::remove_dir(self.root());
-        let _ = fs::remove_dir(&self.0);
-    }
-}
-
-/// A jailed process and its control connection. Killed and reaped when
-/// dropped.
-struct Jailed {
-    pid: i32,
-    reaped: Cell<bool>,
-    control: UnixStream,
-}
-
-impl Jailed {
-    fn exited(&self) -> bool {
-        let mut status = 0;
-        if !self.reaped.get()
-            && unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) } == self.pid
-        {
-            self.reaped.set(true);
-        }
-        self.reaped.get()
-    }
-
-    fn configure(&self, request: &Request, fds: &[i32]) -> Result<Response> {
-        control::send(&self.control, request, fds)?;
-        match control::receive::<Response>(&self.control, 0)? {
-            Some((Response::Error { message }, _)) => bail!("{message}"),
-            Some((response, _)) => Ok(response),
-            None => bail!("exited while starting"),
-        }
-    }
-
-    fn stop(self) {
-        let _ = control::send(&self.control, &Request::Stop, &[]);
-    }
-}
-
-impl Drop for Jailed {
-    // Once reaped the pid may belong to someone else.
-    fn drop(&mut self) {
-        if self.reaped.get() {
-            return;
-        }
-        let mut status = 0;
-        unsafe {
-            libc::kill(self.pid, libc::SIGKILL);
-            libc::waitpid(self.pid, &mut status, 0);
-        }
-    }
-}
-
-struct Spawn<'a> {
-    name: &'static str,
-    uid: u32,
-    nofile: u64,
-    host_network: bool,
-    dir: &'a RunDir,
-    sandbox: &'a mut Sandbox,
-    bin_dir: &'a Path,
-    null: &'a File,
-    seccomp_log: bool,
-}
-
-fn spawn(spawn: Spawn) -> Result<Jailed> {
-    let name = format!("shuru-{}", spawn.name);
-    let path = spawn.bin_dir.join(&name);
-    let binary = File::open(&path).with_context(|| format!("{}", path.display()))?;
-    let listener: OwnedFd = UnixListener::bind(spawn.dir.control(spawn.name))?.into();
-    let procs = spawn.sandbox.child(spawn.name)?;
-    let root = CString::new(spawn.dir.root().as_os_str().as_bytes())?;
-    let argv0 = CString::new(name.as_str())?;
-    let mut argv = vec![argv0.as_c_str()];
-    if spawn.seccomp_log {
-        argv.push(c"--seccomp-log");
-    }
-    let pid = jail::spawn(
-        &Jail {
-            uid: spawn.uid,
-            gid: spawn.uid,
-            cgroup_procs: &procs,
-            root: &root,
-            nofile: spawn.nofile,
-            nproc: NPROC,
-            host_network: spawn.host_network,
-        },
-        &binary,
-        &argv,
-        &Handoff {
-            keep: &listener,
-            null: spawn.null,
-            stderr: io::stderr().as_raw_fd(),
-        },
-    )
-    .with_context(|| format!("starting {name}"))?;
-    let reaped = Cell::new(false);
-    let control = match UnixStream::connect(spawn.dir.control(spawn.name)) {
-        Ok(control) => control,
-        Err(e) => {
-            drop(Jailed {
-                pid,
-                reaped,
-                control: UnixStream::pair()?.0,
-            });
-            return Err(e.into());
-        }
-    };
-    Ok(Jailed {
-        pid,
-        reaped,
-        control,
-    })
-}
-
-/// `NAME@HOST[,HOST]`, valued from the environment of this process.
-fn secret(spec: &str) -> Result<(String, Secret)> {
-    let (name, hosts) = spec
-        .split_once('@')
-        .with_context(|| format!("--secret {spec}: expected NAME@HOST[,HOST]"))?;
-    let value =
-        std::env::var(name).with_context(|| format!("--secret {spec}: ${name} is not set"))?;
-    let hosts = hosts.split(',').map(str::to_string).collect();
-    Ok((name.to_string(), Secret { value, hosts }))
-}
-
-/// What the guest may reach and which secrets it is given, kept with a
-/// snapshot so a restore gets the same.
-#[derive(Clone, Serialize, Deserialize)]
-struct NetworkPolicy {
-    allow: Vec<String>,
-    /// NAME@HOST[,HOST], valued from the environment at each start.
-    secrets: Vec<String>,
-    dns: Ipv4Addr,
-}
-
-struct Network {
-    netd: Jailed,
-    vm_end: OwnedFd,
-    mac: [u8; 6],
-    session: shuru_proxy::Session,
-}
-
-/// Configures `netd`. A restore passes the session and MAC the guest was
-/// saved with: it trusts that CA, holds those placeholders and has the
-/// gateway in its neighbour table under that MAC.
-fn start_network(
-    policy: &NetworkPolicy,
-    ca_bundle: &Path,
-    netd: Jailed,
-    saved: Option<(shuru_proxy::Session, [u8; 6])>,
-) -> Result<Network> {
-    let secrets = policy
-        .secrets
-        .iter()
-        .map(|spec| secret(spec))
-        .collect::<Result<_>>()?;
-    let upstream_roots =
-        fs::read_to_string(ca_bundle).with_context(|| format!("{}", ca_bundle.display()))?;
-    let (vm_end, host_end) = shuru_proxy::create_socketpair()?;
-    let (vm_end, host_end) =
-        unsafe { (OwnedFd::from_raw_fd(vm_end), OwnedFd::from_raw_fd(host_end)) };
-    let (session, mac) = match saved {
-        Some((session, mac)) => (Some(session), mac),
-        None => {
-            let mut mac = [0u8; 6];
-            getrandom::fill(&mut mac).map_err(|e| anyhow::anyhow!("{e}"))?;
-            mac[0] = (mac[0] & 0xfe) | 0x02;
-            (None, mac)
-        }
-    };
-    let config = NetdConfig {
-        dns_resolver: policy.dns,
-        allow: policy.allow.clone(),
-        secrets,
-        upstream_roots,
-        session,
-    };
-    let response = netd
-        .configure(&Request::ConfigureNetwork(config), &[host_end.as_raw_fd()])
-        .context("shuru-netd failed")?;
-    let Response::Network { session } = response else {
-        bail!("shuru-netd answered {response:?}");
-    };
-    Ok(Network {
-        netd,
-        vm_end,
-        mac,
-        session,
-    })
-}
-
-/// What every sandbox needs from the host, opened before the jail.
-struct Host {
-    bin_dir: PathBuf,
-    kvm: OwnedFd,
-    null: File,
-    serial: OwnedFd,
-}
-
-impl Host {
-    fn open(common: &Common) -> Result<Self> {
-        if unsafe { libc::geteuid() } != 0 {
-            bail!("shuru-node runs as root");
-        }
-        let bin_dir = match &common.bin_dir {
-            Some(dir) => dir.clone(),
-            None => std::env::current_exe()?
-                .parent()
-                .context("no binary directory")?
-                .to_path_buf(),
-        };
-        let kvm = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/kvm")
-            .context("/dev/kvm")?
-            .into();
-        let null = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/null")?;
-        let serial = if common.verbose {
-            io::stderr().as_fd().try_clone_to_owned()?
-        } else {
-            null.try_clone()?.into()
-        };
-        Ok(Host {
-            bin_dir,
-            kvm,
-            null,
-            serial,
-        })
-    }
-
-    fn sandbox(&self, common: &Common, memory_bytes: u64, cpus: usize) -> Result<Sandbox> {
-        Sandbox::create(
-            &common.slot.to_string(),
-            &Limits {
-                guest_memory_bytes: memory_bytes,
-                cpus: cpus as u64,
-                pids: SANDBOX_PIDS,
-            },
-        )
-        .context("creating the sandbox cgroup")
-    }
-
-    fn spawn_netd(&self, common: &Common, dir: &RunDir, sandbox: &mut Sandbox) -> Result<Jailed> {
-        firewall::install()?;
-        spawn(Spawn {
-            name: "netd",
-            uid: NETD_UID_BASE + common.slot,
-            nofile: NETD_NOFILE,
-            host_network: true,
-            dir,
-            sandbox,
-            bin_dir: &self.bin_dir,
-            null: &self.null,
-            seccomp_log: common.seccomp_log,
-        })
-    }
-
-    fn spawn_vmm(&self, common: &Common, dir: &RunDir, sandbox: &mut Sandbox) -> Result<Jailed> {
-        spawn(Spawn {
-            name: "vmm",
-            uid: VMM_UID_BASE + common.slot,
-            nofile: VMM_NOFILE,
-            host_network: false,
-            dir,
-            sandbox,
-            bin_dir: &self.bin_dir,
-            null: &self.null,
-            seccomp_log: common.seccomp_log,
-        })
-    }
-}
-
-fn open(path: &Path) -> Result<File> {
-    File::open(path).with_context(|| format!("{}", path.display()))
 }
 
 fn print_times(sandbox: &Sandbox, times: &[(&str, Duration)]) {
@@ -495,109 +168,57 @@ fn print_times(sandbox: &Sandbox, times: &[(&str, Duration)]) {
 
 fn run(args: RunArgs) -> Result<i32> {
     let started = Instant::now();
-    let host = Host::open(&args.common)?;
+    let host = open_host(&args.common)?;
     snapshot_target(args.snapshot_to.as_deref())?;
-    let kernel = open(&args.kernel)?;
-    let initrd = open(&args.initrd)?;
-    let disk = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&args.disk)
-        .with_context(|| format!("{}", args.disk.display()))?;
     let policy = args.allow_net.then(|| NetworkPolicy {
         allow: args.allow.clone(),
         secrets: args.secrets.clone(),
         dns: args.dns,
     });
-
-    let dir = RunDir::create(args.common.slot)?;
-    let vsock_listener = UnixListener::bind(dir.vsock())?;
-    let mut sandbox = host.sandbox(&args.common, args.memory << 20, args.cpus)?;
-
-    let network = match &policy {
-        Some(policy) => {
-            let netd = host.spawn_netd(&args.common, &dir, &mut sandbox)?;
-            Some(start_network(policy, &args.ca_bundle, netd, None)?)
-        }
-        None => None,
-    };
-    let networked = started.elapsed();
-
-    let vmm = host.spawn_vmm(&args.common, &dir, &mut sandbox)?;
-    let spawned = started.elapsed();
-
-    let identity = new_identity()?;
-    let quiet = if args.common.verbose { "" } else { " quiet" };
-    let command_line = format!(
-        "console=ttyAMA0 root=/dev/vda rw{quiet} shuru.token={} shuru.instance={}",
-        hex(&identity.token),
-        hex(&identity.instance)
-    );
-
-    let config = VmmConfig {
-        cpus: args.cpus,
-        memory_bytes: args.memory << 20,
-        boot: Boot::Kernel {
-            command_line,
-            initrd: true,
+    let mut times = Vec::new();
+    let vm = Vm::boot(
+        &host,
+        &KernelBoot {
+            slot: args.common.slot,
+            kernel: &args.kernel,
+            initrd: &args.initrd,
+            disk: &args.disk,
+            cpus: args.cpus,
+            memory_bytes: args.memory << 20,
+            network: policy.as_ref(),
+            secrets: &HashMap::new(),
+            ca_bundle: &args.ca_bundle,
+            verbose: args.common.verbose,
         },
-        disk: Some(Disk { read_only: false }),
-        serial: true,
-        network_mac: network.as_ref().map(|network| network.mac),
-        vsock_connections: VSOCK_CONNECTIONS,
-        balloon: true,
-    };
-    let mut fds = vec![
-        host.kvm.as_raw_fd(),
-        kernel.as_raw_fd(),
-        initrd.as_raw_fd(),
-        disk.as_raw_fd(),
-        host.serial.as_raw_fd(),
-    ];
-    if let Some(network) = &network {
-        fds.push(network.vm_end.as_raw_fd());
-    }
-    fds.push(vsock_listener.as_raw_fd());
-    vmm.configure(&Request::Configure(config), &fds)
-        .context("shuru-vmm failed")?;
-    drop((host, kernel, initrd, disk, vsock_listener));
-    let ready = started.elapsed();
+        started,
+        &mut times,
+    )?;
+    drop(host);
 
     let mut env = HashMap::new();
-    if let Some(network) = &network {
+    if let Some(network) = &vm.network {
         if !network.session.placeholders.is_empty() {
-            let guest = connect_guest(&dir.vsock(), &identity, &vmm)?;
-            let ca = network.session.ca_cert_pem.clone();
-            let ca = HashMap::from([("SHURU_PROXY_CA".to_string(), ca)]);
-            let argv = ["sh", "-c", INSTALL_CA].map(str::to_string).to_vec();
-            if exec(guest, argv, ca)? != 0 {
-                bail!("installing the proxy CA in the guest failed");
-            }
+            vm.install_ca(&network.session.ca_cert_pem)?;
             env = network.session.placeholders.clone();
         }
     }
-    let guest = connect_guest(&dir.vsock(), &identity, &vmm)?;
-    let answered = started.elapsed();
-    let _socket = serve_guest(&args.common, dir.vsock(), identity)?;
+    let guest = vm.connect()?;
+    times.push(("guest answered", started.elapsed()));
+    let _socket = serve_guest(&args.common, vm.dir.vsock(), vm.identity)?;
     let code = exec(guest, args.command, env)?;
     let done = started.elapsed();
+    times.push(("done", done));
 
-    let mut times = vec![
-        ("network", networked),
-        ("jailed", spawned),
-        ("VM running", ready),
-        ("guest answered", answered),
-        ("done", done),
-    ];
     if let Some(to) = &args.snapshot_to {
         let info = SnapshotInfo {
             release: RELEASE.into(),
             protocol: PROTOCOL_VERSION,
             cpus: args.cpus,
             memory_bytes: args.memory << 20,
-            token: hex(&identity.token),
-            instance: hex(&identity.instance),
-            network: network
+            token: hex(&vm.identity.token),
+            instance: hex(&vm.identity.instance),
+            network: vm
+                .network
                 .as_ref()
                 .zip(policy)
                 .map(|(network, policy)| SavedNetwork {
@@ -606,17 +227,22 @@ fn run(args: RunArgs) -> Result<i32> {
                     session: network.session.clone(),
                 }),
         };
-        save_snapshot(&vmm, to, &args.disk, &info, None)?;
+        save_snapshot(&vm.vmm, to, &args.disk, &info, None)?;
         times.push(("snapshot", started.elapsed() - done));
     }
     if args.common.time {
-        print_times(&sandbox, &times);
+        print_times(&vm.sandbox, &times);
     }
-    vmm.stop();
-    if let Some(network) = network {
-        network.netd.stop();
-    }
+    vm.stop();
     Ok(code)
+}
+
+fn open_host(common: &Common) -> Result<Host> {
+    Host::open(
+        common.bin_dir.as_deref(),
+        common.verbose,
+        common.seccomp_log,
+    )
 }
 
 /// What a snapshot directory holds besides the memory, state and disk:
@@ -795,7 +421,7 @@ fn prefetch(memory: File) {
 
 fn restore(args: RestoreArgs) -> Result<i32> {
     let started = Instant::now();
-    let host = Host::open(&args.common)?;
+    let host = open_host(&args.common)?;
     snapshot_target(args.snapshot_to.as_deref())?;
     let info: SnapshotInfo = serde_json::from_reader(open(&args.from.join(SNAPSHOT_INFO))?)
         .context("reading the snapshot")?;
@@ -823,13 +449,15 @@ fn restore(args: RestoreArgs) -> Result<i32> {
 
     let dir = RunDir::create(args.common.slot)?;
     let vsock_listener = UnixListener::bind(dir.vsock())?;
-    let mut sandbox = host.sandbox(&args.common, info.memory_bytes, info.cpus)?;
+    let slot = args.common.slot;
+    let mut sandbox = host.sandbox(slot, info.memory_bytes, info.cpus)?;
     let network = match &info.network {
         Some(saved) => {
-            let netd = host.spawn_netd(&args.common, &dir, &mut sandbox)?;
+            let netd = host.spawn_netd(slot, &dir, &mut sandbox)?;
             let saved_session = (saved.session.clone(), unhex(&saved.mac)?);
             Some(start_network(
                 &saved.policy,
+                &HashMap::new(),
                 &args.ca_bundle,
                 netd,
                 Some(saved_session),
@@ -837,7 +465,7 @@ fn restore(args: RestoreArgs) -> Result<i32> {
         }
         None => None,
     };
-    let vmm = host.spawn_vmm(&args.common, &dir, &mut sandbox)?;
+    let vmm = host.spawn_vmm(slot, &dir, &mut sandbox)?;
     let spawned = started.elapsed();
 
     let config = VmmConfig {
@@ -908,16 +536,6 @@ fn restore(args: RestoreArgs) -> Result<i32> {
     Ok(code)
 }
 
-fn new_identity() -> Result<Identity> {
-    let mut identity = Identity {
-        token: [0; 32],
-        instance: [0; 16],
-    };
-    getrandom::fill(&mut identity.token).map_err(|e| anyhow::anyhow!("{e}"))?;
-    getrandom::fill(&mut identity.instance).map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(identity)
-}
-
 /// Gives a restored guest an identity no other restore of the snapshot
 /// has, the current time and fresh seed material for its RNG. Until this
 /// answers, anyone holding the snapshot could reach the guest.
@@ -956,55 +574,6 @@ fn rotate(guest: &mut UnixStream) -> Result<Identity> {
     }
     guest.set_read_timeout(None)?;
     Ok(restore.identity)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn unhex<const N: usize>(text: &str) -> Result<[u8; N]> {
-    let mut bytes = [0; N];
-    if text.len() != 2 * N || !text.is_ascii() {
-        bail!("bad hex in the snapshot");
-    }
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16)?;
-    }
-    Ok(bytes)
-}
-
-/// Connects to the guest agent through the VMM listener, retrying until
-/// the agent listens.
-fn connect_guest(path: &Path, identity: &Identity, vmm: &Jailed) -> Result<UnixStream> {
-    let deadline = Instant::now() + BOOT_TIMEOUT;
-    loop {
-        if vmm.exited() {
-            bail!("the VMM exited before the guest answered");
-        }
-        if Instant::now() > deadline {
-            bail!("the guest did not answer within {BOOT_TIMEOUT:?}");
-        }
-        if let Some(stream) = try_connect_guest(path, identity)? {
-            return Ok(stream);
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-fn try_connect_guest(path: &Path, identity: &Identity) -> Result<Option<UnixStream>> {
-    let mut stream = UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    stream.write_all(format!("CONNECT {GUEST_PORT}\n").as_bytes())?;
-    if !read_line(&mut stream)?.is_some_and(|line| line.starts_with("OK ")) {
-        return Ok(None);
-    }
-    identity
-        .connect(&mut stream)
-        .context("the guest did not answer the connection hello")?;
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
-    Ok(Some(stream))
 }
 
 /// Removes the `--guest-socket` path when the run ends.
@@ -1046,22 +615,6 @@ fn relay(a: UnixStream, b: UnixStream) {
     let t = std::thread::spawn(move || copy(a2, b2));
     copy(b, a);
     let _ = t.join();
-}
-
-/// Reads up to a newline one byte at a time, so nothing after it is lost.
-fn read_line(stream: &mut UnixStream) -> io::Result<Option<String>> {
-    let mut line = Vec::new();
-    let mut byte = [0];
-    while line.len() < 32 {
-        if stream.read(&mut byte)? == 0 {
-            return Ok(None);
-        }
-        if byte[0] == b'\n' {
-            return Ok(String::from_utf8(line).ok());
-        }
-        line.push(byte[0]);
-    }
-    Ok(None)
 }
 
 fn exec(mut guest: UnixStream, argv: Vec<String>, env: HashMap<String, String>) -> Result<i32> {
