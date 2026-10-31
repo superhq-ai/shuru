@@ -316,6 +316,7 @@ pub fn start_network(
     ca_bundle: &Path,
     netd: Jailed,
     saved: Option<(shuru_proxy::Session, [u8; 6])>,
+    sandbox: &str,
 ) -> Result<Network> {
     let mut secrets = policy
         .secrets
@@ -347,6 +348,7 @@ pub fn start_network(
         secrets,
         upstream_roots,
         session,
+        sandbox: sandbox.to_owned(),
     };
     let response = netd
         .configure(&Request::ConfigureNetwork(config), &[host_end.as_raw_fd()])
@@ -453,6 +455,8 @@ pub fn open(path: &Path) -> Result<File> {
 
 /// A kernel to boot in a fresh jail.
 pub struct KernelBoot<'a> {
+    /// Names the sandbox in its egress log.
+    pub name: &'a str,
     pub slot: u32,
     pub kernel: &'a Path,
     pub initrd: &'a Path,
@@ -510,6 +514,7 @@ impl Vm {
                     spec.ca_bundle,
                     netd,
                     None,
+                    spec.name,
                 )?)
             }
             None => None,

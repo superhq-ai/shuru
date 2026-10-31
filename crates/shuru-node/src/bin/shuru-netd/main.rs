@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use shuru_node::control::{self, NetdConfig, Request, Response};
 use shuru_node::seccomp;
 use shuru_proxy::config::{ConnectionRate, NetworkConfig, Rate, SecretConfig};
-use shuru_proxy::ProxyConfig;
+use shuru_proxy::{EgressLog, ProxyConfig};
 
 const CONTROL_FD: i32 = 3;
 
@@ -98,6 +98,7 @@ fn start(
         public_only: true,
         deny_ports: SMTP.to_vec(),
         connection_rate: Some(CONNECTION_RATE),
+        egress_log: Some(EgressLog::stderr(&config.sandbox)),
         upstream_roots: Some(config.upstream_roots.into_bytes()),
         ..Default::default()
     };

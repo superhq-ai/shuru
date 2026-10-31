@@ -179,6 +179,7 @@ fn run(args: RunArgs) -> Result<i32> {
     let vm = Vm::boot(
         &host,
         &KernelBoot {
+            name: "",
             slot: args.common.slot,
             kernel: &args.kernel,
             initrd: &args.initrd,
@@ -461,6 +462,7 @@ fn restore(args: RestoreArgs) -> Result<i32> {
                 &args.ca_bundle,
                 netd,
                 Some(saved_session),
+                "",
             )?)
         }
         None => None,

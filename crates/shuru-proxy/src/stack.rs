@@ -236,6 +236,7 @@ impl NetworkStack {
             let drain_status = self.device.drain_recv();
             self.reap_sockets();
             self.inspect_pending_frames();
+            self.gate.report(std::time::Instant::now());
             self.iface
                 .poll(Self::now(), &mut self.device, &mut self.sockets);
             self.poll_tcp_sockets();

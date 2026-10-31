@@ -1007,6 +1007,7 @@ impl Node {
         let vm = Vm::boot(
             &self.host,
             &KernelBoot {
+                name: &entry.record.name,
                 slot,
                 kernel: &config.kernel,
                 initrd: &config.initrd,
