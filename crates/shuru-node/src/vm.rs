@@ -38,6 +38,7 @@ const NPROC: u64 = 64;
 const SANDBOX_PIDS: u64 = 2 * NPROC;
 const GUEST_PORT: u32 = 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
+const FLOWS_TIMEOUT: Duration = Duration::from_secs(2);
 const INSTALL_CA: &str =
     "printf '%s' \"$SHURU_PROXY_CA\" > /usr/local/share/ca-certificates/shuru-proxy.crt \
     && update-ca-certificates --fresh > /dev/null 2>&1";
@@ -183,6 +184,23 @@ impl Jailed {
 
     pub fn stop(self) {
         let _ = control::send(&self.control, &Request::Stop, &[]);
+    }
+
+    /// Another handle on the control connection, to ask the running
+    /// process from another thread.
+    pub fn control(&self) -> io::Result<UnixStream> {
+        self.control.try_clone()
+    }
+}
+
+/// The open connections of a guest, asked of its netd over `control`.
+pub fn flows(control: &UnixStream) -> Result<Vec<shuru_proxy::FlowAge>> {
+    control.set_read_timeout(Some(FLOWS_TIMEOUT))?;
+    control::send(control, &Request::Flows, &[])?;
+    match control::receive::<Response>(control, 0)? {
+        Some((Response::Flows { flows }, _)) => Ok(flows),
+        Some((response, _)) => bail!("shuru-netd answered {response:?}"),
+        None => bail!("shuru-netd is gone"),
     }
 }
 

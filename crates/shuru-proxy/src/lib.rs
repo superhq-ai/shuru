@@ -1,6 +1,7 @@
 pub mod config;
 mod device;
 mod dns;
+mod flows;
 mod proxy;
 mod secrets;
 mod stack;
@@ -9,6 +10,7 @@ mod substitute;
 mod tls;
 
 pub use config::ProxyConfig;
+pub use flows::{FlowAge, Flows};
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -45,6 +47,8 @@ pub struct ProxyHandle {
     /// CA certificate in PEM format (for injecting into guest trust store).
     pub ca_cert_pem: Vec<u8>,
     ca_key_pem: String,
+    /// The open connections of the guest and when each last carried bytes.
+    pub flows: Arc<Flows>,
 }
 
 /// What a guest keeps from the proxy that served it: the CA it trusts and
@@ -202,11 +206,13 @@ pub fn start_session(
 
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let flows = Arc::new(Flows::default());
+    let stack_flows = flows.clone();
 
     let stack_thread = std::thread::Builder::new()
         .name("shuru-netstack".into())
         .spawn(move || {
-            let mut stack = NetworkStack::new(host_fd, event_tx, cmd_rx);
+            let mut stack = NetworkStack::new(host_fd, event_tx, cmd_rx, stack_flows);
             stack.run();
         })?;
 
@@ -244,5 +250,6 @@ pub fn start_session(
         placeholders,
         ca_cert_pem,
         ca_key_pem,
+        flows,
     })
 }

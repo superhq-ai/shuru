@@ -8,6 +8,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
@@ -101,6 +102,8 @@ pub struct GuestAddr {
 
 struct Running {
     guest: GuestAddr,
+    /// The control connection of its netd, if it has a network.
+    netd: Option<Arc<Mutex<UnixStream>>>,
     slot: u32,
     boot: u64,
     alive: Arc<AtomicBool>,
@@ -212,6 +215,26 @@ impl Entry {
                 memory_bytes: 0,
             },
         })
+    }
+
+    /// CPU time the running VM has used, or `None` while it is not
+    /// running or is booting or stopping.
+    pub fn cpu_usec(&self) -> Option<u64> {
+        let vm = self.vm.try_lock().ok()?;
+        let running = vm
+            .as_ref()
+            .filter(|running| running.alive.load(Ordering::Acquire))?;
+        cgroup::usage(&running.slot.to_string())
+            .ok()
+            .map(|usage| usage.cpu_usec)
+    }
+
+    /// The netd control connection of a running sandbox with a network.
+    pub async fn netd_if_running(&self) -> Option<Arc<Mutex<UnixStream>>> {
+        let vm = self.vm.lock().await;
+        vm.as_ref()
+            .filter(|running| running.alive.load(Ordering::Acquire))
+            .and_then(|running| running.netd.clone())
     }
 
     /// The guest of a sandbox that is running, without booting one that is
@@ -858,8 +881,8 @@ impl Node {
                 return Err(ApiError::internal(format!("starting the VM thread: {e}")));
             }
         };
-        let guest = match ready_rx.await {
-            Ok(Ok(guest)) => guest,
+        let (guest, netd) = match ready_rx.await {
+            Ok(Ok(booted)) => booted,
             Ok(Err(e)) => {
                 let _ = tokio::task::spawn_blocking(move || thread.join()).await;
                 return Err(ApiError::internal(format!(
@@ -873,6 +896,7 @@ impl Node {
         entry.activity.restart();
         *vm = Some(Running {
             guest: guest.clone(),
+            netd: netd.map(|netd| Arc::new(Mutex::new(netd))),
             slot,
             boot,
             alive,
@@ -892,7 +916,7 @@ impl Node {
         slot: u32,
         boot: u64,
         alive: Arc<AtomicBool>,
-        ready: tokio::sync::oneshot::Sender<Result<GuestAddr>>,
+        ready: tokio::sync::oneshot::Sender<Result<(GuestAddr, Option<UnixStream>)>>,
         stop: mpsc::Receiver<bool>,
     ) {
         let name = &entry.record.name;
@@ -917,8 +941,15 @@ impl Node {
                     .unwrap_or_default(),
             ),
         };
+        let netd = vm.network.as_ref().and_then(|network| {
+            network
+                .netd
+                .control()
+                .map_err(|e| eprintln!("shuru-node: the netd of sandbox {name}: {e}"))
+                .ok()
+        });
         alive.store(true, Ordering::Release);
-        let graceful = if ready.send(Ok(guest)).is_err() {
+        let graceful = if ready.send(Ok((guest, netd))).is_err() {
             false
         } else {
             loop {

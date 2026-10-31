@@ -108,6 +108,8 @@ pub enum Request {
     Snapshot {
         resume: bool,
     },
+    /// The open connections of the guest, for netd.
+    Flows,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -122,6 +124,9 @@ pub enum Response {
     /// and trusts its CA for the hosts they are relayed to.
     Network {
         session: shuru_proxy::Session,
+    },
+    Flows {
+        flows: Vec<shuru_proxy::FlowAge>,
     },
     Error {
         message: String,
