@@ -15,7 +15,7 @@ pub(super) fn decode_ranges(
         return Err(VIRTIO_BLK_S_IOERR);
     }
     let mut ranges = Vec::new();
-    for bytes in payload.chunks_exact(16) {
+    for bytes in payload.as_chunks::<16>().0 {
         let sector = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         let flags = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
