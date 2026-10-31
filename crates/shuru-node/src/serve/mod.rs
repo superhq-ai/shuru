@@ -51,9 +51,10 @@ pub struct ServeArgs {
     /// Guest memory of each new sandbox, in MiB.
     #[arg(long, default_value_t = 2048)]
     memory: u64,
-    /// Size of the disk of each new sandbox, in GiB. Its copy of a smaller
-    /// base disk is grown, sparse, and the guest grows its filesystem to it
-    /// at boot; 0 keeps the size of the base disk.
+    /// Size of the disk of each sandbox, in GiB. A smaller disk, a copy of
+    /// the base or one made before the size was raised, is grown, sparse,
+    /// before its next boot, and the guest grows its filesystem to it; a
+    /// disk is never shrunk. 0 keeps the size of the base disk.
     #[arg(long, default_value_t = 0)]
     disk_size: u64,
     /// Refuse new sandboxes while the state directory has less free, in GiB.

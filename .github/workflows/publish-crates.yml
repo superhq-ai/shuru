@@ -10,7 +10,7 @@ env:
 jobs:
   publish-darwin:
     name: Publish macOS crates
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
 
@@ -73,7 +73,7 @@ jobs:
   publish-cross:
     name: Publish cross-platform crates
     needs: publish-linux
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
 

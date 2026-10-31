@@ -4,7 +4,7 @@
 //! it; the jailed processes are its children and die with it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::DirBuilderExt;
@@ -997,6 +997,12 @@ impl Node {
     fn boot(&self, entry: &Entry, slot: u32) -> Result<Vm> {
         let config = &self.config;
         let disk = entry.dir.join(DISK);
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&disk)
+            .with_context(|| format!("{}", disk.display()))?;
+        grow(&file, config.disk_bytes)?;
+        drop(file);
         let secrets = entry.config().netd_secrets();
         let vm = Vm::boot(
             &self.host,
@@ -1145,6 +1151,16 @@ fn lock(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Grows a sandbox disk to `size` bytes, sparse, when it is smaller. The
+/// guest grows its filesystem to the device at boot. Never shrinks one.
+fn grow(disk: &File, size: u64) -> Result<()> {
+    if disk.metadata()?.len() < size {
+        disk.set_len(size)?;
+        disk.sync_all()?;
+    }
+    Ok(())
+}
+
 /// Writes the sandbox directory under another name, syncs it and renames
 /// it into place, so a crash never leaves one that looks complete. An
 /// imported disk goes back where it was if this fails.
@@ -1166,9 +1182,7 @@ fn make(dir: &Path, disk: &NewDisk, record: &Record, config: &SandboxConfig) -> 
         let disk = match disk {
             NewDisk::Base { path, size } => {
                 let disk = crate::clone_file(path, &staging.join(DISK))?;
-                if disk.metadata()?.len() < *size {
-                    disk.set_len(*size)?;
-                }
+                grow(&disk, *size)?;
                 disk
             }
             NewDisk::Import(path) => {
@@ -1501,6 +1515,27 @@ mod tests {
                 .len(),
             8192
         );
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn a_disk_made_smaller_grows_before_its_next_boot() {
+        use std::os::unix::fs::MetadataExt;
+        let state = scratch("regrow");
+        fs::create_dir_all(&state).unwrap();
+        let path = state.join(DISK);
+        fs::write(&path, vec![7u8; 8192]).unwrap();
+        let disk = OpenOptions::new().write(true).open(&path).unwrap();
+
+        grow(&disk, 64 * MIB).unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 64 * MIB);
+        assert!(meta.blocks() * 512 < 64 * MIB);
+        assert_eq!(fs::read(&path).unwrap()[..8192], vec![7u8; 8192][..]);
+
+        grow(&disk, 4096).unwrap();
+        grow(&disk, 0).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 64 * MIB);
         fs::remove_dir_all(&state).unwrap();
     }
 
