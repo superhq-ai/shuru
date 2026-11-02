@@ -456,6 +456,16 @@ impl Sandbox {
             .map_err(|e| anyhow::anyhow!("Failed to set memory target: {}", e))
     }
 
+    /// Starts the guest services with `env` under the env of their files.
+    /// Send it first after `start`: commands wait for it, and the guest
+    /// starts the services without it after a few seconds.
+    pub fn start_services(&self, env: &HashMap<String, String>) -> Result<()> {
+        let mut stream = self.connect_vsock()?;
+        stream.set_read_timeout(Some(SERVICE_ENV_TIMEOUT))?;
+        stream.set_write_timeout(Some(SERVICE_ENV_TIMEOUT))?;
+        shuru_proto::send_service_env(&mut stream, env).context("starting the guest services")
+    }
+
     /// Block until the guest control server accepts vsock connections.
     pub fn wait_ready(&self) -> Result<()> {
         let stream = self.connect_vsock()?;
@@ -546,6 +556,7 @@ impl Sandbox {
             cols: None,
             cwd: None,
             id: None,
+            before_services: false,
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -871,6 +882,7 @@ impl Sandbox {
             cols: None,
             cwd: cwd.map(|s| s.to_string()),
             id: Some(id),
+            before_services: false,
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -930,6 +942,7 @@ impl Sandbox {
             cols: Some(cols),
             cwd: cwd.map(|s| s.to_string()),
             id: None,
+            before_services: false,
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -979,6 +992,7 @@ impl Sandbox {
             cols: Some(cols),
             cwd: None,
             id: None,
+            before_services: false,
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -1222,6 +1236,7 @@ impl GuestVm {
 /// Upper bound on a graceful shutdown. Covers the slowest service stop
 /// timeout an image can reasonably declare, plus the sync.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(90);
+const SERVICE_ENV_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn shutdown_handshake(stream: TcpStream) -> Result<ShutdownResponse> {
     let mut writer = stream.try_clone()?;

@@ -1131,12 +1131,18 @@ impl Node {
             Instant::now(),
             &mut Vec::new(),
         )?;
-        drop(vm.connect()?);
+        let mut placeholders = HashMap::new();
         if let Some(network) = &vm.network {
             if !network.session.placeholders.is_empty() {
                 vm.install_ca(&network.session.ca_cert_pem)?;
+                placeholders = network.session.placeholders.clone();
             }
         }
+        vm.start_services(&config::exec_env(
+            &entry.config().env,
+            &placeholders,
+            HashMap::new(),
+        ))?;
         Ok(vm)
     }
 

@@ -389,6 +389,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
         nbd_uri.as_deref(),
     )?);
     sandbox.start()?;
+    sandbox.start_services(
+        proxy_handle
+            .as_ref()
+            .map(|handle| &handle.placeholders)
+            .unwrap_or(&HashMap::new()),
+    )?;
 
     // Inject CA cert and secret placeholders when MITM is needed
     let secret_env: HashMap<String, String> = if let Some(ref handle) = proxy_handle {

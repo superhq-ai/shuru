@@ -203,6 +203,7 @@ fn run(args: RunArgs) -> Result<i32> {
             env = network.session.placeholders.clone();
         }
     }
+    vm.start_services(&env)?;
     let guest = vm.connect()?;
     times.push(("guest answered", started.elapsed()));
     let _socket = serve_guest(&args.common, vm.dir.vsock(), vm.identity)?;
@@ -628,6 +629,7 @@ fn exec(mut guest: UnixStream, argv: Vec<String>, env: HashMap<String, String>) 
         cols: None,
         cwd: None,
         id: None,
+        before_services: false,
     };
     frame::send_json(&mut guest, frame::EXEC_REQ, &request)?;
     let mut stdout = io::stdout().lock();
