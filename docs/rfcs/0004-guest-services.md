@@ -106,7 +106,11 @@ under it.
   one it booted with. An env changed later reaches services at the next
   boot.
 - Commands wait for the services to start, like they wait for them to be
-  ready, so the first command after a boot never runs before them.
+  ready, so the first command after a boot never runs before them. The
+  one exception is set up by the host itself, marked `before_services` on
+  its exec request: the node installs the proxy CA that way before it
+  sends the env, so services start trusting it, and a service that fails
+  fails the first command instead of the boot.
 - A host that sends no env, an older one or a raw console boot, gets the
   services started without it after 5 s. An image without service files
   starts at once and accepts a later env as a no op.

@@ -334,6 +334,7 @@ mod tests {
                 cols: None,
                 cwd: None,
                 id: None,
+                before_services: false,
             },
             max_run_after_disconnect: hangup,
         };

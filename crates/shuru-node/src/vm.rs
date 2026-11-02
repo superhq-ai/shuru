@@ -637,7 +637,8 @@ impl Vm {
     }
 
     /// Has the guest trust the proxy CA of its session, which the proxy
-    /// signs with for the hosts it sends secrets to.
+    /// signs with for the hosts it sends secrets to. Runs before the
+    /// services start, so they start trusting it.
     pub fn install_ca(&self, ca_cert_pem: &str) -> Result<()> {
         let mut guest = self.connect()?;
         guest.set_read_timeout(Some(INSTALL_CA_TIMEOUT))?;
@@ -649,6 +650,7 @@ impl Vm {
             cols: None,
             cwd: None,
             id: None,
+            before_services: true,
         };
         frame::send_json(&mut guest, frame::EXEC_REQ, &request)?;
         loop {

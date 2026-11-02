@@ -541,7 +541,12 @@ mod guest {
 
                     // Services declared by the image must be ready before a
                     // command runs against them (RFC 0004).
-                    if let Err(msg) = crate::services::wait_ready() {
+                    let ready = if req.before_services {
+                        Ok(())
+                    } else {
+                        crate::services::wait_ready()
+                    };
+                    if let Err(msg) = ready {
                         let _ = frame::write_frame(&mut writer, frame::ERROR, msg.as_bytes());
                         continue;
                     }

@@ -27,6 +27,10 @@ pub struct ExecRequest {
     /// Names the process for a KillRequest on another connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
+    /// Runs without waiting for the guest services: set up the host does
+    /// before it sends their env, never a command asked for by a user.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub before_services: bool,
 }
 
 /// Kill an exec by the id it was started with. Sent on its own connection,

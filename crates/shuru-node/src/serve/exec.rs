@@ -88,6 +88,7 @@ fn start_request(query: Option<&str>, websocket: bool) -> Result<(SessionStart, 
             cols,
             cwd,
             id: None,
+            before_services: false,
         },
         max_run_after_disconnect,
     };

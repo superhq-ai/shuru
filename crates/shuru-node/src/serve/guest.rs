@@ -89,6 +89,7 @@ pub async fn sync(addr: &GuestAddr) -> Result<(), ApiError> {
         cols: None,
         cwd: None,
         id: None,
+        before_services: false,
     };
     send_json(&mut guest.stream, frame::EXEC_REQ, &request).await?;
     loop {

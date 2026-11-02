@@ -556,6 +556,7 @@ impl Sandbox {
             cols: None,
             cwd: None,
             id: None,
+            before_services: false,
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -881,6 +882,7 @@ impl Sandbox {
             cols: None,
             cwd: cwd.map(|s| s.to_string()),
             id: Some(id),
+            before_services: false,
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -940,6 +942,7 @@ impl Sandbox {
             cols: Some(cols),
             cwd: cwd.map(|s| s.to_string()),
             id: None,
+            before_services: false,
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -989,6 +992,7 @@ impl Sandbox {
             cols: Some(cols),
             cwd: None,
             id: None,
+            before_services: false,
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
