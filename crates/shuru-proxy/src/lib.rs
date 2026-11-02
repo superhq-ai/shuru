@@ -10,7 +10,7 @@ mod stream;
 mod substitute;
 mod tls;
 
-pub use config::ProxyConfig;
+pub use config::{Provided, ProxyConfig, Refused, Scope, SecretConfig, SecretProvider};
 pub use egress::{Egress, EgressLog};
 pub use flows::{FlowAge, Flows};
 
@@ -22,10 +22,11 @@ use std::sync::{Arc, RwLock};
 
 use lru::LruCache;
 use proxy::ProxyEngine;
+use secrets::SecretResolver;
 use stack::NetworkStack;
 use tls::CertificateAuthority;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Cache of IPs that the proxy is allowed to connect to.
 /// Populated by DNS resolution of allowed domains. When the domain allowlist
@@ -53,6 +54,7 @@ pub struct ProxyHandle {
     pub flows: Arc<Flows>,
     /// The bytes the guest sent out.
     pub egress: Arc<Egress>,
+    secrets: Arc<SecretResolver>,
 }
 
 /// What a guest keeps from the proxy that served it: the CA it trusts and
@@ -74,6 +76,14 @@ impl std::fmt::Debug for Session {
 }
 
 impl ProxyHandle {
+    /// Replaces the secrets of a running guest. Values and hosts of those it
+    /// has placeholders for apply from the next request, and those left out
+    /// are no longer substituted. Returns the names it has no placeholder
+    /// for, which wait for a new session.
+    pub fn update_secrets(&self, secrets: HashMap<String, SecretConfig>) -> Vec<String> {
+        self.secrets.update(secrets)
+    }
+
     pub fn session(&self) -> Session {
         Session {
             ca_cert_pem: String::from_utf8_lossy(&self.ca_cert_pem).into_owned(),
@@ -169,8 +179,10 @@ pub fn start(host_fd: RawFd, config: ProxyConfig) -> anyhow::Result<ProxyHandle>
     start_session(host_fd, config, None)
 }
 
-/// `start`, carrying on `session` when given. Its placeholders must cover
-/// the configured secrets exactly.
+/// `start`, carrying on `session` when given. The guest keeps the
+/// placeholders of its session, so a configured secret it has none for waits
+/// for a new session, and one of the session the config no longer has is not
+/// substituted.
 pub fn start_session(
     host_fd: RawFd,
     config: ProxyConfig,
@@ -181,12 +193,14 @@ pub fn start_session(
 
     let (ca, placeholders) = match session {
         Some(session) => {
-            let mut names: Vec<_> = session.placeholders.keys().collect();
-            let mut secrets: Vec<_> = config.secrets.keys().collect();
-            names.sort();
-            secrets.sort();
-            if names != secrets {
-                anyhow::bail!("the secrets differ from the ones the session was started with");
+            let mut pending: Vec<_> = config
+                .secrets
+                .keys()
+                .filter(|name| !session.placeholders.contains_key(*name))
+                .collect();
+            if !pending.is_empty() {
+                pending.sort();
+                warn!("secrets {pending:?} wait for the next boot: the guest has no placeholder for them");
             }
             let ca = CertificateAuthority::from_pem(&session.ca_cert_pem, &session.ca_key_pem)?;
             (ca, session.placeholders)
@@ -212,14 +226,8 @@ pub fn start_session(
     let flows = Arc::new(Flows::default());
     let stack_flows = flows.clone();
     let gate = egress::Gate::new(&config, std::time::Instant::now());
-    let mut engine = ProxyEngine::new(
-        config,
-        event_rx,
-        cmd_tx,
-        ca,
-        placeholders.clone(),
-        allowed_ips,
-    )?;
+    let secrets = Arc::new(SecretResolver::new(&config, placeholders.clone()));
+    let mut engine = ProxyEngine::new(config, event_rx, cmd_tx, ca, secrets.clone(), allowed_ips)?;
     let egress = engine.egress();
 
     let stack_thread = std::thread::Builder::new()
@@ -251,5 +259,6 @@ pub fn start_session(
         ca_key_pem,
         flows,
         egress,
+        secrets,
     })
 }

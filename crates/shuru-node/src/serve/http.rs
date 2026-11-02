@@ -318,7 +318,7 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
         (&Method::PUT, [name, "config"]) => {
             let body = read_body(request.into_body(), MAX_CONFIG_BODY).await?;
             let put: ConfigRequest = parse_json(&body)?;
-            let config = SandboxConfig::parse(put.env, put.secrets)?;
+            let config = SandboxConfig::parse(put.env, put.secrets, put.config_version)?;
             node.configure(name, config).await?;
             Ok(no_content())
         }
@@ -496,12 +496,15 @@ struct CreateRequest {
     start: bool,
     env: Option<Value>,
     secrets: Option<Value>,
+    config_version: Option<u64>,
 }
 
 #[derive(Deserialize)]
 struct ConfigRequest {
     env: Option<Value>,
     secrets: Option<Value>,
+    /// A config with a lower version than the one kept changes nothing.
+    config_version: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -526,7 +529,7 @@ fn no_content() -> Response<Body> {
 async fn create(node: &Arc<Node>, request: Request<Incoming>) -> Result<Response<Body>, ApiError> {
     let body = read_body(request.into_body(), MAX_CONFIG_BODY).await?;
     let create: CreateRequest = parse_json(&body)?;
-    let config = SandboxConfig::parse(create.env, create.secrets)?;
+    let config = SandboxConfig::parse(create.env, create.secrets, create.config_version)?;
     let entry = node
         .create(create.name, create.disk.as_deref(), config, create.start)
         .await?;
@@ -546,6 +549,7 @@ fn sandbox_json(entry: &Entry) -> Value {
         "status": if entry.is_running() { "running" } else { "cold" },
         "env": config.env.keys().collect::<Vec<_>>(),
         "secrets": config.secrets.keys().collect::<Vec<_>>(),
+        "config_version": config.version,
         "url": null,
         "url_settings": null,
         "created_at": created,

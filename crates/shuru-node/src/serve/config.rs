@@ -2,7 +2,8 @@
 //! every exec as they are, and secrets, which the guest only sees as
 //! placeholders that the proxy swaps for the value on requests to the
 //! bound hosts. Kept in `config.json` in the sandbox directory, the one
-//! place a secret value is written.
+//! place a secret value is written. A provided secret has no value here:
+//! netd asks for it while the guest runs (RFC 0013).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -13,6 +14,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use shuru_node::control;
+use shuru_proxy::Scope;
 
 use super::http::ApiError;
 
@@ -30,20 +32,40 @@ pub struct SandboxConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub secrets: BTreeMap<String, BoundSecret>,
+    /// Raised by the caller with each change, so a change that arrives
+    /// late is told from one that is new.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct BoundSecret {
-    pub value: String,
+    /// None for a provided secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
     /// Lowercase, each a domain or `*.` and a domain.
     pub hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub provider: bool,
+    #[serde(default, rename = "in", skip_serializing_if = "is_head")]
+    pub scope: Scope,
+}
+
+fn is_head(scope: &Scope) -> bool {
+    *scope == Scope::Head
 }
 
 impl SandboxConfig {
-    /// The `env` and `secrets` of a request body, checked. No message
-    /// carries a value, and none carries a name before it is checked.
-    pub fn parse(env: Option<Value>, secrets: Option<Value>) -> Result<Self, ApiError> {
+    /// The `env`, `secrets` and `version` of a request body, checked. No
+    /// message carries a value, and none carries a name before it is
+    /// checked.
+    pub fn parse(
+        env: Option<Value>,
+        secrets: Option<Value>,
+        version: Option<u64>,
+    ) -> Result<Self, ApiError> {
         let config = SandboxConfig {
+            version,
             env: match env {
                 Some(env) => parse_env(env)?,
                 None => BTreeMap::new(),
@@ -58,7 +80,9 @@ impl SandboxConfig {
             .iter()
             .map(|(name, value)| name.len() + value.len());
         let secrets = config.secrets.iter().map(|(name, secret)| {
-            name.len() + secret.value.len() + secret.hosts.iter().map(String::len).sum::<usize>()
+            name.len()
+                + secret.value.as_ref().map_or(0, String::len)
+                + secret.hosts.iter().map(String::len).sum::<usize>()
         });
         if env.chain(secrets).sum::<usize>() > MAX_TOTAL {
             return Err(ApiError::bad_request(format!(
@@ -69,6 +93,10 @@ impl SandboxConfig {
         Ok(config)
     }
 
+    pub fn has_provided(&self) -> bool {
+        self.secrets.values().any(|secret| secret.provider)
+    }
+
     /// The secrets as netd takes them.
     pub fn netd_secrets(&self) -> HashMap<String, control::Secret> {
         self.secrets
@@ -77,6 +105,8 @@ impl SandboxConfig {
                 let secret = control::Secret {
                     value: secret.value.clone(),
                     hosts: secret.hosts.clone(),
+                    provided: secret.provider,
+                    scope: secret.scope,
                 };
                 (name.clone(), secret)
             })
@@ -120,15 +150,42 @@ fn parse_secrets(secrets: Value) -> Result<BTreeMap<String, BoundSecret>, ApiErr
                     "{at}: expected an object with value and hosts"
                 )));
             };
-            let value = match fields.remove("value") {
-                Some(Value::String(value)) => value,
+            let provider = match fields.remove("provider") {
+                None => false,
+                Some(Value::Bool(true)) => true,
+                Some(_) => {
+                    return Err(ApiError::bad_request(format!(
+                        "{at}.provider: expected true, or no provider"
+                    )))
+                }
+            };
+            let value = match (fields.remove("value"), provider) {
+                (Some(Value::String(value)), false) => {
+                    check_value(&format!("{at}.value"), &value)?;
+                    Some(value)
+                }
+                (None, true) => None,
+                (Some(_), true) => {
+                    return Err(ApiError::bad_request(format!(
+                        "{at}: a provided secret has no value"
+                    )))
+                }
                 _ => {
                     return Err(ApiError::bad_request(format!(
                         "{at}.value: expected a string"
                     )))
                 }
             };
-            check_value(&format!("{at}.value"), &value)?;
+            let scope = match fields.remove("in") {
+                None => Scope::Head,
+                Some(Value::String(scope)) if scope == "head" => Scope::Head,
+                Some(Value::String(scope)) if scope == "authorization" => Scope::Authorization,
+                Some(_) => {
+                    return Err(ApiError::bad_request(format!(
+                        "{at}.in: expected head or authorization"
+                    )))
+                }
+            };
             let hosts = match fields.remove("hosts") {
                 Some(Value::Array(hosts)) => hosts,
                 _ => {
@@ -153,10 +210,18 @@ fn parse_secrets(secrets: Value) -> Result<BTreeMap<String, BoundSecret>, ApiErr
                 .collect::<Result<_, _>>()?;
             if !fields.is_empty() {
                 return Err(ApiError::bad_request(format!(
-                    "{at}: expected only value and hosts"
+                    "{at}: expected only value or provider, hosts and in"
                 )));
             }
-            Ok((name, BoundSecret { value, hosts }))
+            Ok((
+                name,
+                BoundSecret {
+                    value,
+                    hosts,
+                    provider,
+                    scope,
+                },
+            ))
         })
         .collect()
 }
@@ -243,7 +308,7 @@ mod tests {
     use serde_json::json;
 
     fn parse(env: Value, secrets: Value) -> Result<SandboxConfig, ApiError> {
-        SandboxConfig::parse(Some(env), Some(secrets))
+        SandboxConfig::parse(Some(env), Some(secrets), None)
     }
 
     #[test]
@@ -298,7 +363,10 @@ mod tests {
             config.secrets["TOKEN"].hosts,
             ["api.example.com", "*.example.org"]
         );
-        assert!(SandboxConfig::parse(None, None).unwrap().env.is_empty());
+        assert!(SandboxConfig::parse(None, None, None)
+            .unwrap()
+            .env
+            .is_empty());
 
         let refused = [
             (json!([]), json!({})),
@@ -327,6 +395,22 @@ mod tests {
             (
                 json!({}),
                 json!({ "T": { "value": "s3cret", "hosts": ["a.com"], "host": "b.com" } }),
+            ),
+            (
+                json!({}),
+                json!({ "T": { "value": "s3cret", "provider": true, "hosts": ["a.com"] } }),
+            ),
+            (
+                json!({}),
+                json!({ "T": { "provider": false, "hosts": ["a.com"] } }),
+            ),
+            (
+                json!({}),
+                json!({ "T": { "provider": "s3cret", "hosts": ["a.com"] } }),
+            ),
+            (
+                json!({}),
+                json!({ "T": { "value": "s3cret", "hosts": ["a.com"], "in": "body" } }),
             ),
         ];
         for (env, secrets) in refused {
@@ -359,15 +443,57 @@ mod tests {
         std::fs::write(dir.join(CONFIG), serde_json::to_vec(&config).unwrap()).unwrap();
         let read = read(&dir).unwrap();
         assert_eq!(read.env["A"], "1");
-        assert_eq!(read.secrets["T"].value, "s3cret");
+        assert_eq!(read.secrets["T"].value.as_deref(), Some("s3cret"));
         assert_eq!(read.secrets["T"].hosts, ["a.example.com"]);
         let netd = read.netd_secrets();
-        assert_eq!(netd["T"].value, "s3cret");
+        assert_eq!(netd["T"].value.as_deref(), Some("s3cret"));
+        assert!(!netd["T"].provided);
+
+        let written = std::fs::read_to_string(dir.join(CONFIG)).unwrap();
+        assert!(
+            !written.contains("provider") && !written.contains("\"in\""),
+            "{written}"
+        );
 
         std::fs::write(dir.join(CONFIG), br#"{"env":"s3cret"}"#).unwrap();
         let e = super::read(&dir).err().unwrap();
         assert!(!format!("{e:#}").contains("s3cret"), "{e:#}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn provided_and_scoped_secrets() {
+        let config = SandboxConfig::parse(
+            None,
+            Some(json!({
+                "GH_TOKEN": { "provider": true, "hosts": ["github.com"], "in": "authorization" },
+                "KEY": { "value": "s3cret", "hosts": ["a.com"], "in": "head" },
+            })),
+            Some(7),
+        )
+        .unwrap();
+        assert!(config.has_provided());
+        assert_eq!(config.version, Some(7));
+        let netd = config.netd_secrets();
+        assert!(netd["GH_TOKEN"].provided && netd["GH_TOKEN"].value.is_none());
+        assert_eq!(netd["GH_TOKEN"].scope, Scope::Authorization);
+        assert_eq!(netd["KEY"].scope, Scope::Head);
+
+        let written = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            written,
+            json!({
+                "env": {},
+                "secrets": {
+                    "GH_TOKEN": { "hosts": ["github.com"], "provider": true, "in": "authorization" },
+                    "KEY": { "value": "s3cret", "hosts": ["a.com"] },
+                },
+                "version": 7,
+            })
+        );
+        let read: SandboxConfig = serde_json::from_value(written).unwrap();
+        assert_eq!(read.secrets["GH_TOKEN"].scope, Scope::Authorization);
+        assert!(read.secrets["GH_TOKEN"].provider);
     }
 
     #[test]

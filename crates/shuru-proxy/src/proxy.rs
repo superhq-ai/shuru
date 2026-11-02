@@ -14,6 +14,7 @@ use crate::config::ProxyConfig;
 use crate::dns;
 use crate::egress::{Egress, Tally};
 use crate::secrets::SecretResolver;
+use crate::secrets::Substitution;
 use crate::stack::{ConnectionId, StackCommand, StackEvent, TcpConnection};
 use crate::stream::{ChannelStream, GuestRx, GuestTx};
 use crate::substitute::RequestStream;
@@ -43,7 +44,7 @@ pub struct ProxyEngine {
 struct Shared {
     config: Arc<ProxyConfig>,
     ca: tokio::sync::Mutex<CertificateAuthority>,
-    secrets: SecretResolver,
+    secrets: Arc<SecretResolver>,
     upstream_ssl: SslConnector,
     allowed_ips: AllowedIps,
     egress: Arc<Egress>,
@@ -69,13 +70,12 @@ impl ProxyEngine {
         event_rx: mpsc::UnboundedReceiver<StackEvent>,
         cmd_tx: mpsc::UnboundedSender<StackCommand>,
         ca: CertificateAuthority,
-        placeholders: HashMap<String, String>,
+        secrets: Arc<SecretResolver>,
         allowed_ips: AllowedIps,
     ) -> anyhow::Result<Self> {
         let upstream_ssl = upstream_connector(&config)?;
         let egress = Arc::new(Egress::new(config.egress_rate, std::time::Instant::now()));
         let config = Arc::new(config);
-        let secrets = SecretResolver::new(config.clone(), placeholders);
 
         Ok(ProxyEngine {
             event_rx,
@@ -389,7 +389,7 @@ async fn handle_mitm(
     dst: SocketAddr,
     domain: String,
     first_chunk: Vec<u8>,
-    substitutions: Vec<(String, String)>,
+    substitutions: Vec<Substitution>,
     shared: &Shared,
 ) -> anyhow::Result<()> {
     let acceptor = {
@@ -433,13 +433,20 @@ async fn handle_mitm(
                     break;
                 }
                 Ok(n) => {
-                    // Pick up a rotated secret without waiting for the guest
-                    // to open a new connection. Cheap while the cached value
-                    // is live; a re-mint costs this connection what it would
-                    // have cost at connection setup.
-                    if !requests.is_tunnel() && last_refresh.elapsed() >= SECRET_REFRESH_INTERVAL {
-                        if let Ok(fresh) = secrets.substitutions_for_domain(&domain).await {
-                            requests.update(fresh);
+                    // Pick up a rotated or removed secret without waiting for
+                    // the guest to open a new connection, and only between
+                    // requests, so a body is never held up by a fetch. What
+                    // this connection had may include a secret that is gone,
+                    // so a failed resolve ends it.
+                    if requests.at_request_start()
+                        && last_refresh.elapsed() >= SECRET_REFRESH_INTERVAL
+                    {
+                        match secrets.substitutions_for_domain(&domain).await {
+                            Ok(fresh) => requests.update(fresh),
+                            Err(e) => {
+                                warn!("TLS to {domain} closed: {e:#}");
+                                break;
+                            }
                         }
                         last_refresh = std::time::Instant::now();
                     }
