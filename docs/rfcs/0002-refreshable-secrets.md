@@ -209,10 +209,10 @@ roughly 200x less on an 80 KB upload, 2500x less on 1 MB.
 
 ### Refresh granularity
 
-Values resolve at TLS connection setup, and a live relay re-resolves every 5
-seconds as it forwards, so a rotation reaches a connection that is already
-open rather than waiting for it to reconnect. Fresh values apply from the next
-request head.
+Values resolve at TLS connection setup, and a live relay re-resolves right
+before it rewrites each request head, so a rotation reaches a connection that
+is already open rather than waiting for it to reconnect. A complete head is
+held, not rewritten, until that resolve returns.
 
 The relay can simply await the resolver, because it is already an async loop.
 An earlier draft assumed this needed a lock free read plus a background

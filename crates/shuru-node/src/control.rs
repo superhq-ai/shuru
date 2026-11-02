@@ -61,8 +61,9 @@ impl VmmConfig {
     }
 }
 
-/// The network process for one sandbox. One descriptor follows: the host
-/// end of the frame socket the VM sends Ethernet on.
+/// The network process for one sandbox. Descriptors follow: the host end
+/// of the frame socket the VM sends Ethernet on, then, when `asks` says so,
+/// the socket netd asks the node for provided values on.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetdConfig {
     pub dns_resolver: Ipv4Addr,
@@ -78,18 +79,80 @@ pub struct NetdConfig {
     /// The name of the sandbox, on each line of its egress log.
     #[serde(default)]
     pub sandbox: String,
+    #[serde(default)]
+    pub asks: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+impl NetdConfig {
+    pub fn fd_count(&self) -> usize {
+        1 + self.asks as usize
+    }
+}
+
+/// A secret with its value, or one netd asks the node for (`provided`).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Secret {
-    pub value: String,
+    #[serde(default)]
+    pub value: Option<String>,
     pub hosts: Vec<String>,
+    #[serde(default)]
+    pub provided: bool,
+    #[serde(default, rename = "in")]
+    pub scope: shuru_proxy::Scope,
+}
+
+impl Secret {
+    pub fn valued(value: String, hosts: Vec<String>, scope: shuru_proxy::Scope) -> Secret {
+        Secret {
+            value: Some(value),
+            hosts,
+            provided: false,
+            scope,
+        }
+    }
+}
+
+/// From netd to the node, on the asks socket: the value of a provided
+/// secret.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Ask {
+    pub ask: u64,
+    pub secret: String,
+}
+
+/// The answer to an `Ask`: a value and how long it lives, or why there is
+/// none. `refused` says the provider will not give this sandbox the secret,
+/// rather than that it failed.
+#[derive(Serialize, Deserialize)]
+pub struct Answer {
+    pub ask: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refused: bool,
+}
+
+impl std::fmt::Debug for Answer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Answer")
+            .field("ask", &self.ask)
+            .field("expires_in_ms", &self.expires_in_ms)
+            .field("error", &self.error)
+            .field("refused", &self.refused)
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Secret")
             .field("hosts", &self.hosts)
+            .field("provided", &self.provided)
+            .field("scope", &self.scope)
             .finish_non_exhaustive()
     }
 }
@@ -115,6 +178,10 @@ pub enum Request {
     Flows,
     /// The bytes the guest sent out, for netd.
     Egress,
+    /// Replace the secrets of the running guest, for netd.
+    UpdateSecrets {
+        secrets: HashMap<String, Secret>,
+    },
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -136,6 +203,11 @@ pub enum Response {
     /// In all, since netd started.
     Egress {
         bytes: u64,
+    },
+    /// The secrets are in place, but for `pending`, which the guest has no
+    /// placeholder for and which wait for the next boot.
+    Updated {
+        pending: Vec<String>,
     },
     Error {
         message: String,

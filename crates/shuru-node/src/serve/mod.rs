@@ -11,6 +11,7 @@ mod http;
 mod hub;
 mod idle;
 mod ports;
+mod provider;
 mod sandboxes;
 mod url;
 mod ws;
@@ -73,6 +74,10 @@ pub struct ServeArgs {
     /// Roots for checking the hosts secrets are sent to.
     #[arg(long, default_value = "/etc/ssl/certs/ca-certificates.crt")]
     ca_bundle: PathBuf,
+    /// The unix socket of a provider that answers for the values of
+    /// provided secrets. Without it, sandboxes may not have any.
+    #[arg(long)]
+    secret_provider: Option<PathBuf>,
     /// The first slot sandboxes run in, as `run --slot` picks one.
     #[arg(long, default_value_t = 1000)]
     first_slot: u32,

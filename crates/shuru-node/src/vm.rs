@@ -215,6 +215,18 @@ pub fn egress(control: &UnixStream) -> Result<u64> {
     }
 }
 
+/// Gives a running netd new secrets. Returns the names it keeps for the
+/// next boot, since the guest has no placeholder for them.
+pub fn update_secrets(
+    control: &UnixStream,
+    secrets: HashMap<String, Secret>,
+) -> Result<Vec<String>> {
+    match ask_netd(control, &Request::UpdateSecrets { secrets })? {
+        Response::Updated { pending } => Ok(pending),
+        response => bail!("shuru-netd answered {response:?}"),
+    }
+}
+
 fn ask_netd(control: &UnixStream, request: &Request) -> Result<Response> {
     control.set_read_timeout(Some(NETD_TIMEOUT))?;
     control::send(control, request, &[])?;
@@ -306,7 +318,10 @@ fn secret(spec: &str) -> Result<(String, Secret)> {
     let value =
         std::env::var(name).with_context(|| format!("--secret {spec}: ${name} is not set"))?;
     let hosts = hosts.split(',').map(str::to_string).collect();
-    Ok((name.to_string(), Secret { value, hosts }))
+    Ok((
+        name.to_string(),
+        Secret::valued(value, hosts, shuru_proxy::Scope::Head),
+    ))
 }
 
 /// What the guest may reach and which secrets it is given, kept with a
@@ -324,6 +339,9 @@ pub struct Network {
     pub vm_end: OwnedFd,
     pub mac: [u8; 6],
     pub session: shuru_proxy::Session,
+    /// Where netd asks for the values of provided secrets, when it has
+    /// any. Whoever holds it answers.
+    pub asks: Option<UnixStream>,
 }
 
 /// Configures `netd` with the secrets of the policy and those `given`
@@ -362,6 +380,10 @@ pub fn start_network(
             (None, mac)
         }
     };
+    let asks = match secrets.values().any(|secret| secret.provided) {
+        true => Some(UnixStream::pair()?),
+        false => None,
+    };
     let config = NetdConfig {
         dns_resolver: policy.dns,
         allow: policy.allow.clone(),
@@ -369,9 +391,14 @@ pub fn start_network(
         upstream_roots,
         session,
         sandbox: sandbox.to_owned(),
+        asks: asks.is_some(),
     };
+    let mut fds = vec![host_end.as_raw_fd()];
+    if let Some((_, netd_end)) = &asks {
+        fds.push(netd_end.as_raw_fd());
+    }
     let response = netd
-        .configure(&Request::ConfigureNetwork(config), &[host_end.as_raw_fd()])
+        .configure(&Request::ConfigureNetwork(config), &fds)
         .context("shuru-netd failed")?;
     let Response::Network { session } = response else {
         bail!("shuru-netd answered {response:?}");
@@ -381,6 +408,7 @@ pub fn start_network(
         vm_end,
         mac,
         session,
+        asks: asks.map(|(node_end, _)| node_end),
     })
 }
 

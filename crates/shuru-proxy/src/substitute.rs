@@ -15,7 +15,20 @@
 //! so the request smuggling exposure of a rewriting proxy does not arise.
 //! Anything ambiguous degrades to a plain byte tunnel.
 //!
-//! See docs/rfcs/0002-refreshable-secrets.md.
+//! A placeholder inside an `Authorization: Basic` token is swapped too, after
+//! decoding it, under the same rule. A secret scoped to authorization is
+//! swapped in the value of an `Authorization` header only.
+//!
+//! See docs/rfcs/0002-refreshable-secrets.md and 0013-live-secrets.md.
+
+use base64::alphabet;
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+use base64::Engine;
+
+use crate::config::Scope;
+use crate::secrets::Substitution;
+
+type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// Cap on a single request head. A head larger than this is tunnelled rather
 /// than buffered without bound.
@@ -87,48 +100,81 @@ enum Framing {
 
 /// Substitutes secrets into request heads on a guest to upstream stream.
 pub(crate) struct RequestStream {
-    /// Placeholder to real value, both as raw bytes.
-    pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Placeholder to real value, both as raw bytes, swapped anywhere in a
+    /// head.
+    pairs: Pairs,
+    /// The same, swapped only in the value of an `Authorization` header.
+    authorization: Pairs,
     state: State,
     head: Vec<u8>,
+    /// A complete head not yet rewritten, waiting for `release_head`.
+    held: Option<Vec<u8>>,
 }
 
 impl RequestStream {
-    pub(crate) fn new(substitutions: Vec<(String, String)>) -> Self {
+    pub(crate) fn new(substitutions: Vec<Substitution>) -> Self {
+        let (pairs, authorization) = Self::split(substitutions);
         Self {
-            pairs: Self::to_pairs(substitutions),
+            pairs,
+            authorization,
             state: State::Head,
             head: Vec::new(),
+            held: None,
         }
     }
 
-    fn to_pairs(substitutions: Vec<(String, String)>) -> Vec<(Vec<u8>, Vec<u8>)> {
-        substitutions
-            .into_iter()
-            .map(|(placeholder, value)| (placeholder.into_bytes(), value.into_bytes()))
-            .collect()
+    fn split(substitutions: Vec<Substitution>) -> (Pairs, Pairs) {
+        let mut head = Vec::new();
+        let mut authorization = Vec::new();
+        for s in substitutions {
+            let pair = (s.placeholder.into_bytes(), s.value.into_bytes());
+            match s.scope {
+                Scope::Head => head.push(pair),
+                Scope::Authorization => authorization.push(pair),
+            }
+        }
+        (head, authorization)
     }
 
-    /// Swap in freshly resolved values, applied from the next head onwards.
-    pub(crate) fn update(&mut self, substitutions: Vec<(String, String)>) {
-        self.pairs = Self::to_pairs(substitutions);
+    /// Swap in freshly resolved values, applied from the next head rewritten.
+    pub(crate) fn update(&mut self, substitutions: Vec<Substitution>) {
+        (self.pairs, self.authorization) = Self::split(substitutions);
     }
 
-    /// True once this connection has stopped interpreting HTTP, so the caller
-    /// can skip work it no longer needs to do.
-    pub(crate) fn is_tunnel(&self) -> bool {
+    #[cfg(test)]
+    fn is_tunnel(&self) -> bool {
         matches!(self.state, State::Tunnel)
     }
 
-    /// Consume a chunk of guest bytes, returning what to forward upstream.
+    /// Consume a chunk of guest bytes, returning what to forward upstream,
+    /// with every head rewritten with the values it has now.
     ///
     /// Returns fewer bytes than it was given only while a head is incomplete,
     /// which is precisely when the request is unfinished.
-    pub(crate) fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+    #[cfg(test)]
+    pub(crate) fn push(&mut self, mut chunk: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let (forward, taken) = self.advance(chunk);
+            out.extend_from_slice(&forward);
+            chunk = &chunk[taken..];
+            if !self.has_head() {
+                return out;
+            }
+            out.extend_from_slice(&self.release_head());
+        }
+    }
+
+    /// Consume guest bytes up to the end of the next request head, returning
+    /// what to forward upstream and how many bytes were taken. A head that
+    /// completes is held until `release_head`, so the caller can resolve
+    /// secrets right before it is rewritten. Without one held, every byte
+    /// was taken.
+    pub(crate) fn advance(&mut self, chunk: &[u8]) -> (Vec<u8>, usize) {
         let mut out = Vec::with_capacity(chunk.len());
         let mut pos = 0;
 
-        while pos < chunk.len() {
+        while pos < chunk.len() && self.held.is_none() {
             match &mut self.state {
                 State::Tunnel => {
                     out.extend_from_slice(&chunk[pos..]);
@@ -151,9 +197,7 @@ impl RequestStream {
                         Some(end) => {
                             self.head.extend_from_slice(&rest[..end]);
                             pos += end;
-                            let head = std::mem::take(&mut self.head);
-                            let rewritten = self.finish_head(head);
-                            out.extend_from_slice(&rewritten);
+                            self.held = Some(std::mem::take(&mut self.head));
                         }
                         None => {
                             self.head.extend_from_slice(rest);
@@ -170,7 +214,20 @@ impl RequestStream {
             }
         }
 
-        out
+        (out, pos)
+    }
+
+    /// Whether a complete head waits for `release_head`.
+    pub(crate) fn has_head(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// The held head, rewritten with the values the stream has now.
+    pub(crate) fn release_head(&mut self) -> Vec<u8> {
+        match self.held.take() {
+            Some(head) => self.finish_head(head),
+            None => Vec::new(),
+        }
     }
 
     /// Anything still held when the guest stops sending. A partial head here
@@ -194,8 +251,101 @@ impl RequestStream {
         for (from, to) in &self.pairs {
             out = replace_bytes(&out, from, to);
         }
-        out
+        if self.pairs.is_empty() && self.authorization.is_empty() {
+            return out;
+        }
+        substitute_authorization(&out, &self.authorization, &self.pairs).unwrap_or(out)
     }
+}
+
+/// Base64 as Basic credentials carry it, with or without padding.
+const BASIC: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::STANDARD,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
+
+/// The head with the authorization scoped pairs swapped in every
+/// `Authorization` value, and every pair inside each `Basic` token, or None
+/// when nothing changed. Git sends `user:token` as Basic, encoded, so a
+/// placeholder there never matches as it stands.
+fn substitute_authorization(head: &[u8], authorization: &Pairs, pairs: &Pairs) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(head.len());
+    let mut changed = false;
+    let mut rest = head;
+    while !rest.is_empty() {
+        let end = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map_or(rest.len(), |i| i + 2);
+        let (line, next) = rest.split_at(end);
+        match authorization_line(line, authorization, pairs) {
+            Some(rewritten) => {
+                out.extend_from_slice(&rewritten);
+                changed = true;
+            }
+            None => out.extend_from_slice(line),
+        }
+        rest = next;
+    }
+    changed.then_some(out)
+}
+
+/// One header line rewritten, when it is `Authorization` and a placeholder
+/// in its value, or in its decoded Basic token, was swapped.
+fn authorization_line(line: &[u8], authorization: &Pairs, pairs: &Pairs) -> Option<Vec<u8>> {
+    let colon = line.iter().position(|b| *b == b':')?;
+    if !line[..colon].eq_ignore_ascii_case(b"authorization") {
+        return None;
+    }
+    let given = &line[colon + 1..];
+    let mut value = given.to_vec();
+    for (from, to) in authorization {
+        value = replace_bytes(&value, from, to);
+    }
+    if let Some(swapped) = basic(&value, authorization.iter().chain(pairs)) {
+        value = swapped;
+    }
+    if value == given {
+        return None;
+    }
+    let mut out = line[..colon + 1].to_vec();
+    out.extend_from_slice(&value);
+    Some(out)
+}
+
+/// A `Basic` value with every pair swapped inside its decoded token, or None
+/// when it is not Basic or held no placeholder.
+fn basic<'a>(value: &[u8], pairs: impl Iterator<Item = &'a (Vec<u8>, Vec<u8>)>) -> Option<Vec<u8>> {
+    let start = value.iter().position(|b| !matches!(b, b' ' | b'\t'))?;
+    let scheme = value[start..].get(..6)?;
+    if !scheme[..5].eq_ignore_ascii_case(b"basic") || !matches!(scheme[5], b' ' | b'\t') {
+        return None;
+    }
+    let token_start = start
+        + 5
+        + value[start + 5..]
+            .iter()
+            .position(|b| !matches!(b, b' ' | b'\t'))?;
+    let token_end = value
+        .iter()
+        .rposition(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))?
+        + 1;
+    if token_end <= token_start {
+        return None;
+    }
+    let decoded = BASIC.decode(&value[token_start..token_end]).ok()?;
+    let mut swapped = decoded.clone();
+    for (from, to) in pairs {
+        swapped = replace_bytes(&swapped, from, to);
+    }
+    if swapped == decoded {
+        return None;
+    }
+    let mut out = Vec::with_capacity(value.len() + 64);
+    out.extend_from_slice(&value[..token_start]);
+    out.extend_from_slice(BASIC.encode(&swapped).as_bytes());
+    out.extend_from_slice(&value[token_end..]);
+    Some(out)
 }
 
 impl Body {
@@ -390,8 +540,24 @@ mod tests {
     const PLACEHOLDER: &str = "shuru_tok_abc123";
     const SECRET: &str = "sk-a-much-longer-real-secret-value";
 
+    fn substitution(placeholder: &str, value: &str, scope: Scope) -> Substitution {
+        Substitution {
+            placeholder: placeholder.to_string(),
+            value: value.to_string(),
+            scope,
+        }
+    }
+
     fn stream() -> RequestStream {
-        RequestStream::new(vec![(PLACEHOLDER.to_string(), SECRET.to_string())])
+        RequestStream::new(vec![substitution(PLACEHOLDER, SECRET, Scope::Head)])
+    }
+
+    fn scoped() -> RequestStream {
+        RequestStream::new(vec![substitution(
+            PLACEHOLDER,
+            SECRET,
+            Scope::Authorization,
+        )])
     }
 
     /// Feed `input` in slices of `size`, returning everything forwarded.
@@ -591,7 +757,11 @@ mod tests {
         let out = String::from_utf8(s.push(get_request().as_bytes())).unwrap();
         assert!(out.contains(SECRET));
 
-        s.update(vec![(PLACEHOLDER.to_string(), "rotated-value".to_string())]);
+        s.update(vec![substitution(
+            PLACEHOLDER,
+            "rotated-value",
+            Scope::Head,
+        )]);
         let out = String::from_utf8(s.push(get_request().as_bytes())).unwrap();
         assert!(out.contains("rotated-value"));
     }
@@ -601,6 +771,224 @@ mod tests {
         let mut s = RequestStream::new(Vec::new());
         let req = get_request();
         assert_eq!(feed(&mut s, req.as_bytes(), 5), req.as_bytes());
+    }
+
+    fn basic(credentials: &str) -> String {
+        BASIC.encode(credentials)
+    }
+
+    #[test]
+    fn substitutes_inside_basic_credentials() {
+        let req = format!(
+            "GET /o/r.git/info/refs HTTP/1.1\r\nHost: github.com\r\nAuthorization: Basic {}\r\nAccept: */*\r\n\r\n",
+            basic(&format!("x-access-token:{PLACEHOLDER}"))
+        );
+        let expected = req.replace(
+            &basic(&format!("x-access-token:{PLACEHOLDER}")),
+            &basic(&format!("x-access-token:{SECRET}")),
+        );
+        for size in [1, 5, 64, 4096] {
+            let mut s = stream();
+            let mut out = feed(&mut s, req.as_bytes(), size);
+            out.extend(s.take_pending());
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                expected,
+                "chunk size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn basic_scheme_and_header_name_are_read_without_case() {
+        let token = basic(&format!("u:{PLACEHOLDER}"));
+        let req = format!("GET / HTTP/1.1\r\nHost: h\r\nauthorization:  bAsIc   {token}  \r\n\r\n");
+        let out = String::from_utf8(stream().push(req.as_bytes())).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "GET / HTTP/1.1\r\nHost: h\r\nauthorization:  bAsIc   {}  \r\n\r\n",
+                basic(&format!("u:{SECRET}"))
+            )
+        );
+    }
+
+    #[test]
+    fn basic_without_padding_is_decoded() {
+        let token = basic(&format!("ab:{PLACEHOLDER}"));
+        let unpadded = token.trim_end_matches('=');
+        assert_ne!(token, unpadded, "the test wants a token that pads");
+        let req = format!("GET / HTTP/1.1\r\nHost: h\r\nAuthorization: Basic {unpadded}\r\n\r\n");
+        let out = String::from_utf8(stream().push(req.as_bytes())).unwrap();
+        assert!(out.contains(&basic(&format!("ab:{SECRET}"))));
+    }
+
+    #[test]
+    fn basic_without_a_placeholder_or_not_base64_is_left_alone() {
+        for value in [
+            format!("Basic {}", basic("user:password")),
+            "Basic not*base64!".to_string(),
+            "Basic".to_string(),
+            "Basic ".to_string(),
+            format!("Bearer {}", basic(&format!("u:{PLACEHOLDER}"))),
+            format!("Basicx {}", basic(&format!("u:{PLACEHOLDER}"))),
+        ] {
+            let req = format!("GET / HTTP/1.1\r\nHost: h\r\nAuthorization: {value}\r\n\r\n");
+            let out = stream().push(req.as_bytes());
+            assert_eq!(out, req.as_bytes(), "{value} was changed");
+        }
+    }
+
+    #[test]
+    fn basic_only_in_authorization() {
+        let token = basic(&format!("u:{PLACEHOLDER}"));
+        let req = format!("GET / HTTP/1.1\r\nHost: h\r\nX-Note: Basic {token}\r\nProxy-Authorization: Basic {token}\r\n\r\n");
+        let out = stream().push(req.as_bytes());
+        assert_eq!(out, req.as_bytes());
+    }
+
+    #[test]
+    fn basic_is_not_substituted_without_a_secret_for_the_host() {
+        let token = basic(&format!("u:{PLACEHOLDER}"));
+        let req = format!("GET / HTTP/1.1\r\nHost: h\r\nAuthorization: Basic {token}\r\n\r\n");
+        let out = RequestStream::new(Vec::new()).push(req.as_bytes());
+        assert_eq!(out, req.as_bytes());
+    }
+
+    #[test]
+    fn basic_in_a_body_is_left_alone() {
+        let body = format!(
+            "Authorization: Basic {}",
+            basic(&format!("u:{PLACEHOLDER}"))
+        );
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let out = feed(&mut stream(), req.as_bytes(), 9);
+        assert_eq!(out, req.as_bytes());
+    }
+
+    #[test]
+    fn scoped_secrets_are_swapped_in_authorization_only() {
+        let token = basic(&format!("x-access-token:{PLACEHOLDER}"));
+        for (given, wanted) in [
+            (
+                format!("Authorization: token {PLACEHOLDER}"),
+                format!("Authorization: token {SECRET}"),
+            ),
+            (
+                format!("authorization: Bearer {PLACEHOLDER}"),
+                format!("authorization: Bearer {SECRET}"),
+            ),
+            (
+                format!("Authorization: Basic {token}"),
+                format!(
+                    "Authorization: Basic {}",
+                    basic(&format!("x-access-token:{SECRET}"))
+                ),
+            ),
+        ] {
+            let req = format!("GET / HTTP/1.1\r\nHost: h\r\n{given}\r\n\r\n");
+            let out = String::from_utf8(scoped().push(req.as_bytes())).unwrap();
+            assert_eq!(
+                out,
+                format!("GET / HTTP/1.1\r\nHost: h\r\n{wanted}\r\n\r\n")
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_secrets_are_not_swapped_where_a_host_would_keep_them() {
+        let req = format!(
+            "PUT /repos/o/r/contents/{PLACEHOLDER} HTTP/1.1\r\nHost: api.github.com\r\nX-Title: {PLACEHOLDER}\r\nX-Authorization: {PLACEHOLDER}\r\nContent-Length: 0\r\n\r\n"
+        );
+        let out = scoped().push(req.as_bytes());
+        assert_eq!(out, req.as_bytes());
+    }
+
+    #[test]
+    fn both_scopes_on_one_connection() {
+        let other = "shuru_tok_other";
+        let mut s = RequestStream::new(vec![
+            substitution(PLACEHOLDER, SECRET, Scope::Authorization),
+            substitution(other, "head-value", Scope::Head),
+        ]);
+        let req = format!(
+            "GET /x?k={other}&t={PLACEHOLDER} HTTP/1.1\r\nHost: h\r\nAuthorization: Bearer {PLACEHOLDER}\r\n\r\n"
+        );
+        let out = String::from_utf8(s.push(req.as_bytes())).unwrap();
+        assert_eq!(
+            out,
+            format!("GET /x?k=head-value&t={PLACEHOLDER} HTTP/1.1\r\nHost: h\r\nAuthorization: Bearer {SECRET}\r\n\r\n")
+        );
+    }
+
+    /// Feeds `input` as the relay does, calling `before_head` before each
+    /// head is rewritten.
+    fn relay(
+        s: &mut RequestStream,
+        mut input: &[u8],
+        mut before_head: impl FnMut(&mut RequestStream),
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let (forward, taken) = s.advance(input);
+            out.extend_from_slice(&forward);
+            input = &input[taken..];
+            if !s.has_head() {
+                return out;
+            }
+            before_head(s);
+            out.extend_from_slice(&s.release_head());
+        }
+    }
+
+    #[test]
+    fn a_head_is_held_until_released() {
+        let mut s = stream();
+        let req = get_request();
+        let (out, taken) = s.advance(req.as_bytes());
+        assert!(out.is_empty());
+        assert_eq!(taken, req.len());
+        assert!(s.has_head());
+        let out = String::from_utf8(s.release_head()).unwrap();
+        assert!(out.contains(SECRET));
+        assert!(!s.has_head());
+    }
+
+    #[test]
+    fn a_head_finished_after_a_removal_is_not_substituted() {
+        let mut s = stream();
+        let req = get_request();
+        let (first, rest) = req.split_at(10);
+        assert!(relay(&mut s, first.as_bytes(), |_| unreachable!()).is_empty());
+        let out = relay(&mut s, rest.as_bytes(), |s| s.update(Vec::new()));
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains(SECRET));
+        assert!(out.contains(PLACEHOLDER));
+    }
+
+    #[test]
+    fn heads_after_a_body_in_one_read_are_each_resolved() {
+        let mut s = stream();
+        let first = relay(
+            &mut s,
+            b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\nab",
+            |_| {},
+        );
+        assert!(!String::from_utf8(first).unwrap().contains(PLACEHOLDER));
+        let tail = format!("cd{}{}", get_request(), get_request());
+        let mut resolves = 0;
+        let out = relay(&mut s, tail.as_bytes(), |s| {
+            resolves += 1;
+            s.update(Vec::new());
+        });
+        assert_eq!(resolves, 2);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.starts_with("cd"));
+        assert!(!out.contains(SECRET));
+        assert_eq!(out.matches(PLACEHOLDER).count(), 2);
     }
 
     #[test]

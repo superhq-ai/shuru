@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// A host port exposed to the guest via host.shuru.internal.
@@ -66,6 +69,8 @@ pub struct ProxyConfig {
     /// PEM roots for verifying upstream servers when relaying secrets.
     /// None reads the system store from disk.
     pub upstream_roots: Option<Vec<u8>>,
+    /// Where the values of provided secrets come from.
+    pub provider: Option<Arc<dyn SecretProvider>>,
 }
 
 impl Default for ProxyConfig {
@@ -82,15 +87,46 @@ impl Default for ProxyConfig {
             egress_rate: None,
             egress_log: None,
             upstream_roots: None,
+            provider: None,
         }
     }
+}
+
+/// Mints the values of provided secrets, asked by name whenever the
+/// cached value is missing or near its expiry.
+pub trait SecretProvider: std::fmt::Debug + Send + Sync {
+    fn provide<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Provided>> + Send + 'a>>;
+}
+
+/// A provider saying the secret may not be had, as opposed to failing to
+/// answer. The cached value goes at once.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// A value a provider minted. No Debug, so it cannot reach a log.
+pub struct Provided {
+    pub value: String,
+    /// None keeps the value for the run.
+    pub expires_in: Option<Duration>,
 }
 
 /// A secret that the proxy injects into HTTP requests.
 ///
 /// The value comes from exactly one source: a host environment variable
-/// (`from`), a command that mints it (`command`), or a literal (`value`).
-#[derive(Debug, Clone, Default)]
+/// (`from`), a command that mints it (`command`), a literal (`value`), or
+/// the provider of the proxy (`provided`).
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SecretConfig {
     /// Host environment variable to read the real value from.
     pub from: Option<String>,
@@ -104,6 +140,23 @@ pub struct SecretConfig {
     pub hosts: Vec<String>,
     /// If set, use this value directly instead of reading from the host env var.
     pub value: Option<String>,
+    /// Asked of `ProxyConfig::provider`, and kept until near its expiry.
+    pub provided: bool,
+    /// Where in a request head the placeholder is swapped.
+    pub scope: Scope,
+}
+
+/// Where in a request head a secret is swapped in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    /// The request line and every header.
+    #[default]
+    Head,
+    /// The value of an `Authorization` header only, Basic included. A host
+    /// does not keep that header, so the guest cannot make it store the
+    /// value and read it back.
+    Authorization,
 }
 
 impl SecretConfig {
@@ -120,6 +173,15 @@ impl SecretConfig {
     pub fn from_command(command: Vec<String>, hosts: Vec<String>) -> Self {
         Self {
             command: Some(command),
+            hosts,
+            ..Default::default()
+        }
+    }
+
+    /// Secret asked of the provider of the proxy.
+    pub fn from_provider(hosts: Vec<String>) -> Self {
+        Self {
+            provided: true,
             hosts,
             ..Default::default()
         }

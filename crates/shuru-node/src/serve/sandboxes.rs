@@ -25,6 +25,7 @@ use super::guest;
 use super::http::ApiError;
 use super::hub::Hubs;
 use super::idle::{Activity, Busy};
+use super::provider::{self, Provider};
 use super::ServeArgs;
 use crate::vm::{self, Host, KernelBoot, NetworkPolicy, Vm};
 use shuru_node::cgroup;
@@ -103,6 +104,14 @@ pub struct GuestAddr {
 /// The control connection of a netd. One request at a time: whoever
 /// holds it reads the answer to their own.
 type Netd = Arc<Mutex<UnixStream>>;
+
+/// What the VM thread hands over once the guest is up: where it answers,
+/// its netd, and where that netd asks for provided values.
+struct Booted {
+    guest: GuestAddr,
+    netd: Option<Netd>,
+    asks: Option<UnixStream>,
+}
 
 struct Running {
     guest: GuestAddr,
@@ -289,6 +298,7 @@ struct Config {
     min_free_memory: u64,
     network: Option<NetworkPolicy>,
     ca_bundle: PathBuf,
+    provider: Option<Arc<Provider>>,
     verbose: bool,
 }
 
@@ -391,6 +401,10 @@ impl Node {
                     dns: args.dns,
                 }),
                 ca_bundle: args.ca_bundle.clone(),
+                provider: args
+                    .secret_provider
+                    .clone()
+                    .map(|socket| Arc::new(Provider::new(socket))),
                 verbose: args.verbose,
             },
             host,
@@ -518,11 +532,17 @@ impl Node {
             .map_err(|e| ApiError::internal(format!("{e}")))?
     }
 
-    /// Secrets reach a guest only through the proxy of its network.
+    /// Secrets reach a guest only through the proxy of its network, and
+    /// provided ones only from a provider.
     fn check_config(&self, config: &SandboxConfig) -> Result<(), ApiError> {
         if !config.secrets.is_empty() && self.config.network.is_none() {
             return Err(ApiError::bad_request(
                 "secrets: this host gives sandboxes no network (--allow-net)",
+            ));
+        }
+        if config.has_provided() && self.config.provider.is_none() {
+            return Err(ApiError::bad_request(
+                "secrets: this host has no provider for provided secrets (--secret-provider)",
             ));
         }
         Ok(())
@@ -687,9 +707,11 @@ impl Node {
         .map_err(|e| ApiError::internal(format!("{e}")))?
     }
 
-    /// Replaces the env and secrets of the sandbox. Env reaches the next
-    /// exec; secrets reach the next boot, since netd holds them for the
-    /// run.
+    /// Replaces the env and secrets of the sandbox, unless the config kept
+    /// has a higher version. Env reaches the next exec. Secrets reach the
+    /// netd of a running sandbox at once, but for new names, which wait for
+    /// the next boot; the config is saved first, so a netd that fails to
+    /// take them fails the call and leaves the next boot right.
     pub async fn configure(
         self: &Arc<Self>,
         name: &str,
@@ -700,9 +722,17 @@ impl Node {
         let entry = self.get(name)?;
         tokio::spawn(async move {
             let _op = op;
-            // Held so the sandbox directory is in place and stays.
-            let _vm = entry.vm.lock().await;
+            // Held so the sandbox directory is in place and stays, and the VM
+            // does not boot or stop meanwhile.
+            let vm = entry.vm.lock().await;
             present(&entry)?;
+            let mut config = config;
+            let kept = entry.config().version;
+            match (config.version, kept) {
+                (Some(version), Some(kept)) if version < kept => return Ok(()),
+                (None, kept) => config.version = kept,
+                _ => {}
+            }
             let config = Arc::new(config);
             let saved = {
                 let dir = entry.dir.clone();
@@ -712,8 +742,34 @@ impl Node {
                     .map_err(|e| ApiError::internal(format!("{e}")))?
             };
             saved.map_err(|e| ApiError::internal(format!("saving the config: {e:#}")))?;
-            *entry.config.lock().unwrap_or_else(|e| e.into_inner()) = config;
-            Ok(())
+            *entry.config.lock().unwrap_or_else(|e| e.into_inner()) = config.clone();
+            let Some(netd) = vm
+                .as_ref()
+                .filter(|running| running.alive.load(Ordering::Acquire))
+                .and_then(|running| running.netd.clone())
+            else {
+                return Ok(());
+            };
+            let secrets = config.netd_secrets();
+            let updated = tokio::task::spawn_blocking(move || {
+                let netd = netd.lock().unwrap_or_else(|e| e.into_inner());
+                vm::update_secrets(&netd, secrets)
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("{e}")))?;
+            match updated {
+                Ok(pending) if pending.is_empty() => Ok(()),
+                Ok(pending) => {
+                    eprintln!(
+                        "shuru-node: sandbox {}: secrets {pending:?} wait for the next boot",
+                        entry.record.name
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(ApiError::internal(format!(
+                    "the config is saved, but netd did not take the secrets: {e:#}"
+                ))),
+            }
         })
         .await
         .map_err(|e| ApiError::internal(format!("{e}")))?
@@ -912,7 +968,7 @@ impl Node {
                 return Err(ApiError::internal(format!("starting the VM thread: {e}")));
             }
         };
-        let (guest, netd) = match ready_rx.await {
+        let Booted { guest, netd, asks } = match ready_rx.await {
             Ok(Ok(booted)) => booted,
             Ok(Err(e)) => {
                 let _ = tokio::task::spawn_blocking(move || thread.join()).await;
@@ -923,6 +979,14 @@ impl Node {
             }
             Err(_) => return Err(ApiError::internal("the VM thread ended")),
         };
+        if let (Some(asks), Some(provider)) = (asks, &self.config.provider) {
+            if let Err(e) = provider::answer_asks(provider.clone(), asks, entry.clone()) {
+                eprintln!(
+                    "shuru-node: answering the asks of sandbox {}: {e}",
+                    entry.record.name
+                );
+            }
+        }
         entry.last_running_at.store(unix_now(), Ordering::Relaxed);
         entry.activity.restart();
         *vm = Some(Running {
@@ -947,11 +1011,11 @@ impl Node {
         slot: u32,
         boot: u64,
         alive: Arc<AtomicBool>,
-        ready: tokio::sync::oneshot::Sender<Result<(GuestAddr, Option<Netd>)>>,
+        ready: tokio::sync::oneshot::Sender<Result<Booted>>,
         stop: mpsc::Receiver<bool>,
     ) {
         let name = &entry.record.name;
-        let vm = match self.boot(entry, slot) {
+        let mut vm = match self.boot(entry, slot) {
             Ok(vm) => vm,
             Err(e) => {
                 self.release(slot);
@@ -980,8 +1044,14 @@ impl Node {
                 .map_err(|e| eprintln!("shuru-node: the netd of sandbox {name}: {e}"))
                 .ok()
         });
+        let asks = vm.network.as_mut().and_then(|network| network.asks.take());
         alive.store(true, Ordering::Release);
-        let graceful = if ready.send(Ok((guest, netd.clone()))).is_err() {
+        let booted = Booted {
+            guest,
+            netd: netd.clone(),
+            asks,
+        };
+        let graceful = if ready.send(Ok(booted)).is_err() {
             false
         } else {
             loop {
@@ -1628,7 +1698,12 @@ mod tests {
         assert_eq!(fs::read(dir.join(DISK)).unwrap(), b"stored");
         assert_eq!(read_record(&dir).unwrap().last_boot, 0);
         assert_private(&dir.join(config::CONFIG));
-        assert_eq!(config::read(&dir).unwrap().secrets["TOKEN"].value, "s3cret");
+        assert_eq!(
+            config::read(&dir).unwrap().secrets["TOKEN"]
+                .value
+                .as_deref(),
+            Some("s3cret")
+        );
 
         // The directory exists already, so the make fails at its last step.
         fs::write(&imported, b"again").unwrap();
@@ -1679,6 +1754,7 @@ mod tests {
             Some(serde_json::json!({
                 "TOKEN": { "value": "s3cret", "hosts": ["api.example.com"] }
             })),
+            None,
         )
         .unwrap()
     }

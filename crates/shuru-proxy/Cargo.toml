@@ -24,6 +24,7 @@ tokio-boring = "4"
 simple-dns = "0.9"
 lru = "0.14"
 httparse = "1"
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", features = ["parsing", "formatting"] }
