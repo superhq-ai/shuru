@@ -107,6 +107,8 @@ pub(crate) struct RequestStream {
     authorization: Pairs,
     state: State,
     head: Vec<u8>,
+    /// A complete head not yet rewritten, waiting for `release_head`.
+    held: Option<Vec<u8>>,
 }
 
 impl RequestStream {
@@ -117,6 +119,7 @@ impl RequestStream {
             authorization,
             state: State::Head,
             head: Vec::new(),
+            held: None,
         }
     }
 
@@ -133,7 +136,7 @@ impl RequestStream {
         (head, authorization)
     }
 
-    /// Swap in freshly resolved values, applied from the next head onwards.
+    /// Swap in freshly resolved values, applied from the next head rewritten.
     pub(crate) fn update(&mut self, substitutions: Vec<Substitution>) {
         (self.pairs, self.authorization) = Self::split(substitutions);
     }
@@ -143,21 +146,35 @@ impl RequestStream {
         matches!(self.state, State::Tunnel)
     }
 
-    /// True between requests: no body under way and no head begun, so the
-    /// next bytes start a new request.
-    pub(crate) fn at_request_start(&self) -> bool {
-        matches!(self.state, State::Head) && self.head.is_empty()
-    }
-
-    /// Consume a chunk of guest bytes, returning what to forward upstream.
+    /// Consume a chunk of guest bytes, returning what to forward upstream,
+    /// with every head rewritten with the values it has now.
     ///
     /// Returns fewer bytes than it was given only while a head is incomplete,
     /// which is precisely when the request is unfinished.
-    pub(crate) fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+    #[cfg(test)]
+    pub(crate) fn push(&mut self, mut chunk: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let (forward, taken) = self.advance(chunk);
+            out.extend_from_slice(&forward);
+            chunk = &chunk[taken..];
+            if !self.has_head() {
+                return out;
+            }
+            out.extend_from_slice(&self.release_head());
+        }
+    }
+
+    /// Consume guest bytes up to the end of the next request head, returning
+    /// what to forward upstream and how many bytes were taken. A head that
+    /// completes is held until `release_head`, so the caller can resolve
+    /// secrets right before it is rewritten. Without one held, every byte
+    /// was taken.
+    pub(crate) fn advance(&mut self, chunk: &[u8]) -> (Vec<u8>, usize) {
         let mut out = Vec::with_capacity(chunk.len());
         let mut pos = 0;
 
-        while pos < chunk.len() {
+        while pos < chunk.len() && self.held.is_none() {
             match &mut self.state {
                 State::Tunnel => {
                     out.extend_from_slice(&chunk[pos..]);
@@ -180,9 +197,7 @@ impl RequestStream {
                         Some(end) => {
                             self.head.extend_from_slice(&rest[..end]);
                             pos += end;
-                            let head = std::mem::take(&mut self.head);
-                            let rewritten = self.finish_head(head);
-                            out.extend_from_slice(&rewritten);
+                            self.held = Some(std::mem::take(&mut self.head));
                         }
                         None => {
                             self.head.extend_from_slice(rest);
@@ -199,7 +214,20 @@ impl RequestStream {
             }
         }
 
-        out
+        (out, pos)
+    }
+
+    /// Whether a complete head waits for `release_head`.
+    pub(crate) fn has_head(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// The held head, rewritten with the values the stream has now.
+    pub(crate) fn release_head(&mut self) -> Vec<u8> {
+        match self.held.take() {
+            Some(head) => self.finish_head(head),
+            None => Vec::new(),
+        }
     }
 
     /// Anything still held when the guest stops sending. A partial head here
@@ -896,16 +924,71 @@ mod tests {
         );
     }
 
+    /// Feeds `input` as the relay does, calling `before_head` before each
+    /// head is rewritten.
+    fn relay(
+        s: &mut RequestStream,
+        mut input: &[u8],
+        mut before_head: impl FnMut(&mut RequestStream),
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let (forward, taken) = s.advance(input);
+            out.extend_from_slice(&forward);
+            input = &input[taken..];
+            if !s.has_head() {
+                return out;
+            }
+            before_head(s);
+            out.extend_from_slice(&s.release_head());
+        }
+    }
+
     #[test]
-    fn a_request_starts_only_between_requests() {
+    fn a_head_is_held_until_released() {
         let mut s = stream();
-        assert!(s.at_request_start());
-        s.push(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\nab");
-        assert!(!s.at_request_start(), "inside a body");
-        s.push(b"cd");
-        assert!(s.at_request_start());
-        s.push(b"GET / HT");
-        assert!(!s.at_request_start(), "inside a head");
+        let req = get_request();
+        let (out, taken) = s.advance(req.as_bytes());
+        assert!(out.is_empty());
+        assert_eq!(taken, req.len());
+        assert!(s.has_head());
+        let out = String::from_utf8(s.release_head()).unwrap();
+        assert!(out.contains(SECRET));
+        assert!(!s.has_head());
+    }
+
+    #[test]
+    fn a_head_finished_after_a_removal_is_not_substituted() {
+        let mut s = stream();
+        let req = get_request();
+        let (first, rest) = req.split_at(10);
+        assert!(relay(&mut s, first.as_bytes(), |_| unreachable!()).is_empty());
+        let out = relay(&mut s, rest.as_bytes(), |s| s.update(Vec::new()));
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains(SECRET));
+        assert!(out.contains(PLACEHOLDER));
+    }
+
+    #[test]
+    fn heads_after_a_body_in_one_read_are_each_resolved() {
+        let mut s = stream();
+        let first = relay(
+            &mut s,
+            b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\nab",
+            |_| {},
+        );
+        assert!(!String::from_utf8(first).unwrap().contains(PLACEHOLDER));
+        let tail = format!("cd{}{}", get_request(), get_request());
+        let mut resolves = 0;
+        let out = relay(&mut s, tail.as_bytes(), |s| {
+            resolves += 1;
+            s.update(Vec::new());
+        });
+        assert_eq!(resolves, 2);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.starts_with("cd"));
+        assert!(!out.contains(SECRET));
+        assert_eq!(out.matches(PLACEHOLDER).count(), 2);
     }
 
     #[test]

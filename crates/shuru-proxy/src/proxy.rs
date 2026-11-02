@@ -21,10 +21,6 @@ use crate::substitute::RequestStream;
 use crate::tls::CertificateAuthority;
 use crate::AllowedIps;
 
-/// How often a live relay re-resolves its secrets, so a rotation reaches a
-/// long-lived connection without waiting for it to reconnect.
-const SECRET_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// The async proxy engine.
 ///
 /// Receives events from the smoltcp NetworkStack and proxies TCP connections
@@ -419,9 +415,8 @@ async fn handle_mitm(
     let guest_to_upstream = async move {
         let mut buf = vec![0u8; 65536];
         let mut requests = RequestStream::new(substitutions);
-        let mut last_refresh = std::time::Instant::now();
 
-        loop {
+        'relay: loop {
             match guest_rd.read(&mut buf).await {
                 Ok(0) | Err(_) => {
                     // A head held here belongs to a request the guest
@@ -433,27 +428,33 @@ async fn handle_mitm(
                     break;
                 }
                 Ok(n) => {
-                    // Pick up a rotated or removed secret without waiting for
-                    // the guest to open a new connection, and only between
-                    // requests, so a body is never held up by a fetch. What
-                    // this connection had may include a secret that is gone,
-                    // so a failed resolve ends it.
-                    if requests.at_request_start()
-                        && last_refresh.elapsed() >= SECRET_REFRESH_INTERVAL
-                    {
+                    let mut data = &buf[..n];
+                    loop {
+                        let (out, taken) = requests.advance(data);
+                        data = &data[taken..];
+                        if !out.is_empty() && upstream_wr.write_all(&out).await.is_err() {
+                            break 'relay;
+                        }
+                        if !requests.has_head() {
+                            break;
+                        }
+                        // Resolved right before each head is rewritten, so a
+                        // secret rotated, removed or refused since the last
+                        // request is never swapped in, and never in the middle
+                        // of a body, so an upload is not held up by a fetch.
+                        // What this connection had may include a secret that
+                        // is gone, so a failed resolve ends it.
                         match secrets.substitutions_for_domain(&domain).await {
                             Ok(fresh) => requests.update(fresh),
                             Err(e) => {
                                 warn!("TLS to {domain} closed: {e:#}");
-                                break;
+                                break 'relay;
                             }
                         }
-                        last_refresh = std::time::Instant::now();
-                    }
-
-                    let out = requests.push(&buf[..n]);
-                    if !out.is_empty() && upstream_wr.write_all(&out).await.is_err() {
-                        break;
+                        let head = requests.release_head();
+                        if upstream_wr.write_all(&head).await.is_err() {
+                            break 'relay;
+                        }
                     }
                 }
             }

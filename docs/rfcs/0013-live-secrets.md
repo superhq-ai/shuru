@@ -63,10 +63,11 @@ Netd swaps its table in one step:
   could not take, and serve logs them.
 
 New connections use the new table at once. An open relay resolves its
-substitutions again before the next request head once 5 seconds have
-passed, as in RFC 0002, so a change or a removal reaches it within that.
-It never does so in the middle of a body, so an upload is not held up by
-a fetch. If that resolve fails, the relay closes the connection rather
+substitutions again right before it rewrites each request head, so a
+change or a removal reaches the next request on it, including a head that
+was half sent when the change came or that follows a body in the same
+read. It never does so in the middle of a body, so an upload is not held
+up by a fetch. If that resolve fails, the relay closes the connection rather
 than carry on with what it had, which might include a secret that is
 gone.
 
