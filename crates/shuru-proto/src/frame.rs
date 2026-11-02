@@ -189,6 +189,12 @@ pub const KILL_RESP: u8 = 0x19;
 pub const RESTORE_REQ: u8 = 0x68;
 pub const RESTORE_RESP: u8 = 0x69;
 
+// The env guest services start with (RFC 0004), sent once by the host on
+// its first connection after a boot. Answered with an empty
+// SERVICE_ENV_RESP, or ERROR once the services have started.
+pub const SERVICE_ENV_REQ: u8 = 0x6A;
+pub const SERVICE_ENV_RESP: u8 = 0x6B;
+
 // Exec sessions outlive the connection that started them (RFC 0012).
 // START and ATTACH answer with SESSION_INFO, then STDOUT and STDERR from
 // its output_offset, then EXIT; the connection takes STDIN, STDIN_EOF,

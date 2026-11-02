@@ -77,6 +77,17 @@ impl Exit {
             slot = self.0 .1.wait(slot).unwrap_or_else(|e| e.into_inner());
         }
     }
+
+    /// The wait status, if the child is reaped within `timeout`.
+    pub fn wait_timeout(&self, timeout: Duration) -> Option<libc::c_int> {
+        let slot = self.slot();
+        let (slot, _) = self
+            .0
+             .1
+            .wait_timeout_while(slot, timeout, |status| status.is_none())
+            .unwrap_or_else(|e| e.into_inner());
+        *slot
+    }
 }
 
 /// Starts a child with `start`, which returns its pid, and gives `on_exit`

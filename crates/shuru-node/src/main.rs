@@ -196,11 +196,15 @@ fn run(args: RunArgs) -> Result<i32> {
     )?;
     drop(host);
 
-    let mut env = HashMap::new();
+    let env = vm
+        .network
+        .as_ref()
+        .map(|network| network.session.placeholders.clone())
+        .unwrap_or_default();
+    vm.start_services(&env)?;
     if let Some(network) = &vm.network {
-        if !network.session.placeholders.is_empty() {
+        if !env.is_empty() {
             vm.install_ca(&network.session.ca_cert_pem)?;
-            env = network.session.placeholders.clone();
         }
     }
     let guest = vm.connect()?;

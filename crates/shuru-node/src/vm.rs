@@ -46,6 +46,7 @@ const INSTALL_CA: &str =
     "printf '%s' \"$SHURU_PROXY_CA\" > /usr/local/share/ca-certificates/shuru-proxy.crt \
     && update-ca-certificates --fresh > /dev/null 2>&1";
 const INSTALL_CA_TIMEOUT: Duration = Duration::from_secs(30);
+const SERVICE_ENV_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The sandbox directory: a control socket per jailed process, the vsock
 /// socket, and the empty mount point for their roots. Only root can enter
@@ -624,6 +625,15 @@ impl Vm {
     /// A new guest connection, waiting for the agent to listen.
     pub fn connect(&self) -> Result<UnixStream> {
         connect_guest(&self.dir.vsock(), &self.identity, &self.vmm)
+    }
+
+    /// Starts the guest services with `env` under the env of their files.
+    /// The first thing sent after a boot: commands wait for it.
+    pub fn start_services(&self, env: &HashMap<String, String>) -> Result<()> {
+        let mut guest = self.connect()?;
+        guest.set_read_timeout(Some(SERVICE_ENV_TIMEOUT))?;
+        guest.set_write_timeout(Some(SERVICE_ENV_TIMEOUT))?;
+        shuru_proto::send_service_env(&mut guest, env).context("starting the guest services")
     }
 
     /// Has the guest trust the proxy CA of its session, which the proxy

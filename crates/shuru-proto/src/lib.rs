@@ -140,6 +140,36 @@ pub struct ShutdownResponse {
     pub killed: Vec<String>,
 }
 
+/// SERVICE_ENV_REQ: the env of every guest service, under the env of its
+/// own service file.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServiceEnv {
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+/// Sends `env` as SERVICE_ENV_REQ and waits for the guest to take it.
+pub fn send_service_env(
+    stream: &mut (impl std::io::Read + std::io::Write),
+    env: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    let request = ServiceEnv { env: env.clone() };
+    frame::send_json(stream, frame::SERVICE_ENV_REQ, &request)?;
+    match frame::read_frame(stream)? {
+        Some((frame::SERVICE_ENV_RESP, _)) => Ok(()),
+        Some((frame::ERROR, payload)) => Err(std::io::Error::other(
+            String::from_utf8_lossy(&payload).into_owned(),
+        )),
+        Some((kind, _)) => Err(std::io::Error::other(format!(
+            "the guest answered the service env with frame {kind:#x}"
+        ))),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "the guest closed the connection",
+        )),
+    }
+}
+
 // --- Port forwarding protocol ---
 
 /// A host:guest port mapping for port forwarding over vsock.

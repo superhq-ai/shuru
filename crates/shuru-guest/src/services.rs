@@ -1,7 +1,7 @@
 //! Guest services (RFC 0004): long running processes declared by the image
-//! under /etc/shuru/services/<name>.json. Init starts them at boot, gates
-//! exec requests on their readiness, restarts the ones that ask for it,
-//! and stops them on SHUTDOWN_REQ.
+//! under /etc/shuru/services/<name>.json. Init starts them at boot, once
+//! the host has sent their env, gates exec requests on their readiness,
+//! restarts the ones that ask for it, and stops them on SHUTDOWN_REQ.
 
 use std::collections::HashMap;
 use std::os::unix::process::CommandExt;
@@ -17,6 +17,13 @@ use crate::children::{Exit, Watch};
 const SERVICES_DIR: &str = "/etc/shuru/services";
 const LOG_DIR: &str = "/run/shuru/log";
 const READY_POLL: Duration = Duration::from_millis(250);
+// A service without a ready check is ready once it has run this long, so
+// one that exits at once fails the first commands instead of letting
+// them run.
+const READY_SETTLE: Duration = Duration::from_millis(500);
+// Services start without an env from the host after this: a host that
+// predates SERVICE_ENV_REQ, or none at all.
+const HOST_ENV_WAIT: Duration = Duration::from_secs(5);
 const DEFAULT_READY_TIMEOUT: u64 = 30;
 const DEFAULT_STOP_TIMEOUT: u64 = 15;
 const LOG_TAIL_LINES: usize = 20;
@@ -72,11 +79,14 @@ struct Service {
 
 struct Registry {
     services: Vec<Service>,
+    // Set once by the start of the services; commands wait for it.
+    begun: bool,
     shutting_down: bool,
 }
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     services: Vec::new(),
+    begun: false,
     shutting_down: false,
 });
 static CHANGED: Condvar = Condvar::new();
@@ -190,6 +200,22 @@ fn next_delay(last: Duration, ran: Duration) -> Duration {
     } else {
         (last * 2).min(RESTART_MAX)
     }
+}
+
+/// `spec` with `env` under the env of its own file.
+fn with_env(mut spec: Spec, env: &HashMap<String, String>) -> Spec {
+    let mut merged = env.clone();
+    merged.extend(std::mem::take(&mut spec.env));
+    spec.env = merged;
+    spec
+}
+
+fn declares_services() -> bool {
+    std::fs::read_dir(SERVICES_DIR).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
+    })
 }
 
 fn load_specs() -> Vec<Spec> {
@@ -404,7 +430,9 @@ fn watch_until_ready(spec: Arc<Spec>, exit: Exit) {
         }
         match &spec.ready {
             None => {
-                set_state(&spec.name, State::Ready);
+                if exit.wait_timeout(READY_SETTLE).is_none() {
+                    set_state(&spec.name, State::Ready);
+                }
                 return;
             }
             Some(ready) => {
@@ -435,59 +463,99 @@ fn watch_until_ready(spec: Arc<Spec>, exit: Exit) {
     }
 }
 
-/// Spawn every declared service. Returns the number started.
-pub fn start_all() -> usize {
-    let specs = load_specs();
-    let mut started = 0;
-    for spec in specs {
-        let spec = Arc::new(spec);
-        // Registered before its spawn, so an exit at once is recorded.
+/// Spawns every declared service with `env` under the env of its own
+/// file. Only the first call starts them; a later one is refused, unless
+/// there were none. Returns the number started.
+pub fn start_all(env: &HashMap<String, String>) -> Result<usize, String> {
+    let specs: Vec<Arc<Spec>> = load_specs()
+        .into_iter()
+        .map(|spec| Arc::new(with_env(spec, env)))
+        .collect();
+    let mut watches = Vec::new();
+    let declared = {
+        let mut reg = registry();
+        if reg.begun && reg.services.is_empty() {
+            return Ok(0);
+        }
+        if reg.begun {
+            return Err("services already started without this env".into());
+        }
+        reg.begun = true;
+        if reg.shutting_down {
+            return Ok(0);
+        }
+        // Spawned under the lock, so a shutdown sees every process and an
+        // exit at once is recorded once its service is registered.
         let now = Instant::now();
-        registry().services.push(Service {
-            name: spec.name.clone(),
-            spec: spec.clone(),
-            child: None,
-            exit: Exit::default(),
-            state: State::Starting,
-            stop_timeout: spec.stop_timeout,
-            gate_until: now + spec.ready_timeout,
-            ever_ready: false,
-            started: now,
-            delay: Duration::ZERO,
-        });
-        let (child, exit) = match spawn(&spec) {
-            Ok(started) => started,
-            Err(e) if spec.restart == Restart::Always => {
-                log_line(&format!(
-                    "service {} failed to start: {}, retrying in {}s",
-                    spec.name,
-                    e,
-                    RESTART_FIRST.as_secs()
-                ));
-                if let Some(svc) = registry().services.iter_mut().find(|s| s.name == spec.name) {
+        for spec in specs {
+            let mut svc = Service {
+                name: spec.name.clone(),
+                spec: spec.clone(),
+                child: None,
+                exit: Exit::default(),
+                state: State::Starting,
+                stop_timeout: spec.stop_timeout,
+                gate_until: now + spec.ready_timeout,
+                ever_ready: false,
+                started: now,
+                delay: Duration::ZERO,
+            };
+            match spawn(&spec) {
+                Ok((child, exit)) => {
+                    svc.child = Some(child);
+                    svc.exit = exit.clone();
+                    watches.push((spec, exit));
+                }
+                Err(e) if spec.restart == Restart::Always => {
+                    log_line(&format!(
+                        "service {} failed to start: {}, retrying in {}s",
+                        spec.name,
+                        e,
+                        RESTART_FIRST.as_secs()
+                    ));
                     svc.state = State::Restarting;
                     svc.delay = RESTART_FIRST;
+                    restart_after(spec.name.clone(), RESTART_FIRST);
                 }
-                restart_after(spec.name.clone(), RESTART_FIRST);
-                continue;
+                Err(e) => {
+                    log_line(&format!("service {} failed to start: {}", spec.name, e));
+                    svc.state = State::Failed(format!("failed to start: {}", e));
+                }
             }
-            Err(e) => {
-                log_line(&format!("service {} failed to start: {}", spec.name, e));
-                set_state(&spec.name, State::Failed(format!("failed to start: {}", e)));
-                continue;
-            }
-        };
-        if let Some(svc) = registry().services.iter_mut().find(|s| s.name == spec.name) {
-            svc.child = Some(child);
-            svc.exit = exit.clone();
+            reg.services.push(svc);
         }
-        started += 1;
+        reg.services.len()
+    };
+    CHANGED.notify_all();
+    let started = watches.len();
+    for (spec, exit) in watches {
         std::thread::spawn(move || watch_until_ready(spec, exit));
     }
-    if !registry().services.is_empty() {
+    if declared > 0 {
+        log_line(&format!("{} service(s) starting", started));
         std::thread::spawn(cap_logs);
     }
-    started
+    Ok(started)
+}
+
+/// Starts the services without an env from the host if none came within
+/// HOST_ENV_WAIT. An image that declares none needs no wait.
+pub fn start_after_wait() {
+    if !declares_services() {
+        let _ = start_all(&HashMap::new());
+        return;
+    }
+    std::thread::spawn(|| {
+        std::thread::sleep(HOST_ENV_WAIT);
+        if let Ok(started) = start_all(&HashMap::new()) {
+            if started > 0 {
+                log_line(&format!(
+                    "no service env from the host after {}s, started without it",
+                    HOST_ENV_WAIT.as_secs()
+                ));
+            }
+        }
+    });
 }
 
 fn cap_logs() {
@@ -551,20 +619,24 @@ fn holds(s: &Service, now: Instant) -> bool {
     }
 }
 
-/// Block until no service holds commands. Ok when every service that does
-/// not restart is ready (or none exist), Err with a message naming the
-/// first one that failed. A restarting service never fails a command.
+/// Block until the services have started and none holds commands. Ok when
+/// every service that does not restart is ready (or none exist), Err with
+/// a message naming the first one that failed. A restarting service never
+/// fails a command.
 pub fn wait_ready() -> Result<(), String> {
     if registry().shutting_down {
         return Err("guest is shutting down".into());
     }
+    // A service that has already exited is recorded before deciding, even
+    // when the reaper thread has not run yet.
+    crate::children::reap_watched();
     let mut reg = registry();
     loop {
         if reg.shutting_down {
             return Err("guest is shutting down".into());
         }
         let now = Instant::now();
-        if reg.services.iter().any(|s| holds(s, now)) {
+        if !reg.begun || reg.services.iter().any(|s| holds(s, now)) {
             reg = CHANGED
                 .wait_timeout(reg, Duration::from_millis(200))
                 .unwrap_or_else(|e| e.into_inner())
@@ -687,6 +759,34 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn service_file_env_is_over_the_host_env() {
+        let spec = parse_spec(
+            "web",
+            r#"{"exec": ["/bin/true"], "env": {"PORT": "8080", "MODE": "file"}}"#,
+        )
+        .unwrap();
+        let host = HashMap::from([
+            ("MODE".to_string(), "host".to_string()),
+            ("DATABASE_URL".to_string(), "postgres://db".to_string()),
+        ]);
+        let spec = with_env(spec, &host);
+        let mut env: Vec<_> = spec
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        env.sort();
+        assert_eq!(
+            env,
+            [
+                ("DATABASE_URL", "postgres://db"),
+                ("MODE", "file"),
+                ("PORT", "8080"),
+            ]
+        );
     }
 
     #[test]

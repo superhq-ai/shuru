@@ -1131,7 +1131,16 @@ impl Node {
             Instant::now(),
             &mut Vec::new(),
         )?;
-        drop(vm.connect()?);
+        let placeholders = vm
+            .network
+            .as_ref()
+            .map(|network| network.session.placeholders.clone())
+            .unwrap_or_default();
+        vm.start_services(&config::exec_env(
+            &entry.config().env,
+            &placeholders,
+            HashMap::new(),
+        ))?;
         if let Some(network) = &vm.network {
             if !network.session.placeholders.is_empty() {
                 vm.install_ca(&network.session.ca_cert_pem)?;

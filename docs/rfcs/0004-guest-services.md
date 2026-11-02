@@ -48,8 +48,8 @@ and stop.
 - Dependencies between services. All services start in parallel.
 - Per service users or cgroups. Services run as root in the root cgroup,
   the same as the user command today.
-- Services that depend on host mounts. Mounts arrive over vsock after boot,
-  services start before the first vsock connection.
+- Services that depend on host mounts. Mounts arrive with the first
+  command, after the services have started.
 - Changing the on disk format of checkpoints.
 
 ## Design
@@ -73,10 +73,10 @@ the file stem and must match `[a-z0-9][a-z0-9-]*`.
 | field | required | default | meaning |
 |---|---|---|---|
 | `exec` | yes | | argv of the process to run. Resolved on the init PATH. |
-| `ready` | no | none | argv retried every 250 ms until it exits 0. Without it the service is ready as soon as it is spawned. |
+| `ready` | no | none | argv retried every 250 ms until it exits 0. Without it the service is ready once it has run for 500 ms. |
 | `ready_timeout_secs` | no | 30 | give up on `ready` after this long. |
 | `stop_timeout_secs` | no | 15 | time between SIGTERM and SIGKILL at shutdown. |
-| `env` | no | `{}` | extra environment for `exec` and `ready`. |
+| `env` | no | `{}` | extra environment for `exec` and `ready`, over the env from the host. |
 | `cwd` | no | `/` | working directory for `exec`. |
 | `restart` | no | `"no"` | `"always"` starts the service again after it exits. |
 
@@ -86,16 +86,42 @@ should be debuggable with `shuru run`.
 
 ### Lifecycle in the guest
 
-After networking is up and before the vsock listeners are created, init
-reads the services directory and spawns every service. Each gets its own
-process group and its stdout and stderr appended to
-`/run/shuru/log/<name>.log`. The log lives on tmpfs so it never lands in a
-checkpoint.
+After networking is up, init creates the vsock listeners and waits for the
+env of the services from the host, then reads the services directory and
+spawns every service with it. Each gets its own process group and its
+stdout and stderr appended to `/run/shuru/log/<name>.log`. The log lives
+on tmpfs so it never lands in a checkpoint.
+
+### Env from the host
+
+A service gets the same env as a command: the env the host gives the
+sandbox and the placeholders of its secrets, never a secret value. The
+host sends it once, in `SERVICE_ENV_REQ`, on its first connection after
+the boot, and the guest answers `SERVICE_ENV_RESP` once the services are
+spawned. The env of the service file is over it, and the env of init is
+under it.
+
+- The first env starts the services. Any later one is refused with an
+  ERROR, so the env of a service, and of each restart of it, stays the
+  one it booted with. An env changed later reaches services at the next
+  boot.
+- Commands wait for the services to start, like they wait for them to be
+  ready, so the first command after a boot never runs before them.
+- A host that sends no env, an older one or a raw console boot, gets the
+  services started without it after 5 s. An image without service files
+  starts at once and accepts a later env as a no op.
+- The host connects within a few milliseconds of the guest listening, and
+  the env is one frame, so services start about that much later than
+  before.
 
 Each service has one of five states: starting, ready, restarting, failed or stopped. A
 thread per service runs the ready check until it passes or the timeout is
 hit. The zombie reaper already in init records the exit of any service pid,
 so a daemon that dies at any point moves to failed with its exit status.
+A service without a ready check is ready once it has run 500 ms, so one
+that exits at once fails the first command instead of letting it run, and
+init reaps any exited service itself before it decides whether a command
+runs.
 
 Before spawning a user command, in both the piped and the tty exec paths,
 init waits until no service is still starting. If every service is ready
@@ -191,6 +217,16 @@ VM with the same proxy, allowlist and mount rules as the user command.
   says the image accepts commands running while it comes back.
 - A service that exits at once and restarts forever costs one spawn a
   minute once its wait has reached the cap.
+- The env from the host adds nothing a command does not already get:
+  plain env and secret placeholders, never a secret value. The host sends
+  it and reads one fixed answer with a 10 s timeout, so a guest cannot
+  hold the boot of the host. The guest takes it once, before the services
+  start, so a later connection cannot change what a restart inherits.
+- The env of a running service is in its memory, so a memory snapshot
+  taken while it runs carries it. Placeholders fail closed after a
+  restore, since each run of the network gets new ones, but a credential
+  put in plain env instead of a secret travels with the snapshot. Keep
+  credentials in secrets.
 
 Residual risks:
 
@@ -220,8 +256,11 @@ plain `docker` commands. The nine RFC 0003 tests pass unchanged otherwise.
 
 ## Rollout
 
-The guest and host change together in one release. An old host against a
-new guest never sends `SHUTDOWN_REQ` and behaves as today. An old guest
+The guest and host change together in one release. The env from the
+host came with protocol version 6 of the connection hello, so a host and
+guest that disagree on it refuse to talk instead of waiting out timeouts.
+An old host against a new guest never sends `SHUTDOWN_REQ` and behaves as
+today. An old guest
 skips unknown frames without answering, so a new host against it waits out
 the shutdown timeout and then hard stops. Mixed versions degrade to the old
 behaviour at the cost of a slow stop, and the asset version check keeps the

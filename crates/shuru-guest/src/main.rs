@@ -770,6 +770,15 @@ mod guest {
                         }
                     }
                 }
+                frame::SERVICE_ENV_REQ => {
+                    let result = serde_json::from_slice::<shuru_proto::ServiceEnv>(&payload)
+                        .map_err(|e| format!("invalid service env: {}", e))
+                        .and_then(|req| crate::services::start_all(&req.env));
+                    let _ = match result {
+                        Ok(_) => frame::write_frame(&mut writer, frame::SERVICE_ENV_RESP, &[]),
+                        Err(msg) => frame::write_frame(&mut writer, frame::ERROR, msg.as_bytes()),
+                    };
+                }
                 frame::RESTORE_REQ => {
                     let result = shuru_proto::hello::Restore::decode(&payload)
                         .ok_or_else(|| std::io::Error::other("invalid restore request"))
@@ -1914,10 +1923,7 @@ mod guest {
         }
         crate::children::start_reaper().expect("start the reaper");
 
-        let started = crate::services::start_all();
-        if started > 0 {
-            stage(&format!("{} service(s) starting", started));
-        }
+        crate::services::start_after_wait();
 
         // Register signal handlers (PID 1 has no default signal dispositions)
         unsafe {

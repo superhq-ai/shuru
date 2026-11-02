@@ -340,6 +340,12 @@ pub(crate) fn run_command(
         eprintln!("shuru: VM started, waiting for guest...");
     }
     trace_boot("vm running");
+    sandbox.start_services(
+        proxy_handle
+            .as_ref()
+            .map(|handle| &handle.placeholders)
+            .unwrap_or(&HashMap::new()),
+    )?;
     if std::env::var("SHURU_BOOT_TRACE").is_ok() {
         let _ = sandbox.wait_ready();
         trace_boot("guest vsock ready");
