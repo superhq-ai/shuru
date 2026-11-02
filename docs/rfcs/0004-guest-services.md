@@ -45,7 +45,6 @@ and stop.
 
 ## Non-goals
 
-- Restart on failure. A service that exits is reported, not restarted.
 - Dependencies between services. All services start in parallel.
 - Per service users or cgroups. Services run as root in the root cgroup,
   the same as the user command today.
@@ -79,6 +78,7 @@ the file stem and must match `[a-z0-9][a-z0-9-]*`.
 | `stop_timeout_secs` | no | 15 | time between SIGTERM and SIGKILL at shutdown. |
 | `env` | no | `{}` | extra environment for `exec` and `ready`. |
 | `cwd` | no | `/` | working directory for `exec`. |
+| `restart` | no | `"no"` | `"always"` starts the service again after it exits. |
 
 Files that fail to parse are reported on the console and skipped. They do
 not block the boot or the user command, because a broken file in an image
@@ -92,7 +92,7 @@ process group and its stdout and stderr appended to
 `/run/shuru/log/<name>.log`. The log lives on tmpfs so it never lands in a
 checkpoint.
 
-Each service has one of four states: starting, ready, failed or stopped. A
+Each service has one of five states: starting, ready, restarting, failed or stopped. A
 thread per service runs the ready check until it passes or the timeout is
 hit. The zombie reaper already in init records the exit of any service pid,
 so a daemon that dies at any point moves to failed with its exit status.
@@ -104,6 +104,34 @@ with an ERROR frame that names the service, the reason, and the last lines
 of its log, and does not run the command. File, mount, watch and port
 forward requests are never gated, so the log of a failed service can always
 be read from the host.
+
+### Restarting
+
+A service with `"restart": "always"` is started again after it exits, or
+after a spawn that fails. The first wait is 1 s and each next one doubles,
+up to 60 s. A run that lasted 60 s or more was healthy, so the wait after
+it is 1 s again. Each run gets a new ready check, and a ready check that
+times out leaves the process running: only an exit restarts it.
+
+Such a service holds commands only until it is first ready, or until its
+`ready_timeout_secs` has passed since boot, and never fails them. After
+that, a crash or a restart in progress is in its log, not in the exec of
+an unrelated command. A service without `restart` keeps the rule above:
+it holds commands while starting and fails every command once it has
+failed.
+
+At shutdown a service waiting to restart has no process, and the restart
+does not happen. The spawn of a restart takes the same lock as the start
+of a shutdown, so a process started just before it is stopped like the
+others.
+
+### Logs
+
+Init checks every 5 s. A log over 1 MiB is copied to `<name>.log.1`,
+replacing the older copy, and emptied. Services write with `O_APPEND`, so
+they carry on at the start of the emptied file. Lines written between the
+copy and the truncate are lost. Sixteen services with both files at the cap
+use half of `/run`.
 
 ### Shutdown handshake
 
@@ -151,14 +179,18 @@ VM with the same proxy, allowlist and mount rules as the user command.
 - Services come from the image. Anything that can write to
   `/etc/shuru/services/` in a checkpoint could already run arbitrary code
   in that checkpoint, so this adds no new trust boundary.
-- Service logs are on tmpfs under `/run`, which is size capped at 64 MB.
-  A very chatty service fills its log and then gets write errors, it does
-  not fill the disk or the checkpoint.
+- Service logs are on tmpfs under `/run`, which is size capped at 64 MB,
+  and each is kept near 1 MiB with one older copy. A service that writes
+  faster than the check runs can still fill `/run` and get write errors,
+  but never the disk or the checkpoint.
 - Shutdown is bounded. The guest waits at most `stop_timeout_secs` per
   service and the host waits at most 90 seconds for the reply before it
   hard stops. A hung service cannot hold a VM open.
 - Readiness failure fails closed for exec. A command never runs against a
-  half started service.
+  half started service, unless that service asks to be restarted, which
+  says the image accepts commands running while it comes back.
+- A service that exits at once and restarts forever costs one spawn a
+  minute once its wait has reached the cap.
 
 Residual risks:
 

@@ -1,11 +1,13 @@
 //! Guest services (RFC 0004): long running processes declared by the image
 //! under /etc/shuru/services/<name>.json. Init starts them at boot, gates
-//! exec requests on their readiness, and stops them on SHUTDOWN_REQ.
+//! exec requests on their readiness, restarts the ones that ask for it,
+//! and stops them on SHUTDOWN_REQ.
 
 use std::collections::HashMap;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use shuru_proto::ShutdownResponse;
@@ -18,13 +20,28 @@ const READY_POLL: Duration = Duration::from_millis(250);
 const DEFAULT_READY_TIMEOUT: u64 = 30;
 const DEFAULT_STOP_TIMEOUT: u64 = 15;
 const LOG_TAIL_LINES: usize = 20;
+// /run is a 64 MiB tmpfs, so 16 services with an older file each fit in
+// half of it.
+const MAX_LOG_BYTES: u64 = 1 << 20;
+const LOG_CHECK: Duration = Duration::from_secs(5);
+const RESTART_FIRST: Duration = Duration::from_secs(1);
+const RESTART_MAX: Duration = Duration::from_secs(60);
+// A run this long was healthy, so the next restart waits RESTART_FIRST again.
+const RESTART_RESET: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq)]
 enum State {
     Starting,
     Ready,
+    Restarting,
     Failed(String),
     Stopped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Restart {
+    No,
+    Always,
 }
 
 struct Spec {
@@ -35,14 +52,22 @@ struct Spec {
     stop_timeout: Duration,
     env: HashMap<String, String>,
     cwd: String,
+    restart: Restart,
 }
 
 struct Service {
     name: String,
+    spec: Arc<Spec>,
     child: Option<Watch>,
     exit: Exit,
     state: State,
     stop_timeout: Duration,
+    // Commands wait for a restarting service only until it is first ready
+    // or this passes; after that it never holds or fails them.
+    gate_until: Instant,
+    ever_ready: bool,
+    started: Instant,
+    delay: Duration,
 }
 
 struct Registry {
@@ -137,6 +162,14 @@ fn parse_spec(name: &str, text: &str) -> Result<Spec, String> {
             .map(str::to_string)
             .ok_or("cwd must be a string")?,
     };
+    let restart = match value.get("restart") {
+        None | Some(serde_json::Value::Null) => Restart::No,
+        Some(v) => match v.as_str() {
+            Some("no") => Restart::No,
+            Some("always") => Restart::Always,
+            _ => return Err("restart must be \"no\" or \"always\"".into()),
+        },
+    };
     Ok(Spec {
         name: name.to_string(),
         exec,
@@ -145,7 +178,18 @@ fn parse_spec(name: &str, text: &str) -> Result<Spec, String> {
         stop_timeout,
         env,
         cwd,
+        restart,
     })
+}
+
+/// The wait before the next restart: RESTART_FIRST after a healthy run,
+/// otherwise double the last wait, up to RESTART_MAX.
+fn next_delay(last: Duration, ran: Duration) -> Duration {
+    if ran >= RESTART_RESET || last.is_zero() {
+        RESTART_FIRST
+    } else {
+        (last * 2).min(RESTART_MAX)
+    }
 }
 
 fn load_specs() -> Vec<Spec> {
@@ -239,6 +283,9 @@ fn set_state(name: &str, state: State) {
         if svc.state == State::Stopped || (state == State::Ready && svc.state != State::Starting) {
             return;
         }
+        if state == State::Ready {
+            svc.ever_ready = true;
+        }
         svc.state = state;
     }
     drop(reg);
@@ -246,9 +293,10 @@ fn set_state(name: &str, state: State) {
 }
 
 /// Records the exit of a running service, so one that dies at any point
-/// is reported even when no thread is watching it.
+/// is reported even when no thread is watching it. One that asks for it
+/// is started again after its delay.
 fn record_exit(name: &str, status: i32) {
-    {
+    let restart = {
         let mut reg = registry();
         if reg.shutting_down {
             return;
@@ -260,10 +308,76 @@ fn record_exit(name: &str, status: i32) {
         let Some(svc) = running else {
             return;
         };
-        svc.state = State::Failed(describe_exit(status));
-    }
+        if svc.spec.restart == Restart::Always {
+            svc.state = State::Restarting;
+            svc.delay = next_delay(svc.delay, svc.started.elapsed());
+            Some(svc.delay)
+        } else {
+            svc.state = State::Failed(describe_exit(status));
+            None
+        }
+    };
     CHANGED.notify_all();
-    log_line(&format!("service {} {}", name, describe_exit(status)));
+    match restart {
+        Some(delay) => {
+            log_line(&format!(
+                "service {} {}, restarting in {}s",
+                name,
+                describe_exit(status),
+                delay.as_secs()
+            ));
+            restart_after(name.to_string(), delay);
+        }
+        None => log_line(&format!("service {} {}", name, describe_exit(status))),
+    }
+}
+
+fn restart_after(name: String, delay: Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        respawn(&name);
+    });
+}
+
+/// Starts a restarting service again. It spawns under the registry lock,
+/// so a shutdown either sees the new process or stops this from running.
+fn respawn(name: &str) {
+    let mut reg = registry();
+    if reg.shutting_down {
+        return;
+    }
+    let Some(svc) = reg
+        .services
+        .iter_mut()
+        .find(|s| s.name == name && s.state == State::Restarting)
+    else {
+        return;
+    };
+    let spec = svc.spec.clone();
+    match spawn(&spec) {
+        Ok((child, exit)) => {
+            svc.child = Some(child);
+            svc.exit = exit.clone();
+            svc.state = State::Starting;
+            svc.started = Instant::now();
+            drop(reg);
+            CHANGED.notify_all();
+            log_line(&format!("service {} restarted", name));
+            std::thread::spawn(move || watch_until_ready(spec, exit));
+        }
+        Err(e) => {
+            svc.delay = next_delay(svc.delay, Duration::ZERO);
+            let delay = svc.delay;
+            drop(reg);
+            log_line(&format!(
+                "service {} failed to start: {}, retrying in {}s",
+                name,
+                e,
+                delay.as_secs()
+            ));
+            restart_after(name.to_string(), delay);
+        }
+    }
 }
 
 fn ready_check_passes(spec: &Spec, ready: &[String]) -> bool {
@@ -282,7 +396,7 @@ fn ready_check_passes(spec: &Spec, ready: &[String]) -> bool {
     }
 }
 
-fn watch_until_ready(spec: Spec, exit: Exit) {
+fn watch_until_ready(spec: Arc<Spec>, exit: Exit) {
     let deadline = Instant::now() + spec.ready_timeout;
     loop {
         if exit.get().is_some() {
@@ -294,7 +408,13 @@ fn watch_until_ready(spec: Spec, exit: Exit) {
                 return;
             }
             Some(ready) => {
-                if ready_check_passes(&spec, ready) {
+                let passed = ready_check_passes(&spec, ready);
+                // The run this watches may have ended during the probe, and
+                // a restart begun since must not be judged by it.
+                if exit.get().is_some() {
+                    return;
+                }
+                if passed {
                     set_state(&spec.name, State::Ready);
                     log_line(&format!("service {} ready", spec.name));
                     return;
@@ -304,7 +424,11 @@ fn watch_until_ready(spec: Spec, exit: Exit) {
         if Instant::now() >= deadline {
             let msg = format!("not ready after {}s", spec.ready_timeout.as_secs());
             log_line(&format!("service {} {}", spec.name, msg));
-            set_state(&spec.name, State::Failed(msg));
+            // A restarting service keeps running; only its exit restarts it.
+            match spec.restart {
+                Restart::Always => set_state(&spec.name, State::Ready),
+                Restart::No => set_state(&spec.name, State::Failed(msg)),
+            }
             return;
         }
         std::thread::sleep(READY_POLL);
@@ -316,16 +440,37 @@ pub fn start_all() -> usize {
     let specs = load_specs();
     let mut started = 0;
     for spec in specs {
+        let spec = Arc::new(spec);
         // Registered before its spawn, so an exit at once is recorded.
+        let now = Instant::now();
         registry().services.push(Service {
             name: spec.name.clone(),
+            spec: spec.clone(),
             child: None,
             exit: Exit::default(),
             state: State::Starting,
             stop_timeout: spec.stop_timeout,
+            gate_until: now + spec.ready_timeout,
+            ever_ready: false,
+            started: now,
+            delay: Duration::ZERO,
         });
         let (child, exit) = match spawn(&spec) {
             Ok(started) => started,
+            Err(e) if spec.restart == Restart::Always => {
+                log_line(&format!(
+                    "service {} failed to start: {}, retrying in {}s",
+                    spec.name,
+                    e,
+                    RESTART_FIRST.as_secs()
+                ));
+                if let Some(svc) = registry().services.iter_mut().find(|s| s.name == spec.name) {
+                    svc.state = State::Restarting;
+                    svc.delay = RESTART_FIRST;
+                }
+                restart_after(spec.name.clone(), RESTART_FIRST);
+                continue;
+            }
             Err(e) => {
                 log_line(&format!("service {} failed to start: {}", spec.name, e));
                 set_state(&spec.name, State::Failed(format!("failed to start: {}", e)));
@@ -339,7 +484,50 @@ pub fn start_all() -> usize {
         started += 1;
         std::thread::spawn(move || watch_until_ready(spec, exit));
     }
+    if !registry().services.is_empty() {
+        std::thread::spawn(cap_logs);
+    }
     started
+}
+
+fn cap_logs() {
+    loop {
+        std::thread::sleep(LOG_CHECK);
+        let names: Vec<String> = {
+            let reg = registry();
+            if reg.shutting_down {
+                return;
+            }
+            reg.services.iter().map(|s| s.name.clone()).collect()
+        };
+        for name in names {
+            if let Err(e) = cap_log(Path::new(&log_path(&name)), MAX_LOG_BYTES) {
+                log_line(&format!("service {} log not capped: {}", name, e));
+            }
+        }
+    }
+}
+
+/// Moves a log past `max` bytes to `<log>.1` and empties it. The service
+/// writes with O_APPEND, so it carries on at the start of the emptied file;
+/// lines written between the copy and the truncate are lost.
+fn cap_log(path: &Path, max: u64) -> std::io::Result<bool> {
+    let len = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if len <= max {
+        return Ok(false);
+    }
+    let mut older = path.as_os_str().to_owned();
+    older.push(".1");
+    std::fs::copy(path, &older)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_len(0)?;
+    Ok(true)
 }
 
 fn log_tail(name: &str) -> String {
@@ -349,8 +537,23 @@ fn log_tail(name: &str) -> String {
     lines[start..].join("\n")
 }
 
-/// Block until no service is still starting. Ok when every service is ready
-/// (or none exist), Err with a message naming the first failed service.
+/// Whether commands still wait for this service: one that does not restart
+/// until it is ready or failed, one that does until it is first ready or
+/// its ready timeout has passed since boot.
+fn holds(s: &Service, now: Instant) -> bool {
+    match s.spec.restart {
+        Restart::No => s.state == State::Starting,
+        Restart::Always => {
+            !s.ever_ready
+                && now < s.gate_until
+                && matches!(s.state, State::Starting | State::Restarting)
+        }
+    }
+}
+
+/// Block until no service holds commands. Ok when every service that does
+/// not restart is ready (or none exist), Err with a message naming the
+/// first one that failed. A restarting service never fails a command.
 pub fn wait_ready() -> Result<(), String> {
     if registry().shutting_down {
         return Err("guest is shutting down".into());
@@ -360,7 +563,8 @@ pub fn wait_ready() -> Result<(), String> {
         if reg.shutting_down {
             return Err("guest is shutting down".into());
         }
-        if reg.services.iter().any(|s| s.state == State::Starting) {
+        let now = Instant::now();
+        if reg.services.iter().any(|s| holds(s, now)) {
             reg = CHANGED
                 .wait_timeout(reg, Duration::from_millis(200))
                 .unwrap_or_else(|e| e.into_inner())
@@ -368,7 +572,9 @@ pub fn wait_ready() -> Result<(), String> {
             continue;
         }
         let failed = reg.services.iter().find_map(|s| match &s.state {
-            State::Failed(reason) => Some((s.name.clone(), reason.clone())),
+            State::Failed(reason) if s.spec.restart == Restart::No => {
+                Some((s.name.clone(), reason.clone()))
+            }
             _ => None,
         });
         drop(reg);
@@ -458,4 +664,114 @@ pub fn shutdown() -> ShutdownResponse {
         ));
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let dir =
+                std::env::temp_dir().join(format!("shuru-services-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn restart_defaults_to_no() {
+        let spec = parse_spec("web", r#"{"exec": ["/bin/true"]}"#).unwrap();
+        assert_eq!(spec.restart, Restart::No);
+        let spec = parse_spec("web", r#"{"exec": ["/bin/true"], "restart": null}"#).unwrap();
+        assert_eq!(spec.restart, Restart::No);
+        let spec = parse_spec("web", r#"{"exec": ["/bin/true"], "restart": "no"}"#).unwrap();
+        assert_eq!(spec.restart, Restart::No);
+    }
+
+    #[test]
+    fn restart_always_parses() {
+        let spec = parse_spec("web", r#"{"exec": ["/bin/true"], "restart": "always"}"#).unwrap();
+        assert_eq!(spec.restart, Restart::Always);
+    }
+
+    #[test]
+    fn restart_refuses_other_values() {
+        for value in [r#""on-failure""#, "true", "1", r#""Always""#] {
+            let text = format!(r#"{{"exec": ["/bin/true"], "restart": {value}}}"#);
+            assert!(parse_spec("web", &text).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn restart_waits_double_up_to_a_minute() {
+        let mut delay = Duration::ZERO;
+        let mut seen = Vec::new();
+        for _ in 0..9 {
+            delay = next_delay(delay, Duration::from_secs(2));
+            seen.push(delay.as_secs());
+        }
+        assert_eq!(seen, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+
+    #[test]
+    fn restart_wait_resets_after_a_healthy_run() {
+        assert_eq!(
+            next_delay(Duration::from_secs(60), RESTART_RESET),
+            RESTART_FIRST
+        );
+        assert_eq!(
+            next_delay(
+                Duration::from_secs(60),
+                RESTART_RESET - Duration::from_millis(1)
+            ),
+            RESTART_MAX
+        );
+    }
+
+    #[test]
+    fn log_under_the_cap_is_left() {
+        let dir = Scratch::new("under");
+        let log = dir.0.join("web.log");
+        std::fs::write(&log, b"0123456789").unwrap();
+        assert!(!cap_log(&log, 10).unwrap());
+        assert_eq!(std::fs::read(&log).unwrap(), b"0123456789");
+        assert!(!dir.0.join("web.log.1").exists());
+    }
+
+    #[test]
+    fn log_over_the_cap_moves_to_the_older_file() {
+        let dir = Scratch::new("over");
+        let log = dir.0.join("web.log");
+        std::fs::write(dir.0.join("web.log.1"), b"oldest").unwrap();
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"0123456789a").unwrap();
+        assert!(cap_log(&log, 10).unwrap());
+        assert_eq!(
+            std::fs::read(dir.0.join("web.log.1")).unwrap(),
+            b"0123456789a"
+        );
+        std::io::Write::write_all(&mut writer, b"next").unwrap();
+        assert_eq!(std::fs::read(&log).unwrap(), b"next");
+    }
+
+    #[test]
+    fn missing_log_is_not_an_error() {
+        let dir = Scratch::new("missing");
+        assert!(!cap_log(&dir.0.join("web.log"), 10).unwrap());
+    }
 }
