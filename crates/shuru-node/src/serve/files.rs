@@ -10,6 +10,7 @@ use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use hyper::body::{Body as _, Bytes, Incoming};
+use hyper::header::{HeaderValue, CONTENT_TYPE};
 use hyper::{Method, Request, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -25,7 +26,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::guest::{self, Conn};
 use super::http::{
-    json_response, parse_bool, query_pairs, read_body, streaming, timestamp, ApiError, Body,
+    full, json_response, parse_bool, query_pairs, read_body, streaming, timestamp, ApiError, Body,
     MAX_JSON_BODY,
 };
 use super::sandboxes::{Entry, GuestAddr, Node};
@@ -39,6 +40,8 @@ const MAX_WATCH_MESSAGE: usize = 64 * 1024;
 /// Events a watch holds for a client that reads slowly, before it drops
 /// them and says how many it dropped.
 const WATCH_BACKLOG: usize = 256;
+/// The most of the end of a file a read with `tail` answers.
+const MAX_TAIL: usize = 1 << 20;
 
 pub async fn route(
     node: &Arc<Node>,
@@ -101,6 +104,59 @@ fn parse_mode(key: &str, value: &str) -> Result<u32, ApiError> {
         .ok_or_else(|| {
             ApiError::bad_request(format!("{key}: expected octal permissions, such as 0644"))
         })
+}
+
+fn parse_tail(value: &str) -> Result<usize, ApiError> {
+    value
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| value.parse::<usize>().ok())
+        .flatten()
+        .filter(|tail| (1..=MAX_TAIL).contains(tail))
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "tail: expected a whole number from 1 to {MAX_TAIL}"
+            ))
+        })
+}
+
+/// The last `keep` bytes of a stream, holding no more than that and the
+/// chunk that arrived last.
+struct Tail {
+    keep: usize,
+    chunks: std::collections::VecDeque<Vec<u8>>,
+    held: usize,
+    size: u64,
+}
+
+impl Tail {
+    fn new(keep: usize) -> Tail {
+        Tail {
+            keep,
+            chunks: Default::default(),
+            held: 0,
+            size: 0,
+        }
+    }
+
+    fn push(&mut self, chunk: Vec<u8>) {
+        self.size += chunk.len() as u64;
+        self.held += chunk.len();
+        self.chunks.push_back(chunk);
+        while self.chunks.len() > 1 && self.held - self.chunks[0].len() >= self.keep {
+            self.held -= self.chunks.pop_front().map_or(0, |c| c.len());
+        }
+    }
+
+    fn finish(self) -> (Vec<u8>, u64) {
+        let mut all = Vec::with_capacity(self.held);
+        for chunk in self.chunks {
+            all.extend_from_slice(&chunk);
+        }
+        let cut = all.len().saturating_sub(self.keep);
+        all.drain(..cut);
+        (all, self.size)
+    }
 }
 
 fn mode_string(mode: u32) -> String {
@@ -184,6 +240,7 @@ struct Params {
     pattern: Option<String>,
     mode: Option<u32>,
     mkdir: Option<bool>,
+    tail: Option<usize>,
 }
 
 impl Params {
@@ -197,6 +254,7 @@ impl Params {
                 "pattern" if !value.is_empty() => params.pattern = Some(value),
                 "mode" => params.mode = Some(parse_mode(&key, &value)?),
                 "mkdir" | "mkdirParents" => params.mkdir = Some(parse_bool(&key, &value)?),
+                "tail" => params.tail = Some(parse_tail(&value)?),
                 _ => {}
             }
         }
@@ -250,11 +308,15 @@ async fn read(
     entry: &Arc<Entry>,
     request: Request<Incoming>,
 ) -> Result<Response<Body>, ApiError> {
-    let path = Params::parse(request.uri().query())?.target()?;
+    let params = Params::parse(request.uri().query())?;
+    let path = params.target()?;
     let addr = node.guest(entry).await?;
     let read = ReadFileRequest { path: path.clone() };
     let mut conn = call(&addr, frame::READ_FILE_REQ, &read).await?;
     let first = answer(&mut conn, frame::READ_FILE_RESP, &path).await?;
+    if let Some(keep) = params.tail {
+        return read_tail(conn, first, keep, &path).await;
+    }
     let (tx, rx) = mpsc::channel(4);
     tokio::spawn(async move {
         // The whole connection moves in, its permit with it.
@@ -285,6 +347,31 @@ async fn read(
         }
     });
     Ok(streaming("application/octet-stream", rx))
+}
+
+/// Drains the read and answers its last `keep` bytes, with the length of
+/// the whole file in Shuru-File-Size.
+async fn read_tail(
+    mut conn: Conn,
+    first: Vec<u8>,
+    keep: usize,
+    path: &str,
+) -> Result<Response<Body>, ApiError> {
+    let mut tail = Tail::new(keep);
+    let mut chunk = first;
+    while !chunk.is_empty() {
+        tail.push(chunk);
+        chunk = answer(&mut conn, frame::READ_FILE_RESP, path).await?;
+    }
+    let (bytes, size) = tail.finish();
+    let mut response = Response::new(full(bytes));
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert("shuru-file-size", HeaderValue::from(size));
+    Ok(response)
 }
 
 /// A write body, streamed when its length is known up front.
@@ -864,6 +951,32 @@ fn event_json(detail: &WatchDetail) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tail_keeps_the_last_bytes_and_counts_them_all() {
+        let mut tail = Tail::new(5);
+        for chunk in [&b"abc"[..], b"defg", b"h", b"ijkl"] {
+            tail.push(chunk.to_vec());
+        }
+        assert!(tail.held < 5 + 4 + 4);
+        assert_eq!(tail.finish(), (b"hijkl".to_vec(), 12));
+
+        let mut short = Tail::new(64);
+        short.push(b"ab".to_vec());
+        short.push(b"c".to_vec());
+        assert_eq!(short.finish(), (b"abc".to_vec(), 3));
+
+        assert_eq!(Tail::new(8).finish(), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn a_tail_is_a_whole_number_up_to_a_mib() {
+        assert_eq!(parse_tail("1").unwrap(), 1);
+        assert_eq!(parse_tail("1048576").unwrap(), MAX_TAIL);
+        for bad in ["0", "", "-1", "1.5", "1048577", "+3"] {
+            assert!(parse_tail(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn paths_resolve_against_the_working_dir() {
