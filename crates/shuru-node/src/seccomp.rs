@@ -162,6 +162,9 @@ fn vmm_allowlist(mismatch: SeccompAction) -> Result<BpfProgram> {
         )?])?],
     );
     rules.insert(libc::SYS_prctl, vec![equals(0, libc::PR_SET_NAME as u64)?]);
+    // Stacked filters take the strictest action, so clone3 must pass here
+    // for the ENOSYS of refuse_clone3 to be what the caller gets.
+    rules.insert(libc::SYS_clone3, Vec::new());
     filter(rules, mismatch, SeccompAction::Allow)
 }
 
@@ -277,7 +280,11 @@ fn apply(programs: &[BpfProgram]) -> Result<()> {
 /// With `log`, violations are logged by the kernel and allowed, to find
 /// what a change needs.
 pub fn install_vmm(log: bool) -> Result<()> {
-    apply(&[
+    apply(&vmm_programs(log)?)
+}
+
+fn vmm_programs(log: bool) -> Result<Vec<BpfProgram>> {
+    Ok(vec![
         refuse_clone3()?,
         refusals(BTreeMap::new())?,
         vmm_allowlist(violation(log))?,
@@ -285,7 +292,11 @@ pub fn install_vmm(log: bool) -> Result<()> {
 }
 
 pub fn install_netd(log: bool) -> Result<()> {
-    apply(&[
+    apply(&netd_programs(log)?)
+}
+
+fn netd_programs(log: bool) -> Result<Vec<BpfProgram>> {
+    Ok(vec![
         refuse_clone3()?,
         netd_refusals()?,
         netd_kills(violation(log))?,
@@ -315,5 +326,43 @@ mod tests {
         refusals(BTreeMap::new()).unwrap();
         netd_refusals().unwrap();
         netd_kills(SeccompAction::KillProcess).unwrap();
+    }
+
+    /// glibc 2.38 and later create threads with clone3 on aarch64, and fall
+    /// back to clone only when it answers ENOSYS.
+    #[test]
+    fn the_filters_answer_clone3_with_enosys() {
+        clone3_answers_enosys(vmm_programs(false).unwrap());
+        clone3_answers_enosys(netd_programs(false).unwrap());
+    }
+
+    fn clone3_answers_enosys(programs: Vec<BpfProgram>) {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let code = match apply(&programs) {
+                Err(_) => 100,
+                Ok(()) => {
+                    let r =
+                        unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<u8>(), 0usize) };
+                    if r == -1 {
+                        std::io::Error::last_os_error()
+                            .raw_os_error()
+                            .unwrap_or(101)
+                    } else {
+                        102
+                    }
+                }
+            };
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(
+            !libc::WIFSIGNALED(status),
+            "killed by signal {}",
+            libc::WTERMSIG(status)
+        );
+        assert_eq!(libc::WEXITSTATUS(status), libc::ENOSYS);
     }
 }
