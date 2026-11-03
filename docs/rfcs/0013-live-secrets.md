@@ -71,9 +71,14 @@ up by a fetch. If that resolve fails, the relay closes the connection rather
 than carry on with what it had, which might include a secret that is
 gone.
 
-A provided value cached for a secret that changed or went is dropped. A
-fetch already under way for it finishes for the connection waiting on
-it, and its value is not kept.
+A provided value cached for a secret that changed or went is dropped, and
+so is every provided value an update names, changed or not. What a
+provider answers is decided where it runs, out of sight of the node, so a
+caller that points a provided secret somewhere new sends the same config
+again, and that update is the only sign netd gets. A fetch already under
+way for it finishes for the connection waiting on it, and its value is
+not kept. Values from env, literals and commands are kept when their
+secret is unchanged, since their whole source is in the config.
 
 `PUT config` answers 204 once the file is saved and, for a running
 sandbox, netd has the table. If netd does not take it, the answer is
