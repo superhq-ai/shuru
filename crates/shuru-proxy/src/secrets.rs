@@ -150,8 +150,10 @@ impl SecretResolver {
 
     /// Replaces the secrets. Those the guest has no placeholder for wait for
     /// the next boot and are returned by name; values cached for secrets that
-    /// changed or went are dropped. Connections pick the new table up from
-    /// their next resolve.
+    /// changed or went are dropped, and so are all provided values: what the
+    /// provider answers is decided where it runs, so an update is the only
+    /// sign the proxy gets that it may have changed. Connections pick the new
+    /// table up from their next resolve.
     pub fn update(&self, secrets: HashMap<String, SecretConfig>) -> Vec<String> {
         let mut pending: Vec<String> = secrets
             .keys()
@@ -170,7 +172,7 @@ impl SecretResolver {
             .retain(|name, _| {
                 secrets
                     .get(name)
-                    .is_some_and(|new| table.get(name) == Some(new))
+                    .is_some_and(|new| !new.provided && table.get(name) == Some(new))
             });
         *table = Arc::new(secrets);
         pending
@@ -976,15 +978,18 @@ exit 1
     }
 
     #[tokio::test]
-    async fn an_update_drops_a_cached_value_only_when_its_secret_changed() {
+    async fn an_update_asks_the_provider_again_even_when_the_secret_is_the_same() {
         let provider = Arc::new(FakeProvider::default());
         let resolver = resolver_with(provided(), Some(provider.clone()));
-        resolve_one(&resolver, "api.github.com").await.unwrap();
+        assert_eq!(
+            resolve_one(&resolver, "api.github.com").await.unwrap()[0].1,
+            "value-1"
+        );
 
         resolver.update(HashMap::from([("TOKEN".to_string(), provided())]));
         assert_eq!(
             resolve_one(&resolver, "api.github.com").await.unwrap()[0].1,
-            "value-1"
+            "value-2"
         );
 
         let mut wider = provided();
@@ -992,8 +997,21 @@ exit 1
         resolver.update(HashMap::from([("TOKEN".to_string(), wider)]));
         assert_eq!(
             resolve_one(&resolver, "api.github.com").await.unwrap()[0].1,
-            "value-2"
+            "value-3"
         );
+    }
+
+    #[tokio::test]
+    async fn an_update_keeps_a_minted_value_whose_command_is_the_same() {
+        let provider = TestProvider::new(COUNTING_PROVIDER);
+        let secret =
+            SecretConfig::from_command(provider.argv(STABLE), vec!["api.github.com".into()]);
+        let resolver = resolver_for(secret.clone());
+        resolve_one(&resolver, "api.github.com").await.unwrap();
+
+        resolver.update(HashMap::from([("TOKEN".to_string(), secret)]));
+        resolve_one(&resolver, "api.github.com").await.unwrap();
+        assert_eq!(provider.calls(), 1);
     }
 
     #[tokio::test]
