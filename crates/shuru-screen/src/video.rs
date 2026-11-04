@@ -122,18 +122,19 @@ pub fn start(display: &str, cfg: VideoConfig, input: mpsc::Sender<InputEvent>) -
     Ok(hub)
 }
 
-/// Milliseconds of video in the send queue of `c`, at the rate it reads
-/// when known, else at the bitrate.
-fn queue_ms(pending: usize, capacity_bps: f64, target_kbps: f64) -> f64 {
+/// Milliseconds of video in the send queue of a viewer. At the rate it
+/// can read when measured; before that, at the rate it has been seen to
+/// read, which it can at least, or the safe starting rate if higher.
+fn queue_ms(pending: usize, capacity_bps: f64, rate_bps: f64, start_kbps: f64) -> f64 {
     let rate = if capacity_bps > 0.0 {
         capacity_bps
     } else {
-        target_kbps * 1000.0
+        rate_bps.max(start_kbps * 1000.0)
     };
     pending as f64 * 8000.0 / rate.max(1000.0)
 }
 
-fn flow_ok(clients: &[Arc<Client>], interval_ms: f64, target_kbps: f64) -> bool {
+fn flow_ok(clients: &[Arc<Client>], interval_ms: f64, start_kbps: f64) -> bool {
     for c in clients {
         if !c.acks.load(Ordering::Relaxed) {
             // Hold frames while one is far behind, unless it reads nothing
@@ -141,8 +142,11 @@ fn flow_ok(clients: &[Arc<Client>], interval_ms: f64, target_kbps: f64) -> bool 
             if !c.started.load(Ordering::Relaxed) || c.stalled() {
                 continue;
             }
-            let capacity = c.drain.lock().unwrap().capacity_bps;
-            if queue_ms(c.pending(), capacity, target_kbps) > QUEUE_HOLD_MS {
+            let (capacity, rate) = {
+                let d = c.drain.lock().unwrap();
+                (d.capacity_bps, d.rate_bps)
+            };
+            if queue_ms(c.pending(), capacity, rate, start_kbps) > QUEUE_HOLD_MS {
                 return false;
             }
             continue;
@@ -185,15 +189,23 @@ struct RateCtl {
     ceiling_at: Instant,
     debug: bool,
     logged: f64,
+    /// A rate safe for a viewer not measured yet.
+    start: f64,
+    /// The newest viewer seen.
+    last_id: u64,
 }
 
-const START_KBPS: f64 = 8000.0;
+/// Where a new viewer starts, unless --min-kbps is higher.
+const START_KBPS: f64 = 1500.0;
 
 impl RateCtl {
     fn new(max: f64, min: f64, debug: bool) -> Self {
         let past = Instant::now() - Duration::from_secs(10);
+        let start = START_KBPS.max(min).min(max);
         RateCtl {
-            target: START_KBPS.min(max).max(min),
+            target: start,
+            start,
+            last_id: 0,
             max,
             min,
             last_eval: past,
@@ -208,6 +220,17 @@ impl RateCtl {
     }
 
     fn update(&mut self, hub: &Hub, clients: &[Arc<Client>]) {
+        // A new viewer may read slower than the others: start over from a
+        // safe rate and ramp up as it shows what it takes.
+        let newest = clients.iter().map(|c| c.id).max().unwrap_or(0);
+        if newest > self.last_id {
+            self.last_id = newest;
+            if self.target > self.start {
+                self.target = self.start;
+                hub.target_kbps.store(self.target as u32, Ordering::Relaxed);
+            }
+            self.slow_start = true;
+        }
         if self.last_eval.elapsed() < Duration::from_millis(100) {
             return;
         }
@@ -228,7 +251,7 @@ impl RateCtl {
                 if c.stalled() {
                     continue;
                 }
-                let q = queue_ms(qs.pending, qs.capacity_bps, self.target);
+                let q = queue_ms(qs.pending, qs.capacity_bps, qs.rate_bps, self.start);
                 if q > QUEUE_HIGH_MS {
                     congested = true;
                     if qs.capacity_bps > 0.0 {
@@ -274,12 +297,14 @@ impl RateCtl {
             self.target = t.max(self.min);
             self.last_dec = now;
             self.slow_start = false;
-        } else if self.slow_start
-            && !congested
-            && clear
-            && self.last_inc.elapsed() >= Duration::from_millis(250)
-        {
-            if delivered >= self.target * 0.5 {
+        } else if self.slow_start {
+            // Up by half every 250 ms until the first congestion; the slower
+            // probe below waits for slow start to end.
+            if !congested
+                && clear
+                && self.last_inc.elapsed() >= Duration::from_millis(250)
+                && delivered >= self.target * 0.5
+            {
                 self.target = (self.target * 1.5).min(self.max);
                 self.last_inc = now;
             }
@@ -446,11 +471,14 @@ fn capture_loop(
     let mut last_capture = Instant::now() - interval;
     let mut last_motion = Instant::now();
     let mut paintover_left = 0u32;
-    // Keep the bitrate across a resize.
+    // Keep the bitrate and the viewers known across a resize.
     let mut rc = RateCtl::new(cfg.max_kbps as f64, cfg.min_kbps as f64, cfg.debug);
     match hub.target_kbps.load(Ordering::Relaxed) {
         0 => hub.target_kbps.store(rc.target as u32, Ordering::Relaxed),
-        t => rc.target = (t as f64).clamp(rc.min, rc.max),
+        t => {
+            rc.target = (t as f64).clamp(rc.min, rc.max);
+            rc.last_id = hub.clients().iter().map(|c| c.id).max().unwrap_or(0);
+        }
     }
     let mut had_clients = false;
     let mut full_next = true;
@@ -486,6 +514,9 @@ fn capture_loop(
             cap.grab(cap.full())?;
             stale = [Some(cap.full()), Some(cap.full())];
             cap.damaged = true;
+            // Damage taken in while nobody watched is old: the frame is
+            // captured now.
+            cap.damaged_at = None;
             full_next = true;
         }
         let paintover_due = paintover_left > 0 && last_motion.elapsed() >= cfg.paintover_delay;
@@ -507,7 +538,7 @@ fn capture_loop(
             wait_any(&[hub.waker.fd()], (rem.as_micros() as i32 + 999) / 1000);
             continue;
         }
-        if !want_key && !flow_ok(&clients, interval_ms, rc.target) {
+        if !want_key && !flow_ok(&clients, interval_ms, rc.start) {
             wait_any(&[cap.fd(), hub.waker.fd()], 4);
             continue;
         }
@@ -655,10 +686,9 @@ fn encode_loop(
             target
         };
         if job.force_idr {
-            // A keyframe is what a new viewer sees first: up to about 8
-            // frames of buffer at 4x the cap.
-            let boost = cap.saturating_mul(4).max(16_000);
-            enc.set_rate_buf(crf, boost, boost / cfg.fps.max(1) * 8);
+            // A keyframe is what a new viewer sees first: at most about
+            // 400 ms of video at the cap, sent at up to 4x the cap.
+            enc.set_rate_buf(crf, cap.saturating_mul(4), (cap * 2 / 5).max(1));
             applied_kbps = 0;
         } else {
             let moved = applied_kbps == 0
@@ -735,8 +765,11 @@ mod tests {
     #[test]
     fn queue_in_ms_of_video() {
         // 25 kB at a measured 1 Mbit/s is 200 ms.
-        assert_eq!(queue_ms(25_000, 1_000_000.0, 6000.0), 200.0);
-        // Before a measure, at the bitrate: 75 kB at 6000 kbps is 100 ms.
-        assert_eq!(queue_ms(75_000, 0.0, 6000.0), 100.0);
+        assert_eq!(queue_ms(25_000, 1_000_000.0, 0.0, 6000.0), 200.0);
+        // Before a measure, at the starting rate: 75 kB at 1500 kbps is
+        // 400 ms.
+        assert_eq!(queue_ms(75_000, 0.0, 0.0, 1500.0), 400.0);
+        // Seen reading faster than that: at that rate.
+        assert_eq!(queue_ms(75_000, 0.0, 3_000_000.0, 1500.0), 200.0);
     }
 }

@@ -27,11 +27,16 @@ come from voxl; the server, the protocol and the gate are new.
   again at the new size and every viewer gets a new `hello` and a
   keyframe.
 - The bitrate follows the viewers, between `--min-kbps` and `--max-kbps`.
+  Each new viewer starts it over at a safe rate, 1500 kbps or
+  `--min-kbps` if higher, and it grows by half every 250 ms while the
+  viewers keep up, so a fast viewer is at full rate in about a second.
   A viewer that acks steers it by the delay of its acks. A viewer that
   does not is measured by its send queue: the bytes waiting for it over
-  the rate it reads them. More than about 200 ms of video waiting steps
-  the bitrate down toward that rate, and it steps back up once the queue
-  drains. Past about 400 ms, frames wait until it drains.
+  the rate it reads them, or over the safe rate until that is measured.
+  More than about 200 ms of video waiting steps the bitrate down toward
+  that rate, and it steps back up once the queue drains. Past about
+  400 ms, frames wait until it drains. A keyframe is at most about 400 ms
+  of video at the current bitrate.
 - Blocks sent while they moved are sent again at higher quality once they
   have been still for a moment (the paint-over), so text sharpens when the
   screen settles.
