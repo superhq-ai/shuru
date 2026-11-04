@@ -43,7 +43,7 @@ jobs:
           docker run --rm -v "$PWD:/src" -w /src -e CARGO_TERM_COLOR=always debian:trixie sh -euc '
             apt-get update -qq
             apt-get install -y -qq --no-install-recommends \
-              ca-certificates curl build-essential pkg-config libx264-dev libyuv-dev >/dev/null
+              ca-certificates curl build-essential pkg-config libxcb1-dev libx264-dev libyuv-dev >/dev/null
             curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal
             . "$HOME/.cargo/env"
             CARGO_TARGET_DIR=/tmp/target cargo build --release --locked -p shuru-desktop -p shuru-screen
