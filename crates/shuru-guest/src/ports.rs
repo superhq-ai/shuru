@@ -57,7 +57,7 @@ fn start_scanner() {
             .name("ports".into())
             .spawn(scan_loop);
         if let Err(e) = spawned {
-            eprintln!("shuru-guest: ports: {e}");
+            log!("shuru-guest: ports: {e}");
         }
     });
 }
@@ -303,7 +303,7 @@ fn scan(owners: &mut Owners) -> HashMap<(String, u16), Listener> {
         match fs::read_to_string(path) {
             Ok(table) => sockets.extend(listening(&table, v6)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("shuru-guest: ports: {path}: {e}"),
+            Err(e) => log!("shuru-guest: ports: {path}: {e}"),
         }
     }
     let inodes: Vec<u64> = sockets.iter().map(|s| s.inode).collect();

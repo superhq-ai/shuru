@@ -60,7 +60,7 @@ pub(super) fn start() -> Option<Arc<Handle>> {
     match try_start() {
         Ok(handle) => Some(handle),
         Err(e) => {
-            eprintln!("shuru-guest: exec sessions unavailable: {e}");
+            log!("shuru-guest: exec sessions unavailable: {e}");
             None
         }
     }
@@ -333,7 +333,7 @@ impl Loop {
                 )
             };
             if n < 0 && errno() != libc::EINTR {
-                eprintln!(
+                log!(
                     "shuru-guest: sessions: epoll_wait: {}",
                     io::Error::last_os_error()
                 );
@@ -1042,7 +1042,7 @@ impl Loop {
             failed |= self.poll.set(w, IN).is_err();
         }
         if failed {
-            eprintln!("shuru-guest: session {sid}: {}", io::Error::last_os_error());
+            log!("shuru-guest: session {sid}: {}", io::Error::last_os_error());
         }
         let end = s.ring.end();
         for aid in s.attachments.clone() {

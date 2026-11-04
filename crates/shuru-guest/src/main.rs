@@ -1,3 +1,14 @@
+/// `eprintln!` that drops write errors. PID 1 must outlive a console it
+/// cannot write to: `eprintln!` panics on a failed write, and the panic
+/// takes the guest down with it.
+#[cfg(target_os = "linux")]
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 #[cfg(any(target_os = "linux", test))]
 mod identity;
 
@@ -139,7 +150,7 @@ mod guest {
             )
         };
         if ret != 0 {
-            eprintln!(
+            log!(
                 "shuru-guest: failed to mount {} on {}: {}",
                 source,
                 target,
@@ -198,9 +209,10 @@ mod guest {
                 "/sys/fs/cgroup/cgroup.subtree_control",
                 format!("+{}", name),
             ) {
-                eprintln!(
+                log!(
                     "shuru-guest: failed to enable cgroup controller {}: {}",
-                    name, e
+                    name,
+                    e
                 );
             }
         }
@@ -269,7 +281,7 @@ mod guest {
             return Err(format!("failed to mount overlay at {}", guest_path));
         }
 
-        eprintln!("shuru-guest: mounted {} -> {} (overlay)", tag, guest_path);
+        log!("shuru-guest: mounted {} -> {} (overlay)", tag, guest_path);
         Ok(())
     }
 
@@ -280,7 +292,7 @@ mod guest {
                 tag, guest_path
             ));
         }
-        eprintln!("shuru-guest: mounted {} -> {} (direct rw)", tag, guest_path);
+        log!("shuru-guest: mounted {} -> {} (direct rw)", tag, guest_path);
         Ok(())
     }
 
@@ -296,13 +308,13 @@ mod guest {
 
             let display_name = String::from_utf8_lossy(&name[..name.len().saturating_sub(1)]);
             if libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) < 0 {
-                eprintln!("shuru-guest: failed to get {} flags", display_name);
+                log!("shuru-guest: failed to get {} flags", display_name);
                 return;
             }
 
             ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
             if libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) < 0 {
-                eprintln!("shuru-guest: failed to bring up {}", display_name);
+                log!("shuru-guest: failed to bring up {}", display_name);
             }
         }
     }
@@ -1181,7 +1193,7 @@ mod guest {
         let cgroup = match crate::cgroup::Cgroup::create(&name) {
             Ok(cgroup) => Some(cgroup),
             Err(e) => {
-                eprintln!("shuru-guest: exec without a cgroup: {}", e);
+                log!("shuru-guest: exec without a cgroup: {}", e);
                 None
             }
         };
@@ -1917,7 +1929,7 @@ mod guest {
         let boot_identity = std::fs::read_to_string("/proc/cmdline")
             .and_then(|cmdline| crate::identity::parse(&cmdline))
             .unwrap_or_else(|_| {
-                eprintln!("shuru-guest: missing or invalid guest identity");
+                log!("shuru-guest: missing or invalid guest identity");
                 std::process::exit(1);
             });
         crate::identity::set(boot_identity);
@@ -1932,7 +1944,7 @@ mod guest {
         stage("networking ready");
 
         if let Err(e) = crate::cgroup::init() {
-            eprintln!("shuru-guest: no exec cgroups: {}", e);
+            log!("shuru-guest: no exec cgroups: {}", e);
         }
         crate::children::start_reaper().expect("start the reaper");
 
@@ -1976,7 +1988,7 @@ mod guest {
                 continue;
             }
 
-            eprintln!("shuru-guest: accepted vsock connection");
+            log!("shuru-guest: accepted vsock connection");
 
             std::thread::spawn(move || {
                 handle_connection(client_fd);
