@@ -582,7 +582,8 @@ impl Vm {
         let identity = new_identity()?;
         let quiet = if spec.verbose { "" } else { " quiet" };
         let command_line = format!(
-            "console=ttyAMA0 root=/dev/vda rw{quiet} shuru.token={} shuru.instance={}",
+            "{} root=/dev/vda rw{quiet} shuru.token={} shuru.instance={}",
+            shuru_linux::GUEST_CONSOLE,
             hex(&identity.token),
             hex(&identity.instance)
         );

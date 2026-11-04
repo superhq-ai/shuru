@@ -8,6 +8,10 @@
 # installed kernel is untouched until then. Point SHURU_DATA_DIR somewhere
 # else to keep the result fully isolated.
 #
+# KERNEL_ARCH=x86_64 builds the x86_64 guest kernel from
+# kernel/shuru_x86_64_defconfig. It is installed under the same name, Image,
+# but is the uncompressed ELF vmlinux the x86_64 backend loads.
+#
 # Requires: hf CLI logged in (hf auth whoami), a billable HF account.
 set -euo pipefail
 
@@ -16,11 +20,25 @@ KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 DATA_DIR="${SHURU_DATA_DIR:-${HOME}/.local/share/shuru}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-DEFCONFIG="${REPO_DIR}/kernel/shuru_defconfig"
+KERNEL_ARCH="${KERNEL_ARCH:-arm64}"
+case "$KERNEL_ARCH" in
+    arm64)
+        DEFCONFIG="${REPO_DIR}/kernel/shuru_defconfig"
+        ARTIFACT="Image-${KERNEL_VERSION}"
+        ;;
+    x86_64)
+        DEFCONFIG="${REPO_DIR}/kernel/shuru_x86_64_defconfig"
+        ARTIFACT="vmlinux-x86_64-${KERNEL_VERSION}"
+        ;;
+    *)
+        echo "ERROR: KERNEL_ARCH is arm64 or x86_64, not ${KERNEL_ARCH}"
+        exit 1
+        ;;
+esac
 HF_FLAVOR="${HF_FLAVOR:-cpu-upgrade}"
 HF_USER="$(hf auth whoami --format json | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["user"])')"
 HF_REPO="${HF_REPO:-${HF_USER}/shuru-kernel-build}"
-JOB_NAME="shuru-kernel-${KERNEL_VERSION//./-}"
+JOB_NAME="shuru-kernel-${KERNEL_ARCH//_/-}-${KERNEL_VERSION//./-}"
 
 if [ ! -f "$DEFCONFIG" ]; then
     echo "ERROR: Defconfig not found at ${DEFCONFIG}"
@@ -30,7 +48,7 @@ fi
 export HF_TOKEN="${HF_TOKEN:-$(hf auth token)}"
 DEFCONFIG_B64="$(base64 < "$DEFCONFIG" | tr -d '\n')"
 
-echo "==> Building kernel ${KERNEL_VERSION} on Hugging Face Jobs (${HF_FLAVOR})"
+echo "==> Building ${KERNEL_ARCH} kernel ${KERNEL_VERSION} on Hugging Face Jobs (${HF_FLAVOR})"
 echo "    artifacts: https://huggingface.co/datasets/${HF_REPO} (private)"
 
 hf repos create "$HF_REPO" --type dataset --private --exist-ok > /dev/null
@@ -51,16 +69,24 @@ curl -sSL "https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/sha256sums
 tar xf "linux-${KERNEL_VERSION}.tar.xz"
 cd "linux-${KERNEL_VERSION}"
 
-echo "$DEFCONFIG_B64" | base64 -d > arch/arm64/configs/shuru_defconfig
-make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- shuru_defconfig
-make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image 2>&1 | tail -3
+if [ "$KERNEL_ARCH" = "x86_64" ]; then
+    echo "$DEFCONFIG_B64" | base64 -d > arch/x86/configs/shuru_defconfig
+    make ARCH=x86 shuru_defconfig
+    make ARCH=x86 -j"$(nproc)" vmlinux 2>&1 | tail -3
+    cp vmlinux "/tmp/${ARTIFACT}"
+else
+    echo "$DEFCONFIG_B64" | base64 -d > arch/arm64/configs/shuru_defconfig
+    make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- shuru_defconfig
+    make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image 2>&1 | tail -3
+    cp arch/arm64/boot/Image "/tmp/${ARTIFACT}"
+fi
 
-cp arch/arm64/boot/Image "/tmp/Image-${KERNEL_VERSION}"
-cp .config "/tmp/config-${KERNEL_VERSION}"
-(cd /tmp && sha256sum "Image-${KERNEL_VERSION}" | tee "Image-${KERNEL_VERSION}.sha256")
-hf upload "$HF_REPO" "/tmp/Image-${KERNEL_VERSION}" "Image-${KERNEL_VERSION}" --type dataset > /dev/null
-hf upload "$HF_REPO" "/tmp/Image-${KERNEL_VERSION}.sha256" "Image-${KERNEL_VERSION}.sha256" --type dataset > /dev/null
-hf upload "$HF_REPO" "/tmp/config-${KERNEL_VERSION}" "config-${KERNEL_VERSION}" --type dataset > /dev/null
+CONFIG_NAME="config-${ARTIFACT}"
+cp .config "/tmp/${CONFIG_NAME}"
+(cd /tmp && sha256sum "${ARTIFACT}" | tee "${ARTIFACT}.sha256")
+hf upload "$HF_REPO" "/tmp/${ARTIFACT}" "${ARTIFACT}" --type dataset > /dev/null
+hf upload "$HF_REPO" "/tmp/${ARTIFACT}.sha256" "${ARTIFACT}.sha256" --type dataset > /dev/null
+hf upload "$HF_REPO" "/tmp/${CONFIG_NAME}" "${CONFIG_NAME}" --type dataset > /dev/null
 echo "KERNEL_BUILD_DONE"
 JOBEOF
 
@@ -70,6 +96,8 @@ JOB_ID="$(hf jobs run debian:trixie-slim bash -c "$JOB_SCRIPT" \
     --secrets HF_TOKEN \
     --env "KERNEL_VERSION=${KERNEL_VERSION}" \
     --env "KERNEL_MAJOR=${KERNEL_MAJOR}" \
+    --env "KERNEL_ARCH=${KERNEL_ARCH}" \
+    --env "ARTIFACT=${ARTIFACT}" \
     --env "HF_REPO=${HF_REPO}" \
     --env "DEFCONFIG_B64=${DEFCONFIG_B64}" \
     --format quiet)"
@@ -84,11 +112,11 @@ hf jobs logs "$JOB_ID" | tail -5 | grep -q KERNEL_BUILD_DONE
 
 mkdir -p "$DATA_DIR"
 DL_DIR="$(mktemp -d)"
-hf download "$HF_REPO" "Image-${KERNEL_VERSION}" "Image-${KERNEL_VERSION}.sha256" "config-${KERNEL_VERSION}" \
+hf download "$HF_REPO" "${ARTIFACT}" "${ARTIFACT}.sha256" "config-${ARTIFACT}" \
     --type dataset --local-dir "$DL_DIR" > /dev/null
-(cd "$DL_DIR" && sha256sum -c "Image-${KERNEL_VERSION}.sha256")
-cp "${DL_DIR}/Image-${KERNEL_VERSION}" "${DATA_DIR}/Image"
-cp "${DL_DIR}/config-${KERNEL_VERSION}" "${DATA_DIR}/Image.config"
+(cd "$DL_DIR" && sha256sum -c "${ARTIFACT}.sha256")
+cp "${DL_DIR}/${ARTIFACT}" "${DATA_DIR}/Image"
+cp "${DL_DIR}/config-${ARTIFACT}" "${DATA_DIR}/Image.config"
 rm -rf "$DL_DIR"
 
 echo "==> Kernel ready at ${DATA_DIR}/Image ($(du -h "${DATA_DIR}/Image" | cut -f1))"

@@ -29,3 +29,6 @@ pub use storage::{
     StorageAttachment, StorageDevice, VirtioBlockDevice,
 };
 pub use vm::{VirtualMachine, VmDescriptors, VmImage, VmState};
+
+/// The kernel argument that puts the guest console on the platform UART.
+pub const GUEST_CONSOLE: &str = kvm::arch::CONSOLE;

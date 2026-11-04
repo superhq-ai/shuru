@@ -143,7 +143,7 @@ pub fn seal(req: SealRequest) -> io::Result<SealResponse> {
         if let Err(e) = verified {
             if unsafe { libc::ioctl(root.as_raw_fd(), FITHAW as _, 0) } < 0 {
                 unsafe {
-                    libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+                    libc::reboot(crate::POWER_OFF);
                 }
             }
             return Err(e);

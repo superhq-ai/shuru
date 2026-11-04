@@ -40,7 +40,7 @@ pub fn download_os_image(data_dir: &str) -> Result<()> {
 
 fn download_os_image_version(data_dir: &str, version: &str) -> Result<()> {
     let tag = format!("v{}", version);
-    let tarball_name = format!("shuru-os-{}-aarch64.tar.gz", tag);
+    let tarball_name = format!("shuru-os-{}-{}.tar.gz", tag, std::env::consts::ARCH);
     let url = format!(
         "https://github.com/{}/releases/download/{}/{}",
         GITHUB_REPO, tag, tarball_name
@@ -92,6 +92,7 @@ fn cli_tarball_name(version: &str) -> Result<String> {
     let platform = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "darwin-aarch64",
         ("linux", "aarch64") => "linux-aarch64",
+        ("linux", "x86_64") => "linux-x86_64",
         (os, arch) => bail!("automatic upgrade is not supported on {}-{}", os, arch),
     };
 

@@ -23,6 +23,14 @@ mod files;
 #[cfg(target_os = "linux")]
 mod ports;
 
+/// How the guest stops its VM. An x86_64 guest has no ACPI sleep registers
+/// to power off with, so it resets through the keyboard controller
+/// (reboot=k), which the VMM takes as the end of the VM.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const POWER_OFF: libc::c_int = libc::LINUX_REBOOT_CMD_RESTART;
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+const POWER_OFF: libc::c_int = libc::LINUX_REBOOT_CMD_POWER_OFF;
+
 #[cfg(target_os = "linux")]
 mod guest {
     use std::io::{Read, Write};
@@ -1869,7 +1877,7 @@ mod guest {
     extern "C" fn sigterm_handler(_: libc::c_int) {
         unsafe {
             libc::sync();
-            libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+            libc::reboot(crate::POWER_OFF);
         }
     }
 
@@ -1886,7 +1894,7 @@ mod guest {
         if let Err(e) = crate::disk::boot() {
             stage(&format!("root boot failed: {e}"));
             unsafe {
-                libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+                libc::reboot(crate::POWER_OFF);
             }
             loop {
                 std::thread::park();
@@ -1896,7 +1904,7 @@ mod guest {
         if let Err(e) = crate::disk::check_root() {
             stage(&format!("root boot failed: {e}"));
             unsafe {
-                libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+                libc::reboot(crate::POWER_OFF);
             }
             loop {
                 std::thread::park();
