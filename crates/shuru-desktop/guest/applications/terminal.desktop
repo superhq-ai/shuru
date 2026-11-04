@@ -1,7 +1,9 @@
 [Desktop Entry]
 Type=Application
 Name=Terminal
+Name[zh_CN]=终端
 GenericName=Shell
+GenericName[zh_CN]=命令行
 Comment=A shell in a terminal
 Exec=xterm
 Icon=utilities-terminal
