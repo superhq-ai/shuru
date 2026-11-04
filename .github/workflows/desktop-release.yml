@@ -74,6 +74,19 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
+      # Fallback fonts for CJK text and emoji, pinned to upstream release tags.
+      # The emoji font is the CBDT one: swash renders CBDT bitmaps and only
+      # COLRv0, not COLRv1.
+      - name: Fetch the fonts
+        run: |
+          cd artifacts
+          curl -fsSL -o noto-sans-cjk-sc-regular.otf \
+            https://raw.githubusercontent.com/googlefonts/noto-cjk/Sans2.004/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf
+          echo "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b  noto-sans-cjk-sc-regular.otf" | sha256sum -c
+          curl -fsSL -o noto-color-emoji.ttf \
+            https://raw.githubusercontent.com/googlefonts/noto-emoji/v2.051/fonts/NotoColorEmoji.ttf
+          echo "72a635cb3d2f3524c51620cdde406b217204e8a6a06c6a096ff8ed4b5fd6e27b  noto-color-emoji.ttf" | sha256sum -c
+
       - name: Checksums
         run: cd artifacts && sha256sum * > SHA256SUMS && cat SHA256SUMS
 
@@ -81,7 +94,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           name: shuru-desktop ${{ github.ref_name }}
-          body: shuru-desktop, shuru-screen and the patched Xvfb for Debian trixie guests. Checksums in SHA256SUMS.
+          body: shuru-desktop, shuru-screen and the patched Xvfb for Debian trixie guests, plus the Noto Sans CJK SC and Noto Color Emoji fonts (from googlefonts/noto-cjk Sans2.004 and googlefonts/noto-emoji v2.051). Checksums in SHA256SUMS.
           prerelease: true
           make_latest: false
           files: artifacts/*

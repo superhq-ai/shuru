@@ -1,211 +1,909 @@
-//! What the desktop draws itself: the strip above a window, the panel,
-//! the badge, the click ripple and the cursor. Pure pixels, no X.
+//! What the desktop draws itself: the panel, the rail, title bars, window
+//! corners, menus, the toast, the click ripple and the cursor. Pure pixels,
+//! no X.
 
-use crate::draw::{
-    Canvas, Font, Rect, AMBER, BG, DIM, GREEN, HAIRLINE, HOVER, RAISED, STRIP_BG, SURFACE, TEXT,
-};
+use std::f32::consts::{FRAC_PI_2, PI};
 
-pub const MARGIN: i16 = 12;
-pub const STRIP: i16 = 28;
-pub const PANEL_H: u16 = 44;
-/// Space between the bottom of the panel and the bottom of the window.
-pub const PANEL_LIFT: i16 = 2;
-pub const BORDER: u16 = 2;
+use crate::draw::{self, theme, Canvas, Font, Image, Raised, Rect};
+use crate::glyphs::{self, Glyph};
+use crate::locale::{tr, Msg};
+
+pub const PANEL_H: u16 = 32;
+pub const RAIL_W: u16 = 64;
+pub const BAR_H: u16 = 30;
+/// The corner radius of a window card.
+pub const RADIUS: f32 = 12.0;
+/// The corner piece of a frame: the radius and the ring.
+pub const CORNER: u16 = 13;
 pub const RIPPLE: u16 = 44;
-pub const BADGE_H: usize = 22;
-/// Space the badge keeps from the right end of the strip.
-pub const BADGE_INSET: i16 = 5;
+pub const TOAST_H: u16 = 32;
+pub const TOOLTIP_H: u16 = 22;
+
+/// Rail items: 48 px at x 8, the first at y 40, 52 px apart.
+pub const ITEM: u16 = 48;
+pub const ITEM_X: i16 = 8;
+pub const ITEM_TOP: i16 = 40;
+pub const ITEM_PITCH: i16 = 52;
 
 const TEXT_SIZE: f32 = 13.0;
 const SMALL_SIZE: f32 = 12.0;
+const LABEL_SIZE: f32 = 11.0;
+const CONTROL_Y: f32 = 4.0;
+const CONTROL_H: f32 = 24.0;
 
-/// Where top level windows go, border included: the screen less the
-/// margins and the strip. The panel floats over the bottom of it.
+/// Where windows go: right of the rail, under the panel, 8 px from the
+/// bottom and right edges.
 pub fn work_area(sw: u16, sh: u16) -> (i16, i16, u16, u16) {
-    let top = MARGIN + STRIP;
     (
-        MARGIN,
-        top,
-        sw.saturating_sub(2 * MARGIN as u16),
-        sh.saturating_sub((top + MARGIN) as u16),
+        RAIL_W as i16,
+        PANEL_H as i16 + 8,
+        sw.saturating_sub(RAIL_W + 8),
+        sh.saturating_sub(PANEL_H + 16),
     )
 }
 
-/// The strip: the top edge of the frame round the window, with the app
-/// name in it. `reserve` is kept free at the right for the badge.
-pub fn strip(
-    font: &mut Font,
-    w: usize,
-    app: Option<&str>,
-    title: Option<&str>,
-    reserve: f32,
-) -> Canvas {
-    let h = STRIP as usize;
-    let mut c = Canvas::new(w, h, STRIP_BG);
-    for x in 0..w {
-        c.px[x] = HAIRLINE;
-    }
-    for y in 0..h {
-        c.px[y * w] = HAIRLINE;
-        c.px[y * w + w - 1] = HAIRLINE;
-    }
-    let mid = h as f32 / 2.0 + 0.5;
-    let Some(app) = app else {
-        return c;
-    };
-    let left = 10.0;
-    let room = w as f32 - reserve - left;
-    let app = font.fit(app, TEXT_SIZE, room);
-    let used = font.draw(&mut c, &app, left, mid, TEXT_SIZE, TEXT);
-    if let Some(t) = title.filter(|t| !t.is_empty() && *t != app) {
-        let x = left + used + 10.0;
-        if room + left - x > 24.0 {
-            let t = font.fit(t, TEXT_SIZE, room + left - x);
-            font.draw(&mut c, &t, x, mid, TEXT_SIZE, DIM);
+/// The screen y of rail item `i`.
+pub fn item_y(i: usize) -> i16 {
+    ITEM_TOP + ITEM_PITCH * i as i16
+}
+
+fn mid_of(y: f32, h: f32) -> f32 {
+    y + h / 2.0
+}
+
+fn dot(c: &mut Canvas, x: f32, cy: f32, d: f32, color: u32) {
+    c.rounded_rect(Rect::new(x, cy - d / 2.0, d, d), d / 2.0, color);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelHit {
+    Apps,
+    App,
+    HandBack,
+}
+
+pub struct PanelView<'a> {
+    pub app: Option<(&'a str, Option<&'a Image>)>,
+    /// None, the agent (false) or a person (true).
+    pub person: Option<bool>,
+    pub hover: Option<PanelHit>,
+    pub pressed: Option<PanelHit>,
+}
+
+/// The spans of the panel controls.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PanelLayout {
+    pub apps: (f32, f32),
+    pub app: Option<(f32, f32)>,
+    pub hand: Option<(f32, f32)>,
+}
+
+impl PanelLayout {
+    pub fn hit(&self, x: f32, y: f32) -> Option<PanelHit> {
+        if !(CONTROL_Y..CONTROL_Y + CONTROL_H).contains(&y) {
+            return None;
         }
+        let inside = |s: (f32, f32)| x >= s.0 && x < s.0 + s.1;
+        if inside(self.apps) {
+            Some(PanelHit::Apps)
+        } else if self.app.is_some_and(inside) {
+            Some(PanelHit::App)
+        } else if self.hand.is_some_and(inside) {
+            Some(PanelHit::HandBack)
+        } else {
+            None
+        }
+    }
+}
+
+const MARK_X: f32 = 8.0;
+const LABEL_X: f32 = 35.0;
+
+pub fn panel_layout(font: &mut Font, w: usize, view: &PanelView) -> PanelLayout {
+    let apps_w = (LABEL_X + font.width(tr(Msg::Applications), TEXT_SIZE) + 8.0).round();
+    let apps = (4.0, apps_w);
+    let app = view.app.map(|(name, _)| {
+        let x = apps.0 + apps.1 + 4.0;
+        (x, (32.0 + font.width(name, TEXT_SIZE) + 8.0).round())
+    });
+    let hand = (view.person == Some(true)).then(|| {
+        let hw = (29.0 + font.width(tr(Msg::HandBack), SMALL_SIZE) + 11.0).round();
+        (w as f32 - 4.0 - hw, hw)
+    });
+    PanelLayout { apps, app, hand }
+}
+
+/// The Applications control at (x, y) of its pill: the hq mark and label.
+pub fn apps_label(c: &mut Canvas, font: &mut Font, x: f32, y: f32) {
+    c.glyph(
+        &glyphs::MARK,
+        (x + MARK_X) as i32,
+        (y + 7.0) as i32,
+        theme().text,
+        1.0,
+    );
+    font.draw(
+        c,
+        tr(Msg::Applications),
+        x + LABEL_X,
+        y + 12.0,
+        TEXT_SIZE,
+        theme().text,
+    );
+}
+
+/// The app item at (x, y) of its pill: the 16 px icon and the name.
+pub fn app_label(
+    c: &mut Canvas,
+    font: &mut Font,
+    x: f32,
+    y: f32,
+    name: &str,
+    icon: Option<&Image>,
+) {
+    app_icon(c, font, icon, name, x + 8.0, y + 4.0, 16, 1.0);
+    font.draw(c, name, x + 32.0, y + 12.0, TEXT_SIZE, theme().text);
+}
+
+/// An app icon, or for an app without one a tile with its initial.
+#[allow(clippy::too_many_arguments)]
+pub fn app_icon(
+    c: &mut Canvas,
+    font: &mut Font,
+    icon: Option<&Image>,
+    name: &str,
+    x: f32,
+    y: f32,
+    size: usize,
+    opacity: f32,
+) {
+    match icon {
+        Some(img) => c.image(img, x as i32, y as i32, opacity),
+        None => {
+            let s = size as f32;
+            c.rounded_rect(
+                Rect::new(x, y, s, s),
+                s / 4.0,
+                draw::mix(theme().bg, theme().raised, opacity),
+            );
+            let initial: String = name.chars().take(1).flat_map(char::to_uppercase).collect();
+            let fs = (s * 0.55).round();
+            let tw = font.width(&initial, fs);
+            font.draw(
+                c,
+                &initial,
+                x + (s - tw) / 2.0,
+                y + s / 2.0,
+                fs,
+                draw::mix(theme().bg, theme().text, opacity),
+            );
+        }
+    }
+}
+
+/// The panel: 32 px on BG.
+pub fn panel(font: &mut Font, w: usize, view: &PanelView, layout: &PanelLayout) -> Canvas {
+    let mut c = Canvas::new(w, PANEL_H as usize, theme().bg);
+    let pill = |c: &mut Canvas, s: (f32, f32), hit: PanelHit| {
+        if view.hover == Some(hit) || view.pressed == Some(hit) {
+            let r = Rect::new(s.0, CONTROL_Y, s.1, CONTROL_H);
+            c.rounded_rect(r, 6.0, theme().hover);
+            c.ring_in(r, 6.0, theme().hairline);
+        }
+    };
+    pill(&mut c, layout.apps, PanelHit::Apps);
+    apps_label(&mut c, font, layout.apps.0, CONTROL_Y);
+    if let (Some(s), Some((name, icon))) = (layout.app, view.app) {
+        pill(&mut c, s, PanelHit::App);
+        app_label(&mut c, font, s.0, CONTROL_Y, name, icon);
+    }
+    let mid = mid_of(CONTROL_Y, CONTROL_H);
+    let state = |c: &mut Canvas, font: &mut Font, right: f32, label: &str, color: u32| {
+        let x = right - font.width(label, TEXT_SIZE) - 16.0;
+        dot(c, x, mid, 8.0, color);
+        font.draw(c, label, x + 16.0, mid, TEXT_SIZE, theme().text);
+    };
+    match (view.person, layout.hand) {
+        (Some(true), Some((hx, hw))) => {
+            let r = Rect::new(hx, CONTROL_Y, hw, CONTROL_H);
+            let style = if view.pressed == Some(PanelHit::HandBack) {
+                Raised::pressed(theme().hand_pressed.0, theme().hand_pressed.1)
+            } else {
+                theme().hand_back
+            };
+            c.raised(r, 6.0, style);
+            c.glyph(
+                &glyphs::HAND,
+                (hx + 7.0) as i32,
+                (CONTROL_Y + 4.0) as i32,
+                theme().hand_text,
+                1.0,
+            );
+            font.draw(
+                &mut c,
+                tr(Msg::HandBack),
+                hx + 29.0,
+                mid,
+                SMALL_SIZE,
+                theme().hand_text,
+            );
+            state(&mut c, font, hx - 20.0, tr(Msg::InControl), theme().amber);
+        }
+        (Some(false), _) => state(&mut c, font, w as f32 - 4.0, tr(Msg::Agent), theme().green),
+        _ => {}
+    }
+    c
+}
+
+pub struct RailItem<'a> {
+    pub name: &'a str,
+    pub icon: Option<&'a Image>,
+    pub windows: usize,
+    pub front: bool,
+    /// One of its windows asks for attention.
+    pub attention: bool,
+}
+
+/// The rail: 64 px wide from the panel down, item `i` at screen y
+/// `item_y(i)`. `top` is the screen y of the rail window.
+pub fn rail(
+    font: &mut Font,
+    items: &[RailItem],
+    hover: Option<usize>,
+    h: usize,
+    top: i16,
+) -> Canvas {
+    let mut c = Canvas::new(RAIL_W as usize, h, theme().bg);
+    for (i, item) in items.iter().enumerate() {
+        let y = (item_y(i) - top) as f32;
+        let b = Rect::new(ITEM_X as f32, y, ITEM as f32, ITEM as f32);
+        if item.front {
+            c.rounded_rect(b, 12.0, theme().rail_active);
+        } else if hover == Some(i) {
+            c.rounded_rect(b, 12.0, theme().hover);
+        }
+        rail_icon(&mut c, font, item, ITEM_X as f32, y);
+    }
+    c
+}
+
+/// The icon and running dots of a rail item whose box is at (x, y).
+pub fn rail_icon(c: &mut Canvas, font: &mut Font, item: &RailItem, x: f32, y: f32) {
+    app_icon(c, font, item.icon, item.name, x + 8.0, y + 8.0, 32, 1.0);
+    if item.attention {
+        c.rounded_rect(Rect::new(x + 37.0, y + 5.0, 6.0, 6.0), 3.0, theme().text);
+    }
+    let n = item.windows.min(3);
+    if n > 0 {
+        let total = 6.0 * n as f32 + 3.0 * (n - 1) as f32;
+        let top = y + (ITEM as f32 - total) / 2.0;
+        for k in 0..n {
+            c.rounded_rect(
+                Rect::new(x + 1.0, top + 9.0 * k as f32, 6.0, 6.0),
+                3.0,
+                theme().text,
+            );
+        }
+    }
+}
+
+/// The rail item under a point of the rail window.
+pub fn rail_hit(count: usize, x: f32, screen_y: f32) -> Option<usize> {
+    if !(ITEM_X as f32..(ITEM_X + ITEM as i16) as f32).contains(&x) {
+        return None;
+    }
+    (0..count).find(|&i| {
+        let y = item_y(i) as f32;
+        screen_y >= y && screen_y < y + ITEM as f32
+    })
+}
+
+/// A tooltip: 22 px, RAISED, a HAIRLINE_HI ring outside, and its shape.
+pub fn tooltip(font: &mut Font, text: &str) -> (Canvas, Canvas) {
+    let w = (font.width(text, TEXT_SIZE) + 16.0).ceil();
+    let h = TOOLTIP_H as f32;
+    let b = Rect::new(1.0, 1.0, w, h);
+    let mut c = Canvas::new(w as usize + 2, h as usize + 2, theme().bg);
+    c.rounded_rect(b, 5.0, theme().raised);
+    c.ring_out(b, 5.0, theme().hairline_hi);
+    font.draw(&mut c, text, 9.0, 1.0 + h / 2.0, TEXT_SIZE, theme().text);
+    let mut m = Canvas::new(c.w, c.h, 0);
+    m.rounded_rect(b.inset(-1.0), 6.0, 0xffffff);
+    (c, m)
+}
+
+/// The width of a notification card inside its ring.
+pub const NOTE_W: usize = 340;
+const NOTE_PAD_X: f32 = 12.0;
+const NOTE_PAD_Y: f32 = 10.0;
+const NOTE_TEXT_X: f32 = NOTE_PAD_X + 20.0 + 10.0;
+const NOTE_CLOSE: f32 = 18.0;
+
+/// The close button of a card, in card coordinates.
+pub fn note_close() -> Rect {
+    Rect::new(
+        1.0 + NOTE_W as f32 - NOTE_PAD_X - NOTE_CLOSE,
+        1.0 + NOTE_PAD_Y,
+        NOTE_CLOSE,
+        NOTE_CLOSE,
+    )
+}
+
+/// A notification card: the app icon, the summary, up to two lines of body
+/// and a close button. Answers the card and its shape.
+pub fn note(
+    font: &mut Font,
+    icon: Option<&Image>,
+    app: &str,
+    summary: &str,
+    body: &str,
+) -> (Canvas, Canvas) {
+    let t = theme();
+    let text_w = NOTE_W as f32 - NOTE_TEXT_X - 10.0 - NOTE_CLOSE - NOTE_PAD_X;
+    let body = font.wrap(body, SMALL_SIZE, text_w, 2);
+    let title = if summary.is_empty() { app } else { summary };
+    let text_h = 16.0 + body.len() as f32 * 15.0 + if body.is_empty() { 0.0 } else { 2.0 };
+    let h = 2.0 * NOTE_PAD_Y + text_h.max(20.0);
+    let b = Rect::new(1.0, 1.0, NOTE_W as f32, h);
+    let mut c = Canvas::new(NOTE_W + 2, h as usize + 2, t.bg);
+    c.rounded_rect(b, 10.0, t.surface);
+    c.ring_out(b, 10.0, t.hairline_hi);
+    app_icon(
+        &mut c,
+        font,
+        icon,
+        app,
+        1.0 + NOTE_PAD_X,
+        1.0 + NOTE_PAD_Y,
+        20,
+        1.0,
+    );
+    let x = 1.0 + NOTE_TEXT_X;
+    let title = font.fit(title, TEXT_SIZE, text_w);
+    font.draw(&mut c, &title, x, 1.0 + NOTE_PAD_Y + 8.0, TEXT_SIZE, t.text);
+    for (i, line) in body.iter().enumerate() {
+        let mid = 1.0 + NOTE_PAD_Y + 16.0 + 2.0 + 7.5 + 15.0 * i as f32;
+        font.draw(&mut c, line, x, mid, SMALL_SIZE, t.dim);
+    }
+    let close = note_close();
+    c.glyph(
+        &glyphs::CLOSE,
+        (close.x + 1.0) as i32,
+        (close.y + 1.0) as i32,
+        t.dim,
+        1.0,
+    );
+    let mut m = Canvas::new(c.w, c.h, 0);
+    m.rounded_rect(b.inset(-1.0), 11.0, 0xffffff);
+    (c, m)
+}
+
+/// The take over toast, and its shape.
+pub fn toast(font: &mut Font) -> (Canvas, Canvas) {
+    let w = (12.0 + 8.0 + 8.0 + font.width(tr(Msg::Paused), SMALL_SIZE) + 12.0).ceil();
+    let h = TOAST_H as f32;
+    let b = Rect::new(1.0, 1.0, w, h);
+    let mut c = Canvas::new(w as usize + 2, h as usize + 2, theme().bg);
+    c.rounded_rect(b, 8.0, theme().surface);
+    c.ring_out(b, 8.0, theme().hairline_hi);
+    let mid = 1.0 + h / 2.0;
+    dot(&mut c, 13.0, mid, 8.0, theme().amber);
+    font.draw(&mut c, tr(Msg::Paused), 29.0, mid, SMALL_SIZE, theme().text);
+    let mut m = Canvas::new(c.w, c.h, 0);
+    m.rounded_rect(b.inset(-1.0), 9.0, 0xffffff);
+    (c, m)
+}
+
+/// The line on an empty desktop.
+pub fn empty(font: &mut Font, w: usize) -> Canvas {
+    let mut c = Canvas::new(w, 20, theme().bg);
+    let tw = font.width(tr(Msg::NoWindows), TEXT_SIZE);
+    font.draw(
+        &mut c,
+        tr(Msg::NoWindows),
+        ((w as f32 - tw) / 2.0).round(),
+        10.0,
+        TEXT_SIZE,
+        theme().dim,
+    );
+    c
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Light {
+    Close,
+    Minimize,
+    Maximize,
+}
+
+/// The lights of a bar and their x in the card.
+pub fn lights(close_only: bool) -> &'static [(Light, f32)] {
+    if close_only {
+        &[(Light::Close, 10.0)]
+    } else {
+        &[
+            (Light::Close, 10.0),
+            (Light::Minimize, 28.0),
+            (Light::Maximize, 46.0),
+        ]
+    }
+}
+
+pub const LIGHT_Y: f32 = 9.0;
+pub const LIGHT_D: f32 = 12.0;
+
+/// The light at (x, y) of a card.
+pub fn light_hit(close_only: bool, x: f32, y: f32) -> Option<Light> {
+    if !(LIGHT_Y - 3.0..LIGHT_Y + LIGHT_D + 3.0).contains(&y) {
+        return None;
+    }
+    lights(close_only)
+        .iter()
+        .find(|(_, lx)| x >= lx - 3.0 && x < lx + LIGHT_D + 3.0)
+        .map(|(l, _)| *l)
+}
+
+/// Whether (x, y) of a card is over the group of lights.
+pub fn over_lights(close_only: bool, x: f32, y: f32) -> bool {
+    let right = lights(close_only)
+        .last()
+        .map_or(0.0, |(_, lx)| lx + LIGHT_D);
+    (LIGHT_Y - 3.0..LIGHT_Y + LIGHT_D + 3.0).contains(&y) && (7.0..right + 3.0).contains(&x)
+}
+
+pub struct BarView<'a> {
+    pub title: &'a str,
+    pub focused: bool,
+    pub ring: u32,
+    pub close_only: bool,
+    pub maximized: bool,
+    pub hover: bool,
+    pub pressed: Option<Light>,
+}
+
+/// Our title bar for a card `w` wide, with the ring round it and the top
+/// corners: the top `BAR_H + 1` rows of a frame `w + 2` wide.
+pub fn title_bar(font: &mut Font, w: usize, v: &BarView) -> Canvas {
+    let fw = w + 2;
+    let mut c = Canvas::new(fw, BAR_H as usize + 1, theme().bg);
+    let card = Rect::new(1.0, 1.0, w as f32, 4.0 * RADIUS);
+    c.rounded_rect(card.inset(-1.0), RADIUS + 1.0, v.ring);
+    c.rounded_rect(card, RADIUS, theme().winbar);
+    for x in [0, fw - 1] {
+        for y in RADIUS as usize..c.h {
+            c.px[y * fw + x] = v.ring;
+        }
+    }
+    for &(light, lx) in lights(v.close_only) {
+        let b = Rect::new(1.0 + lx, 1.0 + LIGHT_Y, LIGHT_D, LIGHT_D);
+        let lamp = match light {
+            Light::Close => draw::CLOSE,
+            Light::Minimize => draw::MINIMIZE,
+            Light::Maximize => draw::MAXIMIZE,
+        };
+        let lit = v.focused || v.hover;
+        let style = if v.pressed == Some(light) {
+            Raised::pressed(lamp.ring, lamp.ring)
+        } else if lit {
+            lamp.raised(theme().light_drop)
+        } else {
+            theme().light_idle
+        };
+        c.raised(b, LIGHT_D / 2.0, style);
+        if v.hover {
+            let g = match light {
+                Light::Close => &glyphs::LIGHT_CLOSE,
+                Light::Minimize => &glyphs::LIGHT_MIN,
+                Light::Maximize if v.maximized => &glyphs::LIGHT_RESTORE,
+                Light::Maximize => &glyphs::LIGHT_MAX,
+            };
+            c.glyph(g, b.x as i32, b.y as i32, lamp.glyph, 1.0);
+        }
+    }
+    let max = w as f32 - 148.0;
+    if max > 8.0 && !v.title.is_empty() {
+        let t = font.fit(v.title, SMALL_SIZE, max);
+        let tw = font.width(&t, SMALL_SIZE);
+        let color = if v.focused { theme().text } else { theme().dim };
+        font.draw(
+            &mut c,
+            &t,
+            (1.0 + (w as f32 - tw) / 2.0).round(),
+            1.0 + 15.0,
+            SMALL_SIZE,
+            color,
+        );
     }
     c
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Icon {
-    Globe,
-    Terminal,
-    Folder,
-    Page,
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
 }
 
-pub struct PanelItem {
-    pub icon: Icon,
-    pub running: bool,
-    pub focused: bool,
-}
-
-const PANEL_PAD: f32 = 4.0;
-const ITEM_W: f32 = 50.0;
-
-/// The width of the panel and the span of each item in it.
-pub fn panel_layout(items: &[PanelItem]) -> (usize, Vec<(f32, f32)>) {
-    let spans: Vec<_> = (0..items.len())
-        .map(|i| (PANEL_PAD + i as f32 * (ITEM_W + 4.0), ITEM_W))
-        .collect();
-    let w = spans
-        .last()
-        .map_or(PANEL_H as f32, |&(x, w)| x + w + PANEL_PAD);
-    (w.ceil() as usize, spans)
-}
-
-fn icon(c: &mut Canvas, icon: Icon, cx: f32, cy: f32, color: u32) {
-    let s = 1.6;
-    match icon {
-        Icon::Globe => {
-            c.ellipse(cx, cy, 9.0, 9.0, s, color);
-            c.ellipse(cx, cy, 4.0, 9.0, s, color);
-            c.line(cx - 9.0, cy, cx + 9.0, cy, s, color);
-        }
-        Icon::Terminal => {
-            c.line(cx - 9.0, cy - 5.0, cx - 4.0, cy, s, color);
-            c.line(cx - 4.0, cy, cx - 9.0, cy + 5.0, s, color);
-            c.line(cx, cy + 6.0, cx + 9.0, cy + 6.0, s, color);
-        }
-        Icon::Folder => {
-            c.stroke_rect(Rect::new(cx - 9.5, cy - 4.5, 19.0, 13.0), 2.0, s, color);
-            c.line(cx - 9.5, cy - 4.0, cx - 9.5, cy - 6.5, s, color);
-            c.line(cx - 9.5, cy - 7.5, cx - 3.5, cy - 7.5, s, color);
-            c.line(cx - 3.5, cy - 7.5, cx - 1.5, cy - 4.5, s, color);
-        }
-        Icon::Page => {
-            c.stroke_rect(Rect::new(cx - 7.0, cy - 9.0, 14.0, 18.0), 2.0, s, color);
-            for dy in [-4.0, 0.0, 4.0] {
-                c.line(cx - 3.5, cy + dy, cx + 3.5, cy + dy, s, color);
+/// A corner of a frame: the ring round the card corner over the client,
+/// and its shape: the pixels the card does not cover.
+pub fn corner(which: Corner, ring: u32) -> (Canvas, Canvas) {
+    let s = CORNER as usize;
+    let big = 4.0 * s as f32;
+    let outer = Rect::new(0.0, 0.0, big, big);
+    let inner = outer.inset(1.0);
+    let mut c = Canvas::new(s, s, theme().bg);
+    let mut m = Canvas::new(s, s, 0);
+    for j in 0..s {
+        for i in 0..s {
+            let (x, y) = match which {
+                Corner::TopLeft => (i, j),
+                Corner::TopRight => (s - 1 - i, j),
+                Corner::BottomLeft => (i, s - 1 - j),
+                Corner::BottomRight => (s - 1 - i, s - 1 - j),
+            };
+            let co = draw::coverage(x, y, outer, RADIUS + 1.0);
+            let ci = draw::coverage(x, y, inner, RADIUS);
+            c.px[j * s + i] = draw::mix(draw::mix(theme().bg, ring, co), theme().winbar, ci);
+            if co >= 0.5 && ci < 0.5 {
+                m.px[j * s + i] = 0xffffff;
             }
         }
     }
+    (c, m)
 }
 
-/// The panel and its shape.
-pub fn panel(
-    items: &[PanelItem],
-    w: usize,
-    spans: &[(f32, f32)],
-    hover: Option<usize>,
-) -> (Canvas, Canvas) {
-    let h = PANEL_H as usize;
-    let whole = Rect::new(0.0, 0.0, w as f32, h as f32);
-    let mut c = Canvas::new(w, h, BG);
-    c.bordered(whole, 12.0, SURFACE, HAIRLINE);
-    let ih = h as f32 - 2.0 * PANEL_PAD;
-    for (i, (item, &(x, iw))) in items.iter().zip(spans).enumerate() {
-        let fill = if item.focused {
-            Some(RAISED)
-        } else if hover == Some(i) {
-            Some(HOVER)
-        } else {
-            None
-        };
-        if let Some(f) = fill {
-            c.rounded_rect(Rect::new(x, PANEL_PAD, iw, ih), 9.0, f);
-        }
-        let color = if item.running || hover == Some(i) {
-            TEXT
-        } else {
-            DIM
-        };
-        icon(&mut c, item.icon, x + iw / 2.0, h as f32 / 2.0 - 1.0, color);
-        if item.running {
-            c.rounded_rect(
-                Rect::new(x + iw / 2.0 - 1.5, h as f32 - 8.5, 3.0, 3.0),
-                1.5,
-                color,
-            );
+/// The rows of a rounded rectangle `w` by `h` as SHAPE rectangles.
+pub fn rounded_shape(w: u16, h: u16, r: f32) -> Vec<(i16, i16, u16, u16)> {
+    let b = Rect::new(0.0, 0.0, w as f32, h as f32);
+    let ri = r.ceil() as u16;
+    if h <= 2 * ri || w <= 2 * ri {
+        return draw::mask_rects(w as usize, h as usize, |x, y| {
+            draw::coverage(x, y, b, r) >= 0.5
+        })
+        .into_iter()
+        .map(|(x, y, rw)| (x, y, rw, 1))
+        .collect();
+    }
+    let mut out = Vec::new();
+    for y in (0..ri).chain(h - ri..h) {
+        let first = (0..w / 2).find(|&x| draw::coverage(x as usize, y as usize, b, r) >= 0.5);
+        if let Some(x) = first {
+            out.push((x as i16, y as i16, w - 2 * x, 1));
         }
     }
-    let mut mask = Canvas::new(w, h, 0);
-    mask.rounded_rect(whole, 12.0, 0xffffff);
-    (c, mask)
+    out.push((0, ri as i16, w, h - 2 * ri));
+    out.sort_by_key(|r| r.1);
+    out
 }
 
-/// The item under `x` in the panel.
-pub fn panel_hit(spans: &[(f32, f32)], x: f32) -> Option<usize> {
-    spans.iter().position(|&(sx, sw)| x >= sx && x < sx + sw)
+/// The top and bottom bands of the snap preview, `r` rows each: SNAP
+/// with a HAIRLINE_HI ring inside the edge.
+pub fn snap_band(w: usize, h: usize, top: bool) -> Canvas {
+    let r = RADIUS as usize;
+    let mut c = Canvas::new(w, r, theme().bg);
+    let b = Rect::new(
+        0.0,
+        if top { 0.0 } else { r as f32 - h as f32 },
+        w as f32,
+        h as f32,
+    );
+    c.rounded_rect(b, RADIUS, theme().snap);
+    c.ring_in(b, RADIUS, theme().hairline_hi);
+    c
 }
 
-/// The who badge: a pill with a dot, and for a person a Done button that
-/// hands control back. The pixels, the shape, and the span of Done.
-pub fn badge(font: &mut Font, person: bool) -> (Canvas, Canvas, Option<(f32, f32)>) {
-    let label = if person { "You" } else { "Agent" };
-    let pill = (10.0 + 7.0 + 7.0 + font.width(label, SMALL_SIZE) + 10.0).ceil();
-    let done = (12.0 + font.width("Done", SMALL_SIZE) + 12.0).ceil();
-    let w = if person { pill + 4.0 + done } else { pill } as usize;
-    let h = BADGE_H;
-    let r = h as f32 / 2.0;
-    let mut c = Canvas::new(w, h, STRIP_BG);
-    let mut mask = Canvas::new(w, h, 0);
-    let first = Rect::new(0.0, 0.0, pill, h as f32);
-    c.bordered(first, r, SURFACE, HAIRLINE);
-    mask.rounded_rect(first, r, 0xffffff);
-    let dot = if person { AMBER } else { GREEN };
-    c.rounded_rect(Rect::new(10.0, r - 3.5, 7.0, 7.0), 3.5, dot);
-    font.draw(&mut c, label, 24.0, r, SMALL_SIZE, TEXT);
-    let mut span = None;
-    if person {
-        let x = pill + 4.0;
-        let b = Rect::new(x, 0.0, done, h as f32);
-        c.bordered(b, r, SURFACE, HAIRLINE);
-        mask.rounded_rect(b, r, 0xffffff);
-        font.draw(&mut c, "Done", x + 12.0, r, SMALL_SIZE, TEXT);
-        span = Some((x, done));
+/// Which way a connected popover runs from its pill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    /// Under a panel item, left edges aligned.
+    Below,
+    /// Right of a rail item, top edges aligned.
+    Right,
+    /// Right of a rail item, bottom edges aligned.
+    RightUp,
+}
+
+/// A pill and the sheet it flows into, in window coordinates.
+#[derive(Clone, Copy, Debug)]
+pub struct Connected {
+    pub pill: Rect,
+    pub sheet: Rect,
+    pub pill_r: f32,
+    pub side: Side,
+}
+
+const FILLET: f32 = 10.0;
+const SHEET_R: f32 = 10.0;
+
+impl Connected {
+    /// The outline grown by `d`, as points of window coordinates. The edge
+    /// at `d` 0 runs on pixel centers.
+    pub fn outline(&self, d: f32) -> Vec<(f32, f32)> {
+        // Laid out as for Below: u across, v down from the pill.
+        let to = |x: f32, y: f32| match self.side {
+            Side::Below => (x, y),
+            Side::Right => (y, x),
+            Side::RightUp => (-y, x),
+        };
+        let back = |u: f32, v: f32| match self.side {
+            Side::Below => (u, v),
+            Side::Right => (v, u),
+            Side::RightUp => (v, -u),
+        };
+        let boxed = |r: Rect| {
+            let (a, b) = (to(r.x, r.y), to(r.x + r.w, r.y + r.h));
+            (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1))
+        };
+        let (pl, pt, pr_, _) = boxed(self.pill);
+        let (sl, st, sr, sb) = boxed(self.sheet);
+        let (l, r, t) = (pl + 0.5, pr_ - 0.5, pt + 0.5);
+        let (s, s_l, s_r, b) = (st + 0.5, sl + 0.5, sr - 0.5, sb - 0.5);
+        let rp = self.pill_r;
+        let mut pts = Vec::new();
+        let mut arc = |cu: f32, cv: f32, rad: f32, a0: f32, a1: f32| {
+            let n = (rad.abs() * 1.5).ceil().max(2.0) as usize;
+            for k in 0..=n {
+                let a = a0 + (a1 - a0) * k as f32 / n as f32;
+                pts.push(back(cu + rad * a.cos(), cv + rad * a.sin()));
+            }
+        };
+        arc(l + rp, t + rp, rp + d, PI, 1.5 * PI);
+        arc(r - rp, t + rp, rp + d, 1.5 * PI, 2.0 * PI);
+        if s_r > r + 0.5 {
+            arc(r + FILLET, s - FILLET, FILLET - d, PI, FRAC_PI_2);
+            arc(s_r - SHEET_R, s + SHEET_R, SHEET_R + d, 1.5 * PI, 2.0 * PI);
+        }
+        arc(s_r - SHEET_R, b - SHEET_R, SHEET_R + d, 0.0, FRAC_PI_2);
+        arc(s_l + SHEET_R, b - SHEET_R, SHEET_R + d, FRAC_PI_2, PI);
+        pts
     }
-    (c, mask, span)
+}
+
+/// The connected shape on a `w` by `h` canvas: SURFACE inside, a 1 px
+/// HAIRLINE_HI outline, and the shape mask.
+pub fn connected(w: usize, h: usize, shape: &Connected) -> (Canvas, Canvas) {
+    let fill = draw::fill_coverage(w, h, &shape.outline(0.0));
+    let outer = draw::fill_coverage(w, h, &shape.outline(0.5));
+    let inner = draw::fill_coverage(w, h, &shape.outline(-0.5));
+    let mut c = Canvas::new(w, h, theme().bg);
+    let mut m = Canvas::new(w, h, 0);
+    for i in 0..w * h {
+        let p = draw::mix(theme().bg, theme().surface, fill[i]);
+        c.px[i] = draw::mix(p, theme().hairline_hi, outer[i] - inner[i]);
+        if outer[i] >= 0.5 {
+            m.px[i] = 0xffffff;
+        }
+    }
+    if shape.side == Side::Below {
+        let p = shape.pill;
+        let y = p.y as usize + 1;
+        for x in (p.x + shape.pill_r + 1.0) as usize..(p.x + p.w - shape.pill_r) as usize {
+            c.px[y * w + x] = theme().pill_hi;
+        }
+    }
+    (c, m)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowState {
+    Rest,
+    Hover,
+    Selected,
+}
+
+pub enum Row<'a> {
+    Search {
+        query: &'a str,
+        placeholder: &'a str,
+    },
+    Section(&'a str),
+    /// An app, a window or a URL: 26 px with a 16 px icon.
+    Item {
+        name: &'a str,
+        icon: Option<&'a Image>,
+        icon_name: &'a str,
+        detail: Option<&'a str>,
+        current: bool,
+        minimized: bool,
+        state: RowState,
+    },
+    /// 24 px, text only.
+    Action {
+        name: &'a str,
+        hint: Option<&'a str>,
+        state: RowState,
+    },
+    Sep,
+    Footer,
+}
+
+pub const SHEET_PAD: f32 = 5.0;
+
+impl Row<'_> {
+    pub fn height(&self) -> f32 {
+        match self {
+            Row::Search { .. } => 30.0,
+            Row::Section(_) => 22.0,
+            Row::Item { .. } => 26.0,
+            Row::Action { .. } => 24.0,
+            Row::Sep => 9.0,
+            Row::Footer => 5.0 + 29.0 - SHEET_PAD,
+        }
+    }
+}
+
+/// The height of a sheet holding `rows`.
+pub fn sheet_height(rows: &[Row]) -> f32 {
+    2.0 * SHEET_PAD + rows.iter().map(Row::height).sum::<f32>()
+}
+
+/// Draws the rows into the sheet `s` of a canvas.
+pub fn sheet(c: &mut Canvas, font: &mut Font, s: Rect, rows: &[Row]) {
+    let x = s.x + SHEET_PAD;
+    let w = s.w - 2.0 * SHEET_PAD;
+    let mut y = s.y + SHEET_PAD;
+    for row in rows {
+        let h = row.height();
+        match row {
+            Row::Search { query, placeholder } => {
+                let b = Rect::new(x, y, w, 28.0);
+                c.rounded_rect(b, 6.0, theme().bg);
+                c.ring_in(b, 6.0, theme().hairline_hi);
+                c.glyph(
+                    &glyphs::SEARCH,
+                    (x + 8.0) as i32,
+                    (y + 6.0) as i32,
+                    theme().dim,
+                    1.0,
+                );
+                let mid = y + 14.0;
+                let caret = if query.is_empty() {
+                    font.draw(c, placeholder, x + 34.0, mid, TEXT_SIZE, theme().dim);
+                    x + 32.0
+                } else {
+                    let q = font.fit(query, TEXT_SIZE, w - 44.0);
+                    x + 32.0
+                        + font
+                            .draw(c, &q, x + 32.0, mid, TEXT_SIZE, theme().text)
+                            .round()
+                };
+                c.fill_rect(caret as usize, (y + 7.0) as usize, 1, 14, theme().text);
+            }
+            Row::Section(label) => {
+                font.draw(c, label, x + 8.0, y + 12.0, LABEL_SIZE, theme().dim);
+            }
+            Row::Item {
+                name,
+                icon,
+                icon_name,
+                detail,
+                current,
+                minimized,
+                state,
+            } => {
+                row_fill(c, Rect::new(x, y, w, h), *state);
+                let mid = y + h / 2.0;
+                let opacity = if *minimized { 0.5 } else { 1.0 };
+                app_icon(c, font, *icon, icon_name, x + 8.0, y + 5.0, 16, opacity);
+                let mut right = x + w - 8.0;
+                if *current {
+                    dot(c, right - 7.0, mid, 5.0, theme().text);
+                    right -= 15.0;
+                }
+                let detail = if *minimized {
+                    Some(tr(Msg::Minimized))
+                } else {
+                    *detail
+                };
+                if let Some(d) = detail {
+                    let dw = font.width(d, SMALL_SIZE);
+                    font.draw(c, d, (right - dw).round(), mid, SMALL_SIZE, theme().dim);
+                    right -= dw + 8.0;
+                }
+                let color = if *minimized {
+                    theme().dim
+                } else {
+                    theme().text
+                };
+                let n = font.fit(name, TEXT_SIZE, right - (x + 32.0));
+                font.draw(c, &n, x + 32.0, mid, TEXT_SIZE, color);
+            }
+            Row::Action { name, hint, state } => {
+                row_fill(c, Rect::new(x, y, w, h), *state);
+                let mid = y + h / 2.0;
+                let mut right = x + w - 8.0;
+                if let Some(k) = hint {
+                    let kw = font.width(k, SMALL_SIZE);
+                    font.draw(c, k, (right - kw).round(), mid, SMALL_SIZE, theme().dim);
+                    right -= kw + 8.0;
+                }
+                let n = font.fit(name, TEXT_SIZE, right - (x + 8.0));
+                font.draw(c, &n, x + 8.0, mid, TEXT_SIZE, theme().text);
+            }
+            Row::Sep => {
+                c.fill_rect(
+                    (x + 3.0) as usize,
+                    (y + 4.0) as usize,
+                    (w - 6.0) as usize,
+                    1,
+                    theme().hairline,
+                );
+            }
+            Row::Footer => footer(c, font, s, y + 5.0),
+        }
+        y += h;
+    }
+}
+
+fn row_fill(c: &mut Canvas, b: Rect, state: RowState) {
+    match state {
+        RowState::Rest => {}
+        RowState::Hover => c.rounded_rect(b, 5.0, theme().hover),
+        RowState::Selected => c.rounded_rect(b, 5.0, theme().selected),
+    }
+}
+
+/// The key hints under the Applications menu, from `y`.
+fn footer(c: &mut Canvas, font: &mut Font, s: Rect, y: f32) {
+    c.fill_rect(
+        s.x as usize + 1,
+        y as usize,
+        s.w as usize - 2,
+        1,
+        theme().hairline,
+    );
+    let mid = y + 1.0 + 14.0;
+    let key_y = mid - 9.0;
+    let mut x = s.x + 13.0;
+    let key = |c: &mut Canvas, font: &mut Font, x: &mut f32, g: Option<&Glyph>, t: &str| {
+        let w = match g {
+            Some(_) => 18.0,
+            None => (8.0 + font.width(t, LABEL_SIZE)).round(),
+        };
+        c.raised(Rect::new(*x, key_y, w, 18.0), 4.0, theme().keycap);
+        match g {
+            Some(g) => c.glyph(
+                g,
+                (*x + 1.0) as i32,
+                (key_y + 1.0) as i32,
+                theme().text,
+                1.0,
+            ),
+            None => {
+                font.draw(c, t, *x + 4.0, key_y + 9.0, LABEL_SIZE, theme().text);
+            }
+        }
+        *x += w + 5.0;
+    };
+    let label = |c: &mut Canvas, font: &mut Font, x: &mut f32, t: &str, last: bool| {
+        *x += font.draw(c, t, *x, mid, SMALL_SIZE, theme().dim);
+        if !last {
+            *x += 5.0 + 8.0 + 5.0;
+        }
+    };
+    key(c, font, &mut x, Some(&glyphs::UP), "");
+    key(c, font, &mut x, Some(&glyphs::DOWN), "");
+    label(c, font, &mut x, tr(Msg::Move), false);
+    key(c, font, &mut x, Some(&glyphs::ENTER), "");
+    label(c, font, &mut x, tr(Msg::Open), false);
+    key(c, font, &mut x, None, "Esc");
+    label(c, font, &mut x, tr(Msg::Close), true);
 }
 
 /// A ring around a click, and its shape.
 pub fn ripple(person: bool) -> (Canvas, Canvas) {
     let s = RIPPLE as usize;
     let mid = s as f32 / 2.0;
-    let mut c = Canvas::new(s, s, BG);
-    c.ring(mid, mid, 15.0, 7.0, BG);
-    c.ring(mid, mid, 15.0, 3.5, if person { AMBER } else { TEXT });
+    let mut c = Canvas::new(s, s, theme().bg);
+    c.ring(mid, mid, 15.0, 7.0, theme().bg);
+    c.ring(
+        mid,
+        mid,
+        15.0,
+        3.5,
+        if person { theme().amber } else { theme().text },
+    );
     let mut mask = Canvas::new(s, s, 0);
     mask.ring(mid, mid, 15.0, 7.0, 0xffffff);
     (c, mask)
@@ -237,44 +935,177 @@ mod tests {
     use super::*;
 
     #[test]
-    fn work_area_leaves_room_for_the_strip() {
-        assert_eq!(work_area(1280, 800), (12, 40, 1256, 748));
+    fn the_work_area_is_right_of_the_rail_under_the_panel() {
+        assert_eq!(work_area(1280, 800), (64, 40, 1208, 752));
     }
 
     #[test]
-    fn panel_hits_the_item_under_the_pointer() {
-        let items = vec![
-            PanelItem {
-                icon: Icon::Terminal,
-                running: true,
-                focused: true,
-            },
-            PanelItem {
-                icon: Icon::Globe,
-                running: false,
-                focused: false,
-            },
-        ];
-        let (w, spans) = panel_layout(&items);
-        assert_eq!(w, 112);
-        assert_eq!(panel_hit(&spans, spans[0].0 + 1.0), Some(0));
-        assert_eq!(panel_hit(&spans, spans[1].0 + 1.0), Some(1));
-        assert_eq!(panel_hit(&spans, 0.0), None);
-        let (c, m) = panel(&items, w, &spans, Some(1));
-        assert_eq!(c.w, w);
-        assert!(!inside(&m, 0, 0));
-        assert!(inside(&m, w / 2, 20));
+    fn rail_items_are_hit_by_their_box() {
+        assert_eq!(rail_hit(3, 30.0, 41.0), Some(0));
+        assert_eq!(rail_hit(3, 30.0, 90.0), None);
+        assert_eq!(rail_hit(3, 30.0, 92.0), Some(1));
+        assert_eq!(rail_hit(3, 2.0, 50.0), None);
+        assert_eq!(rail_hit(1, 30.0, 100.0), None);
     }
 
     #[test]
-    fn a_person_gets_a_done_button() {
+    fn the_panel_lays_out_its_controls() {
         let mut f = Font::new();
-        let (a, _, none) = badge(&mut f, false);
-        let (p, _, done) = badge(&mut f, true);
-        assert!(none.is_none());
-        let (x, w) = done.unwrap();
-        assert!(x > 0.0 && x + w <= p.w as f32);
-        assert!(p.w > a.w);
+        let view = PanelView {
+            app: Some(("Chromium", None)),
+            person: Some(true),
+            hover: None,
+            pressed: None,
+        };
+        let l = panel_layout(&mut f, 1280, &view);
+        assert_eq!(l.apps.0, 4.0);
+        let (ax, _) = l.app.unwrap();
+        assert_eq!(ax, l.apps.0 + l.apps.1 + 4.0);
+        let (hx, hw) = l.hand.unwrap();
+        assert_eq!(hx + hw, 1276.0);
+        assert_eq!(l.hit(10.0, 10.0), Some(PanelHit::Apps));
+        assert_eq!(l.hit(ax + 2.0, 10.0), Some(PanelHit::App));
+        assert_eq!(l.hit(hx + 2.0, 10.0), Some(PanelHit::HandBack));
+        assert_eq!(l.hit(hx + 2.0, 30.0), None);
+        let c = panel(&mut f, 1280, &view, &l);
+        assert_eq!((c.w, c.h), (1280, 32));
+    }
+
+    #[test]
+    fn lights_are_hit_by_position() {
+        assert_eq!(light_hit(false, 12.0, 15.0), Some(Light::Close));
+        assert_eq!(light_hit(false, 30.0, 15.0), Some(Light::Minimize));
+        assert_eq!(light_hit(false, 50.0, 15.0), Some(Light::Maximize));
+        assert_eq!(light_hit(true, 50.0, 15.0), None);
+        assert_eq!(light_hit(false, 200.0, 15.0), None);
+    }
+
+    #[test]
+    fn a_rounded_shape_cuts_the_corners_only() {
+        let rects = rounded_shape(100, 60, 13.0);
+        let full: u32 = rects.iter().map(|r| r.2 as u32 * r.3 as u32).sum();
+        assert!(full < 6000 && full > 5800, "{full}");
+        assert!(rects.iter().all(|r| r.0 >= 0 && r.0 as u16 + r.2 <= 100));
+    }
+
+    #[test]
+    fn a_corner_shows_the_ring_and_hides_the_outside() {
+        let (c, m) = corner(Corner::TopLeft, 0xffffff);
+        assert!(!inside(&m, 0, 0));
+        assert!(!inside(&m, 12, 12));
+        assert!(inside(&m, 12, 0));
+        assert!(c.px[12] & 0xff >= 0xf0);
+        let (_, m) = corner(Corner::BottomRight, 0xffffff);
+        assert!(!inside(&m, 12, 12));
+        assert!(inside(&m, 0, 12));
+    }
+
+    #[test]
+    fn a_connected_popover_joins_pill_and_sheet() {
+        let shape = Connected {
+            pill: Rect::new(0.0, 0.0, 100.0, 24.0),
+            sheet: Rect::new(0.0, 32.0, 200.0, 100.0),
+            pill_r: 6.0,
+            side: Side::Below,
+        };
+        let (c, m) = connected(200, 132, &shape);
+        assert!(inside(&m, 50, 12));
+        assert!(inside(&m, 50, 28));
+        assert!(!inside(&m, 150, 12));
+        assert!(inside(&m, 150, 80));
+        assert!(!inside(&m, 199, 131));
+        assert_eq!(c.px[0], theme().bg);
+        assert_eq!(c.px[60 * 200 + 50], theme().surface);
+        assert_eq!(c.px[60 * 200], theme().hairline_hi);
+        let side = Connected {
+            pill: Rect::new(0.0, 0.0, 48.0, 48.0),
+            sheet: Rect::new(56.0, 0.0, 200.0, 120.0),
+            pill_r: 12.0,
+            side: Side::Right,
+        };
+        let (_, m) = connected(256, 120, &side);
+        assert!(inside(&m, 24, 24));
+        assert!(inside(&m, 52, 10));
+        assert!(!inside(&m, 24, 100));
+        assert!(inside(&m, 100, 100));
+        let up = Connected {
+            pill: Rect::new(0.0, 72.0, 48.0, 48.0),
+            sheet: Rect::new(56.0, 0.0, 200.0, 120.0),
+            pill_r: 12.0,
+            side: Side::RightUp,
+        };
+        let (_, m) = connected(256, 120, &up);
+        assert!(inside(&m, 24, 96));
+        assert!(!inside(&m, 24, 20));
+        assert!(inside(&m, 100, 20));
+    }
+
+    #[test]
+    fn sheets_fit_their_rows() {
+        let mut f = Font::new();
+        let rows = [
+            Row::Search {
+                query: "",
+                placeholder: "Search",
+            },
+            Row::Section("Applications"),
+            Row::Item {
+                name: "Terminal",
+                icon: None,
+                icon_name: "Terminal",
+                detail: Some("Shell"),
+                current: false,
+                minimized: false,
+                state: RowState::Selected,
+            },
+            Row::Sep,
+            Row::Action {
+                name: "Quit",
+                hint: None,
+                state: RowState::Hover,
+            },
+            Row::Footer,
+        ];
+        let h = sheet_height(&rows);
+        assert_eq!(h, 10.0 + 30.0 + 22.0 + 26.0 + 9.0 + 24.0 + 29.0);
+        let mut c = Canvas::new(320, h as usize, theme().surface);
+        sheet(&mut c, &mut f, Rect::new(0.0, 0.0, 320.0, h), &rows);
+        assert!(c.px.contains(&theme().raised));
+    }
+
+    #[test]
+    fn a_note_wraps_its_body() {
+        let mut f = Font::new();
+        let (c, m) = note(
+            &mut f,
+            None,
+            "Chromium",
+            "Download complete",
+            "fares-2026-11-14.pdf, 182 KB, in Downloads",
+        );
+        assert_eq!(c.w, NOTE_W + 2);
+        assert_eq!(c.h, 55);
+        assert_eq!((m.w, m.h), (c.w, c.h));
+    }
+
+    #[test]
+    fn a_title_bar_has_lights_and_a_ring() {
+        let mut f = Font::new();
+        let v = BarView {
+            title: "Terminal",
+            focused: true,
+            ring: theme().hairline_hi,
+            close_only: false,
+            maximized: false,
+            hover: false,
+            pressed: None,
+        };
+        let c = title_bar(&mut f, 400, &v);
+        assert_eq!((c.w, c.h), (402, 31));
+        assert_eq!(c.px[200], theme().hairline_hi);
+        assert_eq!(c.px[402 * 20 + 401], theme().hairline_hi);
+        assert_eq!(c.px[402 * 3 + 300], theme().winbar);
+        assert_eq!(c.px[402 * 15 + 17], draw::CLOSE.fill);
     }
 
     #[test]

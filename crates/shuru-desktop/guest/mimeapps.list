@@ -1,0 +1,16 @@
+[Default Applications]
+application/pdf=chromium.desktop
+text/html=chromium.desktop
+application/xhtml+xml=chromium.desktop
+x-scheme-handler/http=chromium.desktop
+x-scheme-handler/https=chromium.desktop
+image/png=chromium.desktop
+image/jpeg=chromium.desktop
+image/gif=chromium.desktop
+image/webp=chromium.desktop
+image/svg+xml=chromium.desktop
+image/avif=chromium.desktop
+text/plain=org.gnome.TextEditor.desktop
+text/markdown=org.gnome.TextEditor.desktop
+text/x-markdown=org.gnome.TextEditor.desktop
+inode/directory=org.gnome.Nautilus.desktop

@@ -1,0 +1,23 @@
+[Desktop Entry]
+Type=Application
+Name=Chromium
+GenericName=Web browser
+GenericName[zh_CN]=网页浏览器
+Comment=Browse the web
+Exec=chromium --force-renderer-accessibility %U
+Icon=chromium
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+StartupWMClass=chromium
+Actions=new-window;new-private-window;
+
+[Desktop Action new-window]
+Name=New Window
+Name[zh_CN]=新建窗口
+Exec=chromium --force-renderer-accessibility --new-window
+
+[Desktop Action new-private-window]
+Name=New Incognito Window
+Name[zh_CN]=新建无痕窗口
+Exec=chromium --force-renderer-accessibility --incognito

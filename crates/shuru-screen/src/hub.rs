@@ -527,7 +527,11 @@ mod tests {
         // Bytes waiting throughout: 37.5 kB in 300 ms is 1 Mbit/s.
         d.sample(t0 + Duration::from_millis(550), 5000, 120_000);
         d.sample(t0 + Duration::from_millis(700), 5000, 137_500);
-        assert!((d.capacity_bps - 1_000_000.0).abs() < 1.0, "{}", d.capacity_bps);
+        assert!(
+            (d.capacity_bps - 1_000_000.0).abs() < 1.0,
+            "{}",
+            d.capacity_bps
+        );
     }
 
     #[test]

@@ -2,29 +2,29 @@
 
 - Status: Draft
 - Date: 2026-11-04
-- Scope: new crate shuru-desktop, shuru-screen (in review), the desktop recipe
+- Scope: shuru-desktop, shuru-screen, the desktop recipe
 - Depends on: RFC 0004 (guest services), shuru-screen (X11 capture, H.264 stream, input gate)
 
 ## Summary
 
-`shuru-desktop` is a window manager for a Linux desktop that an agent
-uses: an X11 window manager, a small panel, and an API on a Unix socket
-that tells the agent what is on the screen in words and refs, not only
-pixels. It replaces Openbox and a panel in a guest, and runs next to
-Xvfb and `shuru-screen`.
+`shuru-desktop` is the desktop of a Linux guest that an agent uses: a
+stacking X11 window manager with a panel, a rail of apps and menus, a
+notification server, the appearance setting, and an API on a Unix socket
+that tells the agent what is on the screen in words, not only pixels. It
+runs next to Xvfb and `shuru-screen`.
 
 It is made for two users: the agent, which needs a screen that is the
 same every time, says what can be clicked, and says when it has settled;
-and the person watching, who needs to see the cursor, where the agent
-clicked, and who is in control.
+and the person watching or taking over, who needs a desktop that feels
+like one, sees the cursor and where the agent clicked, and knows who is
+in control.
 
 ## Motivation
 
 Agents that use computers run today on desktops made for people: XFCE
 or GNOME with a VNC server on top. They cost a gigabyte of memory idle,
-show notifications, overlap windows, animate, and give the agent
-nothing but pixels. What works in practice, from computer use tools and
-from OSWorld, is:
+show unrelated popups, animate, and give the agent nothing but pixels.
+What works in practice, from computer use tools and from OSWorld, is:
 
 - a small fixed screen, so coordinates need no scaling (1024x768 to
   1280x800);
@@ -32,53 +32,173 @@ from OSWorld, is:
   on a screenshot only where the tree is thin (Electron, canvas);
 - refusing an action made from an old observation;
 - waiting for the screen to settle, not sleeping a guessed time;
-- asking before actions that send, delete or pay, and never typing into
-  a password field for the agent, and letting it sign in with a secret
-  it never sees.
+- asking before actions that send, delete or pay, never typing into a
+  password field for the agent, and letting it sign in with a secret it
+  never sees.
 
-None of this needs a desktop environment. It needs a window manager
-that knows what it is for.
+None of this needs a desktop environment. It needs a window manager that
+knows what it is for, and enough of a desktop that a person who takes
+over is at home.
 
 ## Shape
 
-- **One process**, `shuru-desktop`, a static Rust binary on `x11rb`.
-  It owns the X11 window management of the display and draws the panel
-  and the overlays itself. Memory about 10 MB.
-- **One app on screen at a time.** The focused top level window fills
-  the screen less a 12 px margin; transient windows (dialogs, popups)
-  are centred over their parent. No window overlaps another app.
-- **Fixed geometry.** 1280x800 at 96 DPI, one font set, no animations,
-  no compositing, a flat background.
-- **The API is the agent interface.** Windows, apps, the accessibility
-  tree, marks and settle waits are answered on a Unix socket, so the
+- **One process**, `shuru-desktop`, a Rust binary on `x11rb`. It manages
+  the windows of the display, draws the panel, the rail, menus, frames,
+  notification cards and overlays itself with a small software
+  rasterizer, and serves the API. About 6 MB resident, no CPU when
+  idle.
+- **Fixed geometry, followed when it changes.** 1280x800 at 96 DPI by
+  default; when RandR changes the screen size, the shell follows.
+- **No animations, no compositor.** Menus, cards and overlays show at
+  once; motion only for hover states.
+- **The API is the agent interface.** Windows, apps, appearance,
+  notifications and settle waits are answered on a Unix socket, so the
   agent tool needs few screenshots and no pixel search.
-- **The overlays are for people.** Cursor, click ripple, who is in
-  control. They are drawn on a layer the agent can ask to leave out of
-  its screenshots.
 
-## The window manager
+## The desktop
 
-- Reparents nothing; top level windows are mapped full size, with a 28
-  px strip above holding the app name. Override redirect windows (menus,
-  tooltips) are left alone.
-- Focus is explicit: the app on screen has it. Switching is by the API,
-  by the panel, or by `alt+tab` for a person.
-- EWMH enough for Chromium, GTK and Qt apps to behave: `_NET_ACTIVE_WINDOW`,
-  `_NET_CLIENT_LIST`, `_NET_WM_STATE_FULLSCREEN`, `_NET_WM_WINDOW_TYPE`
-  for dialogs and docks, `_NET_WM_NAME`.
-- New windows of the focused app come to the front; a window of another
-  app that maps on its own is listed, not raised, so a background app
-  cannot steal the screen from the agent.
-- No notification daemon is run. A `org.freedesktop.Notifications`
-  service that keeps them and answers them on the API, not on screen,
-  is part of slice 2.
+- **Panel**, 32 px at the top: the Applications menu (search over apps
+  and windows, or a URL), the app in front and its menu, and who is in
+  control, with Hand back while a person has it.
+- **Rail**, 64 px on the left: the configured apps and the running ones,
+  dots for open windows, a fill for the app in front, a small dot for an
+  app that asks for attention. A click focuses or starts; a right click,
+  or a click on the app in front, opens its menu (New Window and the
+  `.desktop` actions, its windows, Hide, Quit).
+- **Windows** are framed: a 1 px ring, 12 px corners, amber while a
+  person is in control. Clients without decorations get our title bar
+  with the three window lights. Clients with their own (GTK client side
+  decorations) keep them, and the frame honors the shadow they declare in
+  `_GTK_FRAME_EXTENTS`.
+- **Placement.** Top level windows open maximized in the work area;
+  they float, move, resize by a band round the edge and snap to the
+  halves and the whole work area. Transients float centered over their
+  parent.
+- **Focus.** The app in front has the keyboard. A window of another app
+  that maps on its own is listed, not raised, so a background app cannot
+  take the screen from the agent; a pager (`_NET_ACTIVE_WINDOW` with
+  source 2) may still raise it.
+- **Keys.** Super opens the Applications menu, Alt+Tab cycles apps,
+  Alt+` the windows of the app in front.
+- **Take over.** With `who` set to `person`, the panel says so, a toast
+  says the agent is paused, frames ring amber, and the click ripple stops.
 
-## The panel
+## Window manager hints
 
-A small pill centred at the bottom: the apps of the desktop (from
-`.desktop` files in a configured list) and the running ones. It is for
-the person who takes over; the agent launches by name through the API.
-It is hidden in screenshots the agent takes unless asked for.
+EWMH and ICCCM enough for Chromium, GTK, Qt and X toolkits to behave:
+
+- `_NET_SUPPORTED`, `_NET_SUPPORTING_WM_CHECK`, `_NET_CLIENT_LIST`,
+  `_NET_CLIENT_LIST_STACKING`, `_NET_ACTIVE_WINDOW` (published by the
+  window manager and honored from clients by the focus rule above),
+  `_NET_WORKAREA`, `_NET_DESKTOP_GEOMETRY`, `_NET_CLOSE_WINDOW`,
+  `_NET_WM_MOVERESIZE`, `_NET_FRAME_EXTENTS`.
+- `_NET_WM_STATE`: maximized horizontally and vertically, hidden,
+  fullscreen, above, demands attention, modal, focused. Fullscreen covers
+  the panel and the rail and returns to the previous state. Above keeps a
+  window over the others. Demands attention, and the urgency bit of
+  `WM_HINTS`, mark the rail until the window is focused.
+- `WM_TRANSIENT_FOR` groups transients with their parent; a modal
+  transient takes the focus whenever its parent would.
+- `WM_NORMAL_HINTS` minimum and maximum sizes and resize increments bound
+  every resize.
+- RandR screen changes: the panel, the rail, the work area and the snap
+  targets are recomputed, maximized windows fill the new work area,
+  floating ones are moved and shrunk to stay on screen.
+- The X screen saver is off: Xvfb runs with `-s 0 -nodpms`, and the
+  window manager sets the screen saver timeout to 0 at start.
+
+## Cursors
+
+Cursors come from the Xcursor theme (Adwaita by default, `XCURSOR_THEME`
+or the `Xcursor.theme` resource otherwise), with the X cursor font as a
+fallback: the arrow by default and on the root, resize arrows on window
+edges and corners, the move cursor while dragging a title bar, a pointer
+over panel controls and rail items, and the text cursor in the search
+field.
+
+The real cursor is hidden with XFixes and drawn in an overlay window from
+the current cursor image, so captures show it. Raw XInput 2 events move
+it; while the pointer moves it is also polled every 100 ms for warps,
+and once a second when idle.
+
+## Appearance
+
+Light, the default, and Dark. The colors of the shell are a theme table
+with the same tokens in both. The setting lives in the guest at
+`~/.config/superhq/appearance`; the window manager watches the file with
+inotify and switches live, redrawing everything it draws. A switch is
+carried to apps four ways:
+
+- XSETTINGS: the window manager owns `_XSETTINGS_S0` and names the GTK
+  theme (`SuperHQ` or `SuperHQ-dark`, both in the guest), so running
+  GTK 3 apps restyle.
+- `gsettings`: `org.gnome.desktop.interface color-scheme` is set to
+  `prefer-light` or `prefer-dark`, and `gtk-theme` to the theme.
+- `~/.config/gtk-3.0/settings.ini`: the theme and
+  `gtk-application-prefer-dark-theme` for apps that start later.
+- The settings portal: `org.freedesktop.portal.Settings` answers
+  `org.freedesktop.appearance color-scheme` and signals `SettingChanged`,
+  for libadwaita and other portal clients.
+
+Chromium follows the GTK theme for its frame and for web
+`prefers-color-scheme`; there is no pinned frame or page scheme. Its
+frame switches live; pages follow the theme Chromium starts with and lag
+one switch behind on a live change, a limit of how Chromium reads the
+GTK theme.
+
+`GET /appearance` and `PUT /appearance` read and set it.
+
+## Notifications
+
+The window manager owns `org.freedesktop.Notifications` on the session
+bus (zbus): `GetCapabilities` (body, actions), `Notify` with
+`replaces_id`, `CloseNotification`, `GetServerInformation`, and the
+`NotificationClosed` and `ActionInvoked` signals. The runtime starts a
+session bus for the desktop user and runs the desktop in it.
+
+A notification is a card at the top right of the work area: the app
+icon, the summary, up to two lines of body and a close button. Up to
+three show, newest on top. `expire_timeout` is honored, 5 s by default.
+A click runs the default action, or dismisses. The agent sees the last 50
+with `GET /notifications` and acts with
+`POST /notifications/{id}/action`, so a download finished or a message
+arrived is something it can read, not only a picture.
+
+## Text and localization
+
+Text is shaped with cosmic-text: HarfBuzz shaping (harfrust), bidi, font
+fallback through fontconfig, and swash for glyphs, color emoji included
+(CBDT and COLRv0). Inter is the first font and is built in; system fonts
+cover the rest. Shaped lines and glyphs are cached, so redraws cost no
+shaping. Ellipsizing is by shaped width. The layout is the same in every
+language; right to left text is shaped and shown in its order, but the
+shell is not mirrored.
+
+The guest ships two fallback fonts from the desktop release, pinned by
+sha256: Noto Sans CJK SC Regular (Chinese and Japanese) and Noto Color
+Emoji. They go to `/usr/local/share/fonts`, not `fonts-noto-cjk`, which
+is hundreds of MB.
+
+The shell has a string table keyed by message id, with English as the
+fallback. The default locale is English (US): the guest default is
+`LANG=en_US.UTF-8`, the English strings use US spelling, and anything
+date or number related follows en_US. The second language is Simplified
+Chinese: `zh_CN`, `zh_SG` and `zh_Hans` map to it, everything else is
+English. The locale is read from `LC_ALL`, then `LC_MESSAGES`, then
+`LANG`. App names and actions come from the `.desktop` files by the
+Desktop Entry locale rules (`Name[zh_CN]`, then `Name[zh]`, then
+`Name`). The runtime passes `LANG` to the desktop, and the desktop to the
+apps it launches, so Chromium and GTK apps speak the same language.
+
+## Input
+
+`shuru-screen` holds the input gate: the agent sends input with
+`POST /input` while the gate is `agent`, a person through the viewer
+stream while it is theirs. Besides moves, buttons, wheel and keys, a
+`text` event types any Unicode string: characters in the keymap are
+pressed as they are, others are bound to a spare keycode for the moment
+they are typed, so `你好，世界` reaches Chromium and a terminal without an
+input method.
 
 ## The API
 
@@ -86,104 +206,98 @@ HTTP on a Unix socket (`/run/shuru-desktop.sock`, mode 0600), JSON.
 
 | route | answers |
 |---|---|
-| `GET /windows` | `[{ id, app, title, pid, focused, kind }]` |
-| `POST /focus {id}` | focuses an app window |
-| `POST /close {id}` | asks it to close (`WM_DELETE_WINDOW`) |
-| `POST /launch {app, args?}` | starts a `.desktop` app as the desktop user, answers its window once mapped |
-| `GET /observe?tree=1&marks=0` | an observation: id, the focused window, its accessibility tree as a compact list of elements, each `{ ref, role, name, value?, bounds, states }` |
-| `GET /marks` | a PNG of the screen with a numbered tag on each element of the last observation, for when the tree is thin |
-| `POST /act {observation, ref, action, text?, secret?}` | click, double, focus, type, type_secret, press on an element by ref; refused with `stale_observation` if the screen changed since that observation, `password_field` for type into a password field |
+| `GET /windows` | `[{id, app, class, title, pid, focused, kind, fullscreen, state, geometry}]` |
+| `POST /focus {id, maximize?}` | focuses an app window, maximized unless asked not to |
+| `POST /close {id}` | asks it to close (`WM_DELETE_WINDOW`), or kills a client without it |
+| `POST /launch {app, args?, timeout_ms?, maximize?}` | starts a `.desktop` app as the desktop user, answers its window once mapped |
 | `GET /settle?quiet_ms=300&max_ms=5000` | answers once the screen has not changed for `quiet_ms`, from the damage events of the display |
-| `GET /field` | what has keyboard focus, and whether it is a password field |
-| `POST /overlay {who, ripple?}` | `who` is `agent`, `person` or null; a ripple at a point |
+| `GET /overlay`, `POST /overlay {who, ripple?}` | who is in control; a ripple at a point |
+| `GET /appearance`, `PUT /appearance {appearance}` | light or dark |
+| `GET /notifications` | the recent notifications, open or closed |
+| `POST /notifications/{id}/action {key?}` | runs an action, `default` by default |
 
-Coordinates are in screen pixels of the fixed 1280x800 screen.
-Element refs are stable for the life of an observation.
+Planned for the next slice:
+
+| route | answers |
+|---|---|
+| `GET /observe?tree=1&marks=0` | an observation: id, the focused window, its accessibility tree as a compact list of elements, each `{ref, role, name, value?, bounds, states}` |
+| `GET /marks` | a PNG of the screen with a numbered tag on each element of the last observation |
+| `POST /act {observation, ref, action, text?, secret?}` | click, double, focus, type, type_secret, press on an element by ref; refused with `stale_observation` if the screen changed since that observation, `password_field` for type into a password field |
+| `GET /field` | what has keyboard focus, and whether it is a password field |
+
+Coordinates are in screen pixels.
 
 ### The accessibility tree
 
 Read from AT-SPI over D-Bus: the guest runs `at-spi2-registryd`, and
-apps are started with accessibility on (`GTK_MODULES`, `QT_ACCESSIBILITY=1`,
-Chromium with `--force-renderer-accessibility`). The tree is cut to the
-focused window, to visible and enabled elements, and to roles that can
-be acted on or read (buttons, links, fields, lists, rows, headings,
-text). A cap of 400 elements an observation keeps it small for a model;
-past it, elements of the visible area first.
+apps are started with accessibility on (`GTK_MODULES`,
+`QT_ACCESSIBILITY=1`, Chromium with `--force-renderer-accessibility`).
+The tree is cut to the focused window, to visible and enabled elements,
+and to roles that can be acted on or read. A cap of 400 elements an
+observation keeps it small for a model.
 
-Where an app gives no tree (canvas, some Electron apps), `/observe`
-says so and the agent uses `/marks`, which then tags regions found by
-the boxes of what the tree does have, or nothing, and the agent falls
-back to coordinates.
+Where an app gives no tree (canvas, some Electron apps), `/observe` says
+so and the agent uses `/marks`, or coordinates.
 
 ### Settling
 
-`shuru-screen` already listens for damage on the display. Both use the
-DAMAGE extension directly; `shuru-desktop` keeps a last change time and
-answers `/settle` from it, so a screenshot is taken once a page has
-stopped moving, not after a guessed sleep.
-
-### Input
-
-Clicks and keys go through the input gate of `shuru-screen` when it
-runs (only the holder of the gate may send input), else through XTEST
-directly. Long text is set on the clipboard and pasted, which is faster
-than typing and keeps keyboard layout out of it; a field that refuses
-paste gets typed text. Key chords are checked against the keysyms the
-display has.
+`shuru-desktop` keeps a last change time from the DAMAGE extension on the
+root, leaving out damage from its own windows, and answers `/settle` from
+it, so a screenshot is taken once a page has stopped moving.
 
 ## Safety in the desktop
 
 - **Password fields take secrets, not text.** `/act` with `type` into a
   password field is refused, never skipped: nothing is typed, and the
-  answer is `password_field` with the reason, so the agent does not go
-  on as if it had typed. The agent then has two ways on:
+  answer is `password_field` with the reason. The agent then has two
+  ways on:
   - `/act` with `type_secret` and the name of a secret: the desktop
     types the placeholder of that secret (RFC 0002, RFC 0013). The proxy
     puts the real value in only on requests to the hosts bound to the
     secret, so the value is never in the guest, a screenshot or the
-    context of the model, and on any other site the placeholder is a
-    useless string. A name the guest has no secret for answers
+    context of the model. A name the guest has no secret for answers
     `no_such_secret`.
-  - ask the person: the tool marks the step as needing them, and a
-    person types it after taking over. No screenshot is taken for the
-    agent while a person is in control.
-- Password fields are found in the accessibility tree. An app that
-  gives no tree (canvas, some Electron apps) cannot be checked, and
-  typing there is not refused; the tool says so in what it tells the
-  agent, and taking over is the way in for those.
-- The overlay shows who is in control, with a border when it is a
-  person, so a watcher never mistakes the agent for themselves.
-- Typed text is never logged. The API logs routes and refs only.
+  - ask the person, who types it after taking over. No screenshot is
+    taken for the agent while a person is in control.
+- Password fields are found in the accessibility tree. An app that gives
+  no tree cannot be checked; the tool says so, and taking over is the way
+  in for those.
+- The panel and the frames show who is in control, so a watcher never
+  mistakes the agent for themselves.
+- Typed text is never logged. The API logs routes only.
 - Asking before an outward action is the tool of the agent, not the
-  window manager: it does not know what a button does. It does give the
-  tool the element name and role to ask with.
+  window manager: it does not know what a button does.
 
 ## The guest
 
-A recipe or image installs Xvfb, Chromium, `at-spi2-core`, and
-`shuru-desktop` and `shuru-screen`, and runs them as guest services
-under an unprivileged `desktop` user:
+A recipe or image installs Xvfb, Chromium, `at-spi2-core`, the guest
+settings of `shuru-desktop` (`crates/shuru-desktop/guest`: GTK themes,
+Chromium preferences and policy, desktop entries, `mimeapps.list`, xterm
+resources), the two fonts, the `en_US.UTF-8` and `zh_CN.UTF-8` locales,
+and runs as guest services under an unprivileged `desktop` user:
 
 ```
-xvfb      Xvfb :1 -screen 0 1280x800x24 -shmem -dpi 96
-desktop   shuru-desktop --display :1 --socket /run/shuru-desktop.sock
+xvfb      Xvfb :1 -screen 0 1280x800x24 -shmem -dpi 96 -s 0 -nodpms
+desktop   dbus-run-session -- shuru-desktop --display :1 --socket /run/shuru-desktop.sock --apps ...
 screen    shuru-screen --display :1 --socket /run/shuru-screen.sock
-chromium  chromium --force-renderer-accessibility --no-first-run ...
 ```
 
-Chromium gets a policy file: no first run, no default browser check, no
-translate bar, no password saving, downloads to `~/Downloads` without a
-prompt.
+with `LANG` and `XCURSOR_THEME=Adwaita` in the environment of the desktop
+service. Chromium gets `initial_preferences` and a managed policy: no
+first run or sign in screens, no sync, no default browser check, no
+password saving. PDF, HTML and images open in Chromium, text and Markdown
+in the editor, directories in Files.
 
 ## Slices
 
 1. The window manager: layout, focus, EWMH, the panel, `/windows`,
-   `/focus`, `/close`, `/launch`, `/settle`, the overlays. Replaces
-   Openbox.
-2. `/observe` with AT-SPI, `/act` by ref with stale refusal, `/field`
-   with the password refusal and `type_secret`, `/marks`, the
-   notification service.
-3. One process with `shuru-screen`, sharing the X connection and the
+   `/focus`, `/close`, `/launch`, `/settle`, the overlays. Done.
+2. The desktop: stacking windows, rail, menus, frames, appearance,
+   notifications, fonts and localization, cursors, RandR, text input.
+   This change.
+3. `/observe` with AT-SPI, `/act` by ref with stale refusal, `/field`
+   with the password refusal and `type_secret`, `/marks`.
+4. One process with `shuru-screen`, sharing the X connection and the
    damage tracking.
 
 ## Not in this RFC
@@ -191,20 +305,29 @@ prompt.
 - Wayland. A compositor on smithay could replace Xvfb, the window
   manager and capture in one; this RFC stays on X11 until the API shows
   what it must keep.
-- More than one screen, or a screen size that changes.
+- More than one screen.
+- Clipboard sync between the guest and the viewer.
+- Languages beyond English and Simplified Chinese, and mirrored layouts
+  for right to left languages.
 - Sound.
 
 ## Testing
 
-- In a Linux container with Xvfb: windows map full size, a dialog is
-  centred over its parent, focus follows the API, an app that maps in
-  the background does not take focus.
-- `/settle` answers within `quiet_ms` of the last change of a scripted
-  animation, and waits while it runs.
-- `/observe` on a GTK test app and on Chromium with a known page lists
-  the expected roles and names; `/act` clicks the right element; an
-  `/act` after the page changed answers `stale_observation`.
-- `/act type` into a password field is refused with `password_field`
-  and types nothing; `type_secret` types the placeholder of that secret;
-  an unknown secret answers `no_such_secret`.
-- Memory of `shuru-desktop` under 20 MB with Chromium open.
+In a Debian trixie container with Xvfb, Chromium, xterm and GTK test
+apps, against screenshots of the design:
+
+- windows open maximized, float, snap, resize by their band and by
+  their size increments; dialogs center over their parent; a modal dialog
+  keeps the focus from its parent; above, fullscreen and attention show
+  in `_NET_WM_STATE` and on screen;
+- the screen shrinks and grows with `xrandr` and the work area, panel,
+  rail and windows follow;
+- light and dark switch live from `PUT /appearance` and from the file,
+  for the shell, a GTK app, the Chromium frame;
+- `notify-send` with replaces, actions and timeouts, and a Chromium web
+  notification, on screen and through the API;
+- titles and menus in English, Simplified Chinese, Japanese, emoji,
+  Arabic and Hindi; the shell and Chromium with `LANG=zh_CN.UTF-8`;
+- `/input` text types Chinese into Chromium and xterm;
+- memory of `shuru-desktop` about 6 MB with Chromium open, and no CPU
+  time over 30 s idle.

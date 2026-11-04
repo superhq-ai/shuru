@@ -1,13 +1,23 @@
 //! `shuru-desktop` is the window manager of a desktop an agent uses: it
-//! lays out windows one app at a time, draws a panel and overlays for the
-//! person watching, and answers an API on a unix socket. See RFC 0014.
+//! frames and stacks windows, draws a panel, a rail, menus and overlays for
+//! the person watching, and answers an API on a unix socket. See RFC 0014.
 
 #[cfg(target_os = "linux")]
+mod appearance;
+#[cfg(target_os = "linux")]
 mod apps;
+#[cfg(target_os = "linux")]
+mod bus;
 #[cfg(target_os = "linux")]
 mod chrome;
 #[cfg(target_os = "linux")]
 mod draw;
+#[cfg(target_os = "linux")]
+mod glyphs;
+#[cfg(target_os = "linux")]
+mod icon;
+#[cfg(target_os = "linux")]
+mod locale;
 #[cfg(target_os = "linux")]
 mod server;
 #[cfg(target_os = "linux")]
@@ -50,7 +60,7 @@ mod linux {
         /// The unix socket to serve on, made with mode 0600.
         #[arg(long)]
         socket: PathBuf,
-        /// Apps for the panel: paths to .desktop files or their ids, such
+        /// Apps for the rail: paths to .desktop files or their ids, such
         /// as org.gnome.Calculator.
         #[arg(long, value_delimiter = ',')]
         apps: Vec<String>,
@@ -65,13 +75,15 @@ mod linux {
                 Err(e) => eprintln!("shuru-desktop: app {spec}: {e:#}"),
             }
         }
-        let (wm, settle) = crate::wm::start(&args.display, apps)
+        let (bus_tx, bus_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (wm, settle) = crate::wm::start(&args.display, apps, bus_tx)
             .with_context(|| format!("managing {}", args.display))?;
         let listener = bind(&args.socket)?;
         eprintln!("shuru-desktop: serving on {}", args.socket.display());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        runtime.spawn(crate::bus::run(wm.clone(), bus_rx));
         let state = State { wm, settle };
         let served = runtime.block_on(async move {
             let listener = tokio::net::UnixListener::from_std(listener)?;

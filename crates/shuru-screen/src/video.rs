@@ -68,7 +68,15 @@ struct Job {
 fn open(display: &str, cfg: &VideoConfig) -> Result<(Capturer, Encoder, Geometry)> {
     let cap = Capturer::new(display)?;
     let (w, h) = (cap.width, cap.height);
-    let enc = Encoder::new(w, h, cfg.fps, cfg.threads, cfg.crf, cfg.max_kbps, cfg.profile)?;
+    let enc = Encoder::new(
+        w,
+        h,
+        cfg.fps,
+        cfg.threads,
+        cfg.crf,
+        cfg.max_kbps,
+        cfg.profile,
+    )?;
     let geometry = Geometry {
         width: w,
         height: h,
@@ -679,7 +687,11 @@ fn encode_loop(
             continue;
         }
         let target = hub.target_kbps.load(Ordering::Relaxed);
-        let crf = if job.paintover { cfg.paintover_crf } else { cfg.crf };
+        let crf = if job.paintover {
+            cfg.paintover_crf
+        } else {
+            cfg.crf
+        };
         let cap = if job.paintover {
             target.saturating_mul(2)
         } else {
@@ -707,7 +719,13 @@ fn encode_loop(
         let mut out = Vec::with_capacity(64 << 10);
         out.resize(HEADER, 0);
         let ts_ms = job.captured_at.duration_since(epoch).as_millis() as i64;
-        let r = enc.encode(&job.buf, ts_ms, job.force_idr, info.as_deref_mut(), &mut out);
+        let r = enc.encode(
+            &job.buf,
+            ts_ms,
+            job.force_idr,
+            info.as_deref_mut(),
+            &mut out,
+        );
         let _ = ret.send((job.idx, job.buf));
         let key = match r {
             Ok(key) if out.len() > HEADER => key,
