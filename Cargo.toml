@@ -8,6 +8,7 @@ members = [
     "crates/shuru-node",
     "crates/shuru-proto",
     "crates/shuru-proxy",
+    "crates/shuru-screen",
     "crates/shuru-sdk",
     "crates/shuru-vm",
     "crates/shuru-store",
@@ -16,8 +17,8 @@ members = [
 exclude = ["vendor"]
 # shuru-darwin and shuru-linux are platform-specific — only pulled in
 # transitively via shuru-vm's cfg'd deps. shuru-node runs on Linux nodes
-# only, shuru-desktop in Linux guests only. Excluded from default builds so
-# `cargo check` doesn't fail on the wrong OS.
+# only, shuru-desktop and shuru-screen in Linux guests only. Excluded from
+# default builds so `cargo check` doesn't fail on the wrong OS.
 default-members = [
     "crates/shuru-cli",
     "crates/shuru-proto",
@@ -39,3 +40,7 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The streamer runs per frame loops; size matters less than CPU there.
+[profile.release.package.shuru-screen]
+opt-level = 3
