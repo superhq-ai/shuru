@@ -4,6 +4,9 @@ What a Debian trixie guest image installs next to `shuru-desktop`, and
 where. Paths are for an image that runs the desktop as one user; the
 files under `~` go in the home of that user.
 
+Each desktop release carries this directory as `shuru-desktop-guest.tar.gz`,
+listed in its `SHA256SUMS`.
+
 | file | installs to | does |
 |---|---|---|
 | `applications/*.desktop` | `/usr/local/share/applications/` | the apps of the rail, with their names and actions |
