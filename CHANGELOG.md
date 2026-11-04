@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.14.0
+
+### Security: the CLI and the Rust SDK enforce the public-only egress guard
+
+`shuru run --allow-net` now refuses connections to loopback, private,
+link-local and other non-public addresses by default, matching the
+hosted node (`public_only`, RFC 0008). Without it, a guest on a Linux
+cloud host with `--allow-net` and no domain allowlist could reach the
+instance metadata service and LAN addresses through the proxy. An
+explicit `--expose-host` (or `expose_host` in `shuru.json`) turns the
+guard back off, since host exposure is the one feature that needs
+loopback.
+
+The Rust SDK sets the same guard when it builds the proxy itself. The
+TypeScript SDK inherits it, since it runs the CLI.
+
 ## 0.13.0
 
 ### Run as a user
@@ -34,17 +50,6 @@ an Xvfb build and the guest settings for Chromium and the terminal.
 - A guest error on `shuru run` ends its line.
 
 ## 0.12.0
-
-### Security: the CLI enforces the public-only egress guard
-
-`shuru run --allow-net` now refuses connections to loopback, private,
-link-local and other non-public addresses by default, matching the
-hosted node (`public_only`, RFC 0008). Without it, a guest on a Linux
-cloud host with `--allow-net` and no domain allowlist could reach the
-instance metadata service and LAN addresses through the proxy. An
-explicit `--expose-host` (or `expose_host` in `shuru.json`) turns the
-guard back off, since host exposure is the one feature that needs
-loopback.
 
 ### Linux: x86_64 hosts
 

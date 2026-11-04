@@ -725,10 +725,33 @@ struct BootedVm {
     run_as: shuru_proto::RunAs,
 }
 
+/// Build the proxy configuration for a network-enabled sandbox.
+///
+/// The public-only guard is enforced by default, matching the hosted node
+/// (RFC 0008) and the CLI. Without it, a guest on a Linux cloud host with
+/// networking enabled and no `allowed_hosts` could reach the instance
+/// metadata service and LAN addresses through the proxy. `expose_host` is the
+/// one feature that legitimately needs loopback (via the gateway), so a
+/// non-empty `expose_host` turns the guard back off.
+fn proxy_config_for(config: &SandboxConfig) -> ProxyConfig {
+    ProxyConfig {
+        secrets: config.secrets.clone(),
+        network: NetworkConfig {
+            allow: config.allowed_hosts.clone(),
+        },
+        public_only: config.expose_host.is_empty(),
+        expose_host: config.expose_host.clone(),
+        ..Default::default()
+    }
+}
+
 fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
     let default_env = config.env.clone();
     let run_as = config.run_as.clone();
-    let data_dir = config.data_dir.unwrap_or_else(shuru_vm::default_data_dir);
+    let data_dir = config
+        .data_dir
+        .clone()
+        .unwrap_or_else(shuru_vm::default_data_dir);
 
     // Resolve asset paths
     let kernel_path = format!("{}/Image", data_dir);
@@ -848,14 +871,7 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
 
     // Set up proxy networking if enabled
     let (vm_fd, proxy_handle) = if config.allow_net {
-        let proxy_config = ProxyConfig {
-            secrets: config.secrets,
-            network: NetworkConfig {
-                allow: config.allowed_hosts,
-            },
-            expose_host: config.expose_host,
-            ..Default::default()
-        };
+        let proxy_config = proxy_config_for(&config);
 
         let (vm_fd, host_fd) = shuru_proxy::create_socketpair()?;
         let handle = shuru_proxy::start(host_fd, proxy_config)?;
@@ -1135,4 +1151,45 @@ fn exec_command(
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         exit_code: output.exit_code,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn net_sandbox_defaults_to_public_only() {
+        let config = SandboxConfig {
+            allow_net: true,
+            ..Default::default()
+        };
+        assert!(proxy_config_for(&config).public_only);
+    }
+
+    #[test]
+    fn allowed_hosts_sandbox_is_still_public_only() {
+        let config = SandboxConfig {
+            allow_net: true,
+            allowed_hosts: vec!["api.openai.com".to_string()],
+            ..Default::default()
+        };
+        let proxy = proxy_config_for(&config);
+        assert!(proxy.public_only);
+        assert_eq!(proxy.network.allow, vec!["api.openai.com".to_string()]);
+    }
+
+    #[test]
+    fn expose_host_opts_out_of_public_only() {
+        let config = SandboxConfig {
+            allow_net: true,
+            expose_host: vec![ExposeHostMapping {
+                host_port: 3000,
+                guest_port: 8080,
+            }],
+            ..Default::default()
+        };
+        let proxy = proxy_config_for(&config);
+        assert!(!proxy.public_only);
+        assert_eq!(proxy.expose_host.len(), 1);
+    }
 }
