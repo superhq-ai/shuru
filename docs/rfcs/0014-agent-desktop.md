@@ -104,7 +104,7 @@ EWMH and ICCCM enough for Chromium, GTK, Qt and X toolkits to behave:
 - RandR screen changes: the panel, the rail, the work area and the snap
   targets are recomputed, maximized windows fill the new work area,
   floating ones are moved and shrunk to stay on screen.
-- The X screen saver is off: Xvfb runs with `-s 0 -nodpms`, and the
+- The X screen saver is off: Xvfb runs with `-s 0`, and the
   window manager sets the screen saver timeout to 0 at start.
 
 ## Cursors
@@ -277,7 +277,7 @@ resources), the two fonts, the `en_US.UTF-8` and `zh_CN.UTF-8` locales,
 and runs as guest services under an unprivileged `desktop` user:
 
 ```
-xvfb      Xvfb :1 -screen 0 1280x800x24 -shmem -dpi 96 -s 0 -nodpms
+xvfb      Xvfb :1 -screen 0 1280x800x24 -shmem -dpi 96 -s 0
 desktop   dbus-run-session -- shuru-desktop --display :1 --socket /run/shuru-desktop.sock --apps ...
 screen    shuru-screen --display :1 --socket /run/shuru-screen.sock
 ```

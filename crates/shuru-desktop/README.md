@@ -98,7 +98,7 @@ EWMH and ICCCM as apps expect them:
   and the snap targets follow, maximized windows fill the new work area
   and floating ones stay on screen.
 - The X screen saver is turned off at start (`SetScreenSaver` with a
-  timeout of 0); run Xvfb with `-s 0 -nodpms` as well.
+  timeout of 0); run Xvfb with `-s 0` as well.
 
 ## Cursors
 
