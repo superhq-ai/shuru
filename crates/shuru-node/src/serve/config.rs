@@ -436,7 +436,8 @@ mod tests {
             json!({ "T": { "value": "s3cret", "hosts": ["a.example.com"] } }),
         )
         .unwrap();
-        let dir = std::env::temp_dir().join(format!("shuru-config-{}", std::process::id()));
+        // Not shuru-config-<pid>: a test of sandboxes.rs makes that one.
+        let dir = std::env::temp_dir().join(format!("shuru-config-file-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(read(&dir).unwrap().secrets.is_empty());
