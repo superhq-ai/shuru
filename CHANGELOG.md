@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.13.0
+
+### Run as a user
+
+Every command, session and service in the guest ran as root. An exec, a
+service file and a sandbox can now name a user and a group (RFC 0015):
+`shuru run --user name[:group]`, `"user"` in `shuru.json`, `user` and
+`group` on `exec` and `spawn` of `shuru run --stdio` and in both SDKs,
+and `user` and `group` in a service file. The process gets the groups,
+the home, `HOME`, `USER`, `LOGNAME` and `SHELL` of the passwd entry,
+starts in its home (the root when the home is missing), and owns its
+terminal. An unknown user or group fails the command before anything
+runs. What shuru runs itself, such as the proxy CA install and recipe
+builds, stays root, and a service never takes the default of the
+sandbox. The guest protocol is now version 7, so a guest that would
+ignore the user is refused at the hello.
+
+`Sandbox::exec_with_env`, `exec_buffered`, `open_exec`, `open_shell`,
+`open_shell_with_cwd` and `shell` in shuru-vm take a `RunAs`; `exec`
+stays root.
+
+### A desktop for agents
+
+`shuru-desktop` is a window manager for agents, with an API on a unix
+socket (RFC 0014), and `shuru-screen` streams an X11 screen as H.264
+over a WebSocket and types any Unicode. Both are released on their own
+for Debian trixie guests on ARM64 and x86_64, as `desktop-v0.2.0`, with
+an Xvfb build and the guest settings for Chromium and the terminal.
+
+### Fixes
+
+- A guest error on `shuru run` ends its line.
+
 ## 0.12.0
 
 ### Linux: x86_64 hosts
