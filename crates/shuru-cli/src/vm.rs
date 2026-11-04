@@ -43,6 +43,54 @@ pub(crate) struct PreparedVm {
     pub run_as: RunAs,
 }
 
+/// Assemble the proxy configuration for a network-enabled run: the config
+/// file's sections, the CLI flag overrides merged over them, and the egress
+/// guard.
+///
+/// The public-only guard is enforced by default, matching the hosted node's
+/// posture (RFC 0008). Without it, a guest on a Linux cloud host with
+/// `--allow-net` and no allowlist could reach the instance metadata service
+/// and LAN addresses through the proxy. Host exposure is the one feature that
+/// legitimately needs loopback (via the gateway), so an explicit `expose_host`
+/// request turns the guard back off; everything else is confined to public
+/// addresses.
+fn build_proxy_config(vm: &VmArgs, cfg: &ShuruConfig) -> Result<shuru_proxy::config::ProxyConfig> {
+    let mut proxy = cfg.to_proxy_config()?;
+
+    if let Some(resolver) = vm.dns_resolver {
+        proxy.dns_resolver = resolver;
+    }
+
+    // Merge --secret flags: NAME=ENV_VAR@host1,host2
+    for s in &vm.secret {
+        let (name, from, hosts) = parse_secret_flag(s).with_context(|| {
+            format!("invalid --secret: '{}' (expected NAME=ENV@host1,host2)", s)
+        })?;
+        proxy.secrets.insert(
+            name,
+            shuru_proxy::config::SecretConfig::from_env(from, hosts),
+        );
+    }
+
+    // Merge --allow-domain flags
+    for d in &vm.allow_host {
+        proxy.network.allow.push(d.clone());
+    }
+
+    // Merge --expose-host flags
+    for s in &vm.expose_host {
+        let mapping = crate::config::parse_expose_host(s)
+            .with_context(|| format!("invalid --expose-host: '{}'", s))?;
+        proxy.expose_host.push(mapping);
+    }
+
+    // Enforce the egress guard only once every expose_host source (config file
+    // and CLI) has been merged, so the opt-out is honoured either way.
+    proxy.public_only = proxy.expose_host.is_empty();
+
+    Ok(proxy)
+}
+
 pub(crate) fn prepare_vm(vm: &VmArgs, cfg: &ShuruConfig, from: Option<&str>) -> Result<PreparedVm> {
     trace_boot("prepare_vm start");
     let cpus = vm.cpus.or(cfg.cpus).unwrap_or(2);
@@ -61,36 +109,7 @@ pub(crate) fn prepare_vm(vm: &VmArgs, cfg: &ShuruConfig, from: Option<&str>) -> 
     };
 
     let proxy_config = if allow_net {
-        let mut proxy = cfg.to_proxy_config()?;
-
-        if let Some(resolver) = vm.dns_resolver {
-            proxy.dns_resolver = resolver;
-        }
-
-        // Merge --secret flags: NAME=ENV_VAR@host1,host2
-        for s in &vm.secret {
-            let (name, from, hosts) = parse_secret_flag(s).with_context(|| {
-                format!("invalid --secret: '{}' (expected NAME=ENV@host1,host2)", s)
-            })?;
-            proxy.secrets.insert(
-                name,
-                shuru_proxy::config::SecretConfig::from_env(from, hosts),
-            );
-        }
-
-        // Merge --allow-domain flags
-        for d in &vm.allow_host {
-            proxy.network.allow.push(d.clone());
-        }
-
-        // Merge --expose-host flags
-        for s in &vm.expose_host {
-            let mapping = crate::config::parse_expose_host(s)
-                .with_context(|| format!("invalid --expose-host: '{}'", s))?;
-            proxy.expose_host.push(mapping);
-        }
-
-        Some(proxy)
+        Some(build_proxy_config(vm, cfg)?)
     } else {
         None
     };
@@ -556,6 +575,53 @@ fn parse_port_mapping(s: &str) -> Result<PortMapping> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vm_args(argv: &[&str]) -> VmArgs {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(
+            std::iter::once("shuru")
+                .chain(std::iter::once("run"))
+                .chain(argv.iter().copied()),
+        )
+        .unwrap();
+        match cli.command {
+            crate::cli::Commands::Run { vm, .. } => vm,
+            _ => panic!("expected `run` subcommand"),
+        }
+    }
+
+    #[test]
+    fn net_run_defaults_to_public_only() {
+        let vm = vm_args(&["--allow-net"]);
+        let proxy = build_proxy_config(&vm, &ShuruConfig::default()).unwrap();
+        assert!(proxy.public_only);
+        assert!(proxy.expose_host.is_empty());
+    }
+
+    #[test]
+    fn allowlist_run_still_public_only() {
+        let vm = vm_args(&["--allow-net", "--allow-host", "api.openai.com"]);
+        let proxy = build_proxy_config(&vm, &ShuruConfig::default()).unwrap();
+        assert!(proxy.public_only);
+        assert_eq!(proxy.network.allow, vec!["api.openai.com".to_string()]);
+    }
+
+    #[test]
+    fn expose_host_flag_opts_out_of_public_only() {
+        let vm = vm_args(&["--allow-net", "--expose-host", "8080:3000"]);
+        let proxy = build_proxy_config(&vm, &ShuruConfig::default()).unwrap();
+        assert!(!proxy.public_only);
+        assert_eq!(proxy.expose_host.len(), 1);
+    }
+
+    #[test]
+    fn expose_host_in_config_opts_out_of_public_only() {
+        let cfg: ShuruConfig = serde_json::from_str(r#"{"expose_host":["5432"]}"#).unwrap();
+        let vm = vm_args(&["--allow-net"]);
+        let proxy = build_proxy_config(&vm, &cfg).unwrap();
+        assert!(!proxy.public_only);
+        assert_eq!(proxy.expose_host.len(), 1);
+    }
 
     #[test]
     fn mount_defaults_to_read_only() {
