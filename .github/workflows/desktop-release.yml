@@ -69,6 +69,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           path: artifacts/
@@ -87,6 +89,13 @@ jobs:
             https://raw.githubusercontent.com/googlefonts/noto-emoji/v2.051/fonts/NotoColorEmoji.ttf
           echo "72a635cb3d2f3524c51620cdde406b217204e8a6a06c6a096ff8ed4b5fd6e27b  noto-color-emoji.ttf" | sha256sum -c
 
+      # The guest settings next to the binaries; reproducible, so the
+      # checksum only moves when a file does.
+      - name: Pack the guest settings
+        run: |
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+            -C crates/shuru-desktop -cf - guest | gzip -n > artifacts/shuru-desktop-guest.tar.gz
+
       - name: Checksums
         run: cd artifacts && sha256sum * > SHA256SUMS && cat SHA256SUMS
 
@@ -94,7 +103,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           name: shuru-desktop ${{ github.ref_name }}
-          body: shuru-desktop, shuru-screen and the patched Xvfb for Debian trixie guests, plus the Noto Sans CJK SC and Noto Color Emoji fonts (from googlefonts/noto-cjk Sans2.004 and googlefonts/noto-emoji v2.051). Checksums in SHA256SUMS.
+          body: shuru-desktop, shuru-screen and the patched Xvfb for Debian trixie guests, the guest settings (shuru-desktop-guest.tar.gz), plus the Noto Sans CJK SC and Noto Color Emoji fonts (from googlefonts/noto-cjk Sans2.004 and googlefonts/noto-emoji v2.051). Checksums in SHA256SUMS.
           prerelease: true
           make_latest: false
           files: artifacts/*
