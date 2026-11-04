@@ -10,6 +10,7 @@ listed in its `SHA256SUMS`.
 | file | installs to | does |
 |---|---|---|
 | `applications/*.desktop` | `/usr/local/share/applications/` | the apps of the rail, with their names and actions |
+| `icons/hicolor/` | `/usr/local/share/icons/hicolor/` | the terminal icon at 16, 32 and 64 px; `icons/src/` holds its SVGs |
 | `themes/SuperHQ/` | `/usr/share/themes/SuperHQ/` | the light GTK 3 theme (the default) |
 | `themes/SuperHQ-dark/` | `/usr/share/themes/SuperHQ-dark/` | the dark GTK 3 theme |
 | `gtk-3.0/settings.ini` | `/etc/gtk-3.0/settings.ini` | the theme, Inter, the window buttons on the left, no animations |
@@ -17,7 +18,6 @@ listed in its `SHA256SUMS`.
 | `chromium/policy.json` | `/etc/chromium/policies/managed/superhq.json` | no sign in, no sync, no promotions, no default browser check, no password manager |
 | `xterm/XTerm` | appended to `/etc/X11/app-defaults/XTerm` | the terminal colors and font, titles in UTF-8 |
 | `mimeapps.list` | `/etc/xdg/mimeapps.list` | which app opens what |
-| `render-icons.sh` | run at build time | renders SVG app icons to the PNG sizes the shell draws |
 
 ## Packages
 
@@ -25,7 +25,7 @@ listed in its `SHA256SUMS`.
 apt-get install --no-install-recommends \
   xvfb dbus-x11 dbus-user-session libglib2.0-bin dconf-gsettings-backend \
   adwaita-icon-theme fontconfig locales shared-mime-info xdg-utils \
-  chromium chromium-l10n xterm librsvg2-bin
+  chromium chromium-l10n xterm
 ```
 
 ## Display
@@ -120,17 +120,18 @@ either.
 
 ## Default apps
 
-`mimeapps.list` opens PDF, HTML and images in Chromium, plain text and
-Markdown in the text editor (`org.gnome.TextEditor`), and directories in
-Files (`org.gnome.Nautilus`). Change the ids if an image ships other
-apps. `xdg-open file.pdf` then opens Chromium.
+The guest ships two apps, Chromium and the terminal. `mimeapps.list`
+opens PDF, HTML, images, plain text, Markdown and directories in
+Chromium, so `xdg-open` works for each of them. An image that adds an
+editor or a file manager points the types at its ids.
 
 ## Icons
 
 The shell draws app icons at 16 and 32 px (and 64 for HiDPI) from the
-icon theme. An app that ships only an SVG icon gets PNGs rendered at
-build time:
+PNGs of the icon theme and `pixmaps`, scaled from the nearest size. The
+terminal has an icon of its own, `superhq-terminal`, drawn at each size
+from `icons/src/` (the 16 px one from its own simpler SVG):
 
 ```sh
-sh render-icons.sh /usr/local/share utilities-terminal=/path/terminal.svg
+rsvg-convert -w 64 -h 64 icons/src/superhq-terminal.svg -o icons/hicolor/64x64/apps/superhq-terminal.png
 ```

@@ -285,8 +285,8 @@ screen    shuru-screen --display :1 --socket /run/shuru-screen.sock
 with `LANG` and `XCURSOR_THEME=Adwaita` in the environment of the desktop
 service. Chromium gets `initial_preferences` and a managed policy: no
 first run or sign in screens, no sync, no default browser check, no
-password saving. PDF, HTML and images open in Chromium, text and Markdown
-in the editor, directories in Files.
+password saving. The guest ships Chromium and the terminal; PDF, HTML,
+images, text, Markdown and directories open in Chromium.
 
 ## Slices
 

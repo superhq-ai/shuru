@@ -7,7 +7,7 @@ and `shuru-screen`. Linux only.
 
 ```
 shuru-desktop --display :1 --socket /run/shuru-desktop.sock \
-  --apps chromium,org.gnome.Nautilus,/usr/share/applications/xterm.desktop
+  --apps chromium,terminal
 ```
 
 `--apps` lists the apps of the rail: ids of `.desktop` files in the XDG
