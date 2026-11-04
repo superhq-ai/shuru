@@ -36,11 +36,10 @@ enum ShiftFix {
     Lift,
 }
 
-fn scratch_file(display: &str) -> std::path::PathBuf {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    let d = display.replace([':', '/'], "_");
-    std::path::Path::new(&dir).join(format!("shuru-screen-keymap{d}"))
-}
+/// Root window property listing the remapped scratch keycodes, so a run
+/// that did not exit cleanly is undone by the next. It lives on the display
+/// it describes, not in a file a path could be planted at.
+const SCRATCH_PROP: &[u8] = b"_SHURU_SCREEN_SCRATCH";
 
 /// X keycodes (evdev + 8) with no entry in the DOM code table of Chromium.
 const SAFE_SCRATCH: &[u8] = &[
@@ -176,7 +175,7 @@ struct Injector {
     smooth: Option<SmoothScroll>,
     wheel: WheelAcc,
     shift_kc: u8,
-    scratch_path: std::path::PathBuf,
+    scratch_prop: u32,
 }
 
 impl Injector {
@@ -200,20 +199,30 @@ impl Injector {
             smooth: None,
             wheel: WheelAcc::default(),
             shift_kc: 0,
-            scratch_path: scratch_file(display),
+            scratch_prop: 0,
         };
-        // Undo remaps left by a run that did not exit cleanly.
-        if let Ok(old) = std::fs::read_to_string(&me.scratch_path) {
+        me.scratch_prop = me.conn.intern_atom(false, SCRATCH_PROP)?.reply()?.atom;
+        let old = me
+            .conn
+            .get_property(
+                true,
+                root,
+                me.scratch_prop,
+                xproto::AtomEnum::INTEGER,
+                0,
+                256,
+            )?
+            .reply()?;
+        if old.format == 8 && !old.value.is_empty() {
             me.load_keymap(max_kc)?;
-            for kc in old.split_whitespace().filter_map(|k| k.parse::<u8>().ok()) {
-                if kc >= min_kc && kc <= max_kc {
+            for &kc in &old.value {
+                if SAFE_SCRATCH.contains(&kc) && kc >= min_kc && kc <= max_kc {
                     let _ = me
                         .conn
                         .change_keyboard_mapping(1, kc, me.per as u8, &vec![0; me.per]);
                 }
             }
             let _ = me.conn.sync();
-            let _ = std::fs::remove_file(&me.scratch_path);
         }
         me.load_keymap(max_kc)?;
         me.shift_kc = me.lookup.get(&SHIFT_L).map(|&(k, _)| k).unwrap_or(50);
@@ -315,12 +324,14 @@ impl Injector {
         let per = self.per;
         self.syms[i * per..(i + 1) * per].copy_from_slice(&row);
         self.scratch_map.insert(keysym, (kc, Instant::now()));
-        let used: Vec<String> = self
-            .scratch_map
-            .values()
-            .map(|(k, _)| k.to_string())
-            .collect();
-        let _ = std::fs::write(&self.scratch_path, used.join(" "));
+        let used: Vec<u8> = self.scratch_map.values().map(|&(k, _)| k).collect();
+        let _ = self.conn.change_property8(
+            xproto::PropMode::REPLACE,
+            self.root,
+            self.scratch_prop,
+            xproto::AtomEnum::INTEGER,
+            &used,
+        );
         (kc, ShiftFix::None)
     }
 
@@ -330,8 +341,8 @@ impl Injector {
                 .conn
                 .change_keyboard_mapping(1, kc, self.per as u8, &vec![0; self.per]);
         }
+        let _ = self.conn.delete_property(self.root, self.scratch_prop);
         let _ = self.conn.sync();
-        let _ = std::fs::remove_file(&self.scratch_path);
     }
 
     fn click(&self, button: u8, n: i32) {
