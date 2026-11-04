@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use x11rb::connection::Connection;
@@ -17,12 +17,26 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
 pub enum InputEvent {
-    Move { x: i32, y: i32 },
+    Move {
+        x: i32,
+        y: i32,
+    },
     /// X button numbers: 1 left, 2 middle, 3 right.
-    Button { button: u8, down: bool },
+    Button {
+        button: u8,
+        down: bool,
+    },
     /// Wheel units, 120 a notch: positive dy scrolls down, dx right.
-    Wheel { dx: f64, dy: f64 },
-    Key { keysym: u32, down: bool },
+    Wheel {
+        dx: f64,
+        dy: f64,
+    },
+    Key {
+        keysym: u32,
+        down: bool,
+    },
+    /// Committed text, typed char by char as press and release.
+    Text(String),
     ReleaseAll,
     /// Undo keymap changes before exit.
     Shutdown,
@@ -47,6 +61,38 @@ const SAFE_SCRATCH: &[u8] = &[
     183, 184, 185, 186, 203, 204, 205, 206, 207, 208, 210, 211, 213, 219, 220, 221, 222, 223, 224,
     226, 227, 228, 229, 230, 231, 234, 235, 244, 245, 246, 247, 248, 249, 250, 251, 253, 254, 255,
 ];
+
+pub const TEXT_MAX: usize = 4096;
+
+const RETURN: u32 = 0xff0d;
+const TAB: u32 = 0xff09;
+
+/// The keysym that types `c`: Latin-1 by its code point, the rest of
+/// Unicode at 0x01000000 + code point. Control chars other than newline
+/// and tab type nothing.
+pub fn char_keysym(c: char) -> Option<u32> {
+    match c {
+        '\n' | '\r' => Some(RETURN),
+        '\t' => Some(TAB),
+        ' '..='~' | '\u{a0}'..='\u{ff}' => Some(c as u32),
+        _ if c.is_control() => None,
+        _ => Some(0x0100_0000 + c as u32),
+    }
+}
+
+/// The keysyms that type `text`, in order, with CR LF as one Return.
+fn text_keysyms(text: &str) -> impl Iterator<Item = u32> + '_ {
+    let mut chars = text.chars().peekable();
+    std::iter::from_fn(move || loop {
+        let c = chars.next()?;
+        if c == '\r' {
+            chars.next_if_eq(&'\n');
+        }
+        if let Some(k) = char_keysym(c) {
+            return Some(k);
+        }
+    })
+}
 
 const SHIFT_L: u32 = 0xffe1;
 const SHIFT_R: u32 = 0xffe2;
@@ -167,8 +213,10 @@ struct Injector {
     syms: Vec<u32>,
     lookup: HashMap<u32, (u8, usize)>,
     scratch: Vec<u8>,
-    /// keysym to the scratch keycode mapped for it, with its last use.
-    scratch_map: HashMap<u32, (u8, Instant)>,
+    /// keysym to the scratch keycode mapped for it, with the tick of its
+    /// last use.
+    scratch_map: HashMap<u32, (u8, u64)>,
+    tick: u64,
     pressed: HashMap<u32, u8>,
     buttons: [bool; 16],
     shift_down: u32,
@@ -193,6 +241,7 @@ impl Injector {
             lookup: HashMap::new(),
             scratch: vec![],
             scratch_map: HashMap::new(),
+            tick: 0,
             pressed: HashMap::new(),
             buttons: [false; 16],
             shift_down: 0,
@@ -228,7 +277,9 @@ impl Injector {
         me.shift_kc = me.lookup.get(&SHIFT_L).map(|&(k, _)| k).unwrap_or(50);
         me.smooth = SmoothScroll::detect(&me.conn);
         if me.smooth.is_none() {
-            eprintln!("shuru-screen: the XTEST pointer has no scroll axes, scrolling by wheel clicks");
+            eprintln!(
+                "shuru-screen: the XTEST pointer has no scroll axes, scrolling by wheel clicks"
+            );
         }
         Ok(me)
     }
@@ -295,22 +346,27 @@ impl Injector {
                 },
             );
         }
+        self.tick += 1;
         if let Some((kc, t)) = self.scratch_map.get_mut(&keysym) {
-            *t = Instant::now();
+            *t = self.tick;
             return (*kc, ShiftFix::None);
         }
-        if self.scratch.is_empty() {
-            return (0, ShiftFix::None);
-        }
-        // Map the keysym onto a spare keycode at every level.
+        // Map the keysym onto a spare keycode at every level. The least
+        // recently used one goes, unless it is held: its release has to
+        // find the keysym it was pressed as. Its earlier presses and
+        // releases are queued ahead of the remap on this connection, and
+        // the sync below waits until the server took them all.
         let kc = if self.scratch_map.len() < self.scratch.len() {
             self.scratch[self.scratch_map.len()]
         } else {
-            let (&old, _) = self
+            let Some((&old, _)) = self
                 .scratch_map
                 .iter()
+                .filter(|(_, (kc, _))| !self.pressed.values().any(|p| p == kc))
                 .min_by_key(|(_, (_, t))| *t)
-                .unwrap();
+            else {
+                return (0, ShiftFix::None);
+            };
             self.scratch_map.remove(&old).unwrap().0
         };
         let row = vec![keysym; self.per];
@@ -323,7 +379,7 @@ impl Injector {
         let i = (kc - self.min_kc) as usize;
         let per = self.per;
         self.syms[i * per..(i + 1) * per].copy_from_slice(&row);
-        self.scratch_map.insert(keysym, (kc, Instant::now()));
+        self.scratch_map.insert(keysym, (kc, self.tick));
         let used: Vec<u8> = self.scratch_map.values().map(|&(k, _)| k).collect();
         let _ = self.conn.change_property8(
             xproto::PropMode::REPLACE,
@@ -343,6 +399,31 @@ impl Injector {
         }
         let _ = self.conn.delete_property(self.root, self.scratch_prop);
         let _ = self.conn.sync();
+    }
+
+    /// Runs `keys` with Shift as `fix` needs it.
+    fn with_fix(&self, fix: ShiftFix, keys: impl FnOnce(&Self)) {
+        match fix {
+            ShiftFix::None => keys(self),
+            ShiftFix::Add => {
+                self.fake(xproto::KEY_PRESS_EVENT, self.shift_kc, 0, 0);
+                keys(self);
+                self.fake(xproto::KEY_RELEASE_EVENT, self.shift_kc, 0, 0);
+            }
+            ShiftFix::Lift => {
+                let held: Vec<u8> = [SHIFT_L, SHIFT_R]
+                    .iter()
+                    .filter_map(|k| self.pressed.get(k).copied())
+                    .collect();
+                for &h in &held {
+                    self.fake(xproto::KEY_RELEASE_EVENT, h, 0, 0);
+                }
+                keys(self);
+                for &h in &held {
+                    self.fake(xproto::KEY_PRESS_EVENT, h, 0, 0);
+                }
+            }
+        }
     }
 
     fn click(&self, button: u8, n: i32) {
@@ -415,32 +496,24 @@ impl Injector {
                         self.shift_down += 1;
                     }
                     self.pressed.insert(keysym, kc);
-                    match fix {
-                        ShiftFix::None => self.fake(xproto::KEY_PRESS_EVENT, kc, 0, 0),
-                        ShiftFix::Add => {
-                            self.fake(xproto::KEY_PRESS_EVENT, self.shift_kc, 0, 0);
-                            self.fake(xproto::KEY_PRESS_EVENT, kc, 0, 0);
-                            self.fake(xproto::KEY_RELEASE_EVENT, self.shift_kc, 0, 0);
-                        }
-                        ShiftFix::Lift => {
-                            let held: Vec<u8> = [SHIFT_L, SHIFT_R]
-                                .iter()
-                                .filter_map(|k| self.pressed.get(k).copied())
-                                .collect();
-                            for &h in &held {
-                                self.fake(xproto::KEY_RELEASE_EVENT, h, 0, 0);
-                            }
-                            self.fake(xproto::KEY_PRESS_EVENT, kc, 0, 0);
-                            for &h in &held {
-                                self.fake(xproto::KEY_PRESS_EVENT, h, 0, 0);
-                            }
-                        }
-                    }
+                    self.with_fix(fix, |s| s.fake(xproto::KEY_PRESS_EVENT, kc, 0, 0));
                 } else if let Some(kc) = self.pressed.remove(&keysym) {
                     if keysym == SHIFT_L || keysym == SHIFT_R {
                         self.shift_down = self.shift_down.saturating_sub(1);
                     }
                     self.fake(xproto::KEY_RELEASE_EVENT, kc, 0, 0);
+                }
+            }
+            InputEvent::Text(text) => {
+                for keysym in text_keysyms(&text) {
+                    let (kc, fix) = self.resolve(keysym);
+                    if kc == 0 {
+                        continue;
+                    }
+                    self.with_fix(fix, |s| {
+                        s.fake(xproto::KEY_PRESS_EVENT, kc, 0, 0);
+                        s.fake(xproto::KEY_RELEASE_EVENT, kc, 0, 0);
+                    });
                 }
             }
             InputEvent::ReleaseAll => {
@@ -515,6 +588,45 @@ mod tests {
         assert_eq!(w.take(-250.0, -130.0, NOTCH), (-2, -1));
         assert_eq!(w.take(-10.0, -110.0, NOTCH), (0, -1));
         assert_eq!(w.take(-100.0, 0.0, NOTCH), (-1, 0));
+    }
+
+    #[test]
+    fn char_keysyms() {
+        assert_eq!(char_keysym('a'), Some(0x61));
+        assert_eq!(char_keysym(' '), Some(0x20));
+        assert_eq!(char_keysym('~'), Some(0x7e));
+        assert_eq!(char_keysym('\u{a0}'), Some(0xa0));
+        assert_eq!(char_keysym('é'), Some(0xe9));
+        assert_eq!(char_keysym('ÿ'), Some(0xff));
+        assert_eq!(char_keysym('Ā'), Some(0x0100_0100));
+        assert_eq!(char_keysym('€'), Some(0x0100_20ac));
+        assert_eq!(char_keysym('你'), Some(0x0100_4f60));
+        assert_eq!(char_keysym('，'), Some(0x0100_ff0c));
+        assert_eq!(char_keysym('😀'), Some(0x0101_f600));
+        assert_eq!(char_keysym('\n'), Some(RETURN));
+        assert_eq!(char_keysym('\t'), Some(TAB));
+        assert_eq!(char_keysym('\0'), None);
+        assert_eq!(char_keysym('\x1b'), None);
+        assert_eq!(char_keysym('\x7f'), None);
+        assert_eq!(char_keysym('\u{85}'), None);
+    }
+
+    #[test]
+    fn text_keysyms_in_order() {
+        let k: Vec<u32> = text_keysyms("你好，世界").collect();
+        assert_eq!(
+            k,
+            [
+                0x0100_4f60,
+                0x0100_597d,
+                0x0100_ff0c,
+                0x0100_4e16,
+                0x0100_754c
+            ]
+        );
+        let k: Vec<u32> = text_keysyms("a\r\nb\rc\n\nd\x07").collect();
+        assert_eq!(k, [0x61, RETURN, 0x62, RETURN, 0x63, RETURN, RETURN, 0x64]);
+        assert_eq!(text_keysyms("").count(), 0);
     }
 
     #[test]

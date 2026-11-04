@@ -126,8 +126,8 @@ pub struct Capturer {
 
 impl Capturer {
     pub fn new(display: &str) -> Result<Self> {
-        let (conn, screen_num) =
-            RustConnection::connect(Some(display)).map_err(|e| anyhow!("X display {display}: {e}"))?;
+        let (conn, screen_num) = RustConnection::connect(Some(display))
+            .map_err(|e| anyhow!("X display {display}: {e}"))?;
         let screen = &conn.setup().roots[screen_num];
         let root = screen.root;
         // Even sizes for 4:2:0; an odd last row or column is left out.
@@ -145,27 +145,32 @@ impl Capturer {
         conn.randr_select_input(root, randr::NotifyMask::SCREEN_CHANGE)?;
         let mut stride = width as usize * 4;
         let seg = conn.generate_id()?;
-        let (buf, offset, direct) =
-            match find_xvfb_framebuffer(&conn, root, width, height, xserver_pid(display)) {
-                Some((buf, offset, fb_stride)) => {
-                    eprintln!(
-                        "shuru-screen: capturing from the Xvfb framebuffer (shmid {})",
-                        buf.shmid
-                    );
-                    stride = fb_stride;
-                    (buf, offset, true)
-                }
-                None => {
-                    eprintln!(
+        let (buf, offset, direct) = match find_xvfb_framebuffer(
+            &conn,
+            root,
+            width,
+            height,
+            xserver_pid(display),
+        ) {
+            Some((buf, offset, fb_stride)) => {
+                eprintln!(
+                    "shuru-screen: capturing from the Xvfb framebuffer (shmid {})",
+                    buf.shmid
+                );
+                stride = fb_stride;
+                (buf, offset, true)
+            }
+            None => {
+                eprintln!(
                         "shuru-screen: no Xvfb framebuffer (start Xvfb with -shmem), capturing by MIT-SHM GetImage"
                     );
-                    let buf = ShmBuf::new(stride * height as usize)?;
-                    conn.shm_attach(seg, buf.shmid as u32, false)?.check()?;
-                    // Removed once both sides detach.
-                    unsafe { libc::shmctl(buf.shmid, libc::IPC_RMID, std::ptr::null_mut()) };
-                    (buf, 0, false)
-                }
-            };
+                let buf = ShmBuf::new(stride * height as usize)?;
+                conn.shm_attach(seg, buf.shmid as u32, false)?.check()?;
+                // Removed once both sides detach.
+                unsafe { libc::shmctl(buf.shmid, libc::IPC_RMID, std::ptr::null_mut()) };
+                (buf, 0, false)
+            }
+        };
         let damage = conn.generate_id()?;
         conn.damage_create(damage, root, damage::ReportLevel::RAW_RECTANGLES)?;
         conn.flush()?;

@@ -54,14 +54,23 @@ impl CursorImage {
         for &p in &self.argb {
             let a = p >> 24;
             let un = |c: u32| (c * 255 + a / 2).checked_div(a).unwrap_or(0).min(255) as u8;
-            out.extend_from_slice(&[un((p >> 16) & 0xff), un((p >> 8) & 0xff), un(p & 0xff), a as u8]);
+            out.extend_from_slice(&[
+                un((p >> 16) & 0xff),
+                un((p >> 8) & 0xff),
+                un(p & 0xff),
+                a as u8,
+            ]);
         }
         out
     }
 
     pub fn png(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        let mut enc = png::Encoder::new(&mut out, self.width.max(1) as u32, self.height.max(1) as u32);
+        let mut enc = png::Encoder::new(
+            &mut out,
+            self.width.max(1) as u32,
+            self.height.max(1) as u32,
+        );
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
         let mut rgba = self.rgba();

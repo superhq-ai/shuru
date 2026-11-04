@@ -26,7 +26,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::hub::{Client, Gate, Hub, Out};
-use crate::input::InputEvent;
+use crate::input::{InputEvent, TEXT_MAX};
 
 type Body = Full<Bytes>;
 
@@ -52,6 +52,10 @@ enum Msg {
         keysym: u32,
         down: bool,
     },
+    Text {
+        #[serde(deserialize_with = "capped_text")]
+        text: String,
+    },
     Keyframe,
     Ack {
         frame: u32,
@@ -65,9 +69,20 @@ impl Msg {
             Msg::Button { button, down } => InputEvent::Button { button, down },
             Msg::Wheel { dx, dy } => InputEvent::Wheel { dx, dy },
             Msg::Key { keysym, down } => InputEvent::Key { keysym, down },
+            Msg::Text { text } => InputEvent::Text(text),
             Msg::Keyframe | Msg::Ack { .. } => return None,
         })
     }
+}
+
+fn capped_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let text = String::deserialize(d)?;
+    if text.chars().count() > TEXT_MAX {
+        return Err(serde::de::Error::custom(format!(
+            "text is longer than {TEXT_MAX} chars"
+        )));
+    }
+    Ok(text)
 }
 
 #[derive(Deserialize)]
@@ -162,8 +177,14 @@ async fn route(hub: Arc<Hub>, fd: RawFd, mut request: Request<Incoming>) -> Resp
         }
         (Method::GET, "/stream") => {
             let viewer = query(&request, "viewer");
-            if viewer.as_deref().is_some_and(|v| v.is_empty() || v == "agent") {
-                return error(StatusCode::BAD_REQUEST, "a viewer id is not empty and not \"agent\"");
+            if viewer
+                .as_deref()
+                .is_some_and(|v| v.is_empty() || v == "agent")
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "a viewer id is not empty and not \"agent\"",
+                );
             }
             upgrade(&mut request, move |socket| stream(hub, viewer, fd, socket))
         }
@@ -199,7 +220,10 @@ async fn route(hub: Arc<Hub>, fd: RawFd, mut request: Request<Incoming>) -> Resp
             // half the events are in.
             let gate = hub.gate.lock().unwrap();
             if *gate != Gate::Agent {
-                return error(StatusCode::CONFLICT, "the input gate is not open for the agent");
+                return error(
+                    StatusCode::CONFLICT,
+                    "the input gate is not open for the agent",
+                );
             }
             let n = input.len();
             for i in input {
@@ -334,10 +358,44 @@ fn on_text(hub: &Hub, client: &Client, text: &str) {
         }
         input => {
             let gate = hub.gate.lock().unwrap();
-            let open = matches!((&*gate, client.viewer.as_deref()), (Gate::Viewer(g), Some(v)) if g == v);
+            let open =
+                matches!((&*gate, client.viewer.as_deref()), (Gate::Viewer(g), Some(v)) if g == v);
             if let (true, Some(ev)) = (open, input.input()) {
                 let _ = hub.input.send(ev);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_message() {
+        let msg: Msg = serde_json::from_str(r#"{"type":"text","text":"你好，世界\n"}"#).unwrap();
+        match msg.input() {
+            Some(InputEvent::Text(t)) => assert_eq!(t, "你好，世界\n"),
+            _ => panic!("not a text event"),
+        }
+        let list: Vec<Msg> = serde_json::from_str(
+            r#"[{"type":"text","text":"a"},{"type":"key","keysym":65293,"down":true}]"#,
+        )
+        .unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(serde_json::from_str::<Msg>(r#"{"type":"text"}"#).is_err());
+        assert!(serde_json::from_str::<Msg>(r#"{"type":"text","text":5}"#).is_err());
+    }
+
+    #[test]
+    fn text_is_capped_in_chars() {
+        let at_cap = format!(r#"{{"type":"text","text":"{}"}}"#, "界".repeat(TEXT_MAX));
+        assert!(serde_json::from_str::<Msg>(&at_cap).is_ok());
+        let over = format!(r#"{{"type":"text","text":"{}"}}"#, "a".repeat(TEXT_MAX + 1));
+        let err = serde_json::from_str::<Msg>(&over)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("text is longer than 4096 chars"), "{err}");
     }
 }

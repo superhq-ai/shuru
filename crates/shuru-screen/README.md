@@ -176,6 +176,7 @@ Clients may send text messages, JSON:
 | `{"type": "button", "button": B, "down": true}` | X button: 1 left, 2 middle, 3 right |
 | `{"type": "wheel", "dx": 0, "dy": 120}` | scroll; 120 is one notch, positive `dy` scrolls down, `dx` right; any size, smaller deltas add up |
 | `{"type": "key", "keysym": K, "down": true}` | an X keysym, such as 0x61 for `a` or 0xff0d for Return |
+| `{"type": "text", "text": "你好，世界"}` | committed text, any Unicode, typed in order as a press and release per char; a newline (LF, CR or CR LF) is Return, tab is Tab, other control chars are skipped; at most 4096 chars |
 
 Input messages are applied only while the gate is open for this viewer,
 and dropped otherwise. Unknown messages are ignored.
@@ -202,8 +203,8 @@ a `gate` message.
 
 ### `POST /input`
 
-A JSON list of input events, the same `move`, `button`, `wheel` and `key`
-messages as on the stream, applied in order:
+A JSON list of input events, the same `move`, `button`, `wheel`, `key`
+and `text` messages as on the stream, applied in order:
 
 ```json
 [{"type": "move", "x": 400, "y": 300}, {"type": "button", "button": 1, "down": true}, {"type": "button", "button": 1, "down": false}]
