@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use cosmic_text::{
     fontdb, Attrs, Buffer, CacheKey, Family, FontSystem, Metrics, Shaping, SwashCache,
-    SwashContent, Wrap,
+    SwashContent, Weight, Wrap,
 };
 
 use crate::glyphs::Glyph;
@@ -523,7 +523,7 @@ impl Font {
         let mut buf = Buffer::new(&mut self.fonts, Metrics::new(size, size));
         buf.set_wrap(Wrap::None);
         buf.set_size(None, None);
-        let attrs = Attrs::new().family(Family::SansSerif);
+        let attrs = Attrs::new().family(Family::SansSerif).weight(Weight::MEDIUM);
         buf.set_text(text, &attrs, Shaping::Advanced, None);
         buf.shape_until_scroll(&mut self.fonts, false);
         let mut line = Line {
