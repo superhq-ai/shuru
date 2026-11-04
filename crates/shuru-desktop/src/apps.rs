@@ -9,27 +9,30 @@ use anyhow::{bail, Context, Result};
 pub struct App {
     /// The file name less `.desktop`, such as `org.gnome.Calculator`.
     pub id: String,
+    /// The Name for the locale of the shell.
     pub name: String,
+    /// The Name without a locale.
+    pub plain_name: String,
     pub exec: String,
     pub wm_class: Option<String>,
     pub terminal: bool,
     pub categories: Vec<String>,
+    /// The Icon key: a name in the icon themes or a path.
+    pub icon: Option<String>,
+    pub generic: Option<String>,
+    /// The Desktop Actions, in the order of the Actions key.
+    pub actions: Vec<Action>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Action {
+    pub name: String,
+    pub exec: String,
 }
 
 impl App {
-    /// The dock icon for the app, from its categories.
-    pub fn icon(&self) -> crate::chrome::Icon {
-        use crate::chrome::Icon;
-        let has = |c: &str| self.categories.iter().any(|x| x == c);
-        if has("WebBrowser") {
-            Icon::Globe
-        } else if has("TerminalEmulator") {
-            Icon::Terminal
-        } else if has("FileManager") {
-            Icon::Folder
-        } else {
-            Icon::Page
-        }
+    pub fn is_browser(&self) -> bool {
+        self.categories.iter().any(|c| c == "WebBrowser")
     }
 
     /// Whether a window with this WM_CLASS belongs to the app.
@@ -56,14 +59,25 @@ impl App {
     pub fn is_named(&self, name: &str) -> bool {
         self.id.eq_ignore_ascii_case(name)
             || self.name.eq_ignore_ascii_case(name)
+            || self.plain_name.eq_ignore_ascii_case(name)
             || self.program().is_some_and(|p| p.eq_ignore_ascii_case(name))
     }
 
     /// The argv to start the app with `args` (files or URLs).
     pub fn command(&self, args: &[String]) -> Result<Vec<String>> {
+        self.expand(&self.exec, args)
+    }
+
+    /// The argv of one of its Desktop Actions.
+    pub fn action_command(&self, i: usize) -> Result<Vec<String>> {
+        let action = self.actions.get(i).context("no such action")?;
+        self.expand(&action.exec, &[])
+    }
+
+    fn expand(&self, exec: &str, args: &[String]) -> Result<Vec<String>> {
         let mut argv = Vec::new();
         let mut took_args = false;
-        for word in split_exec(&self.exec)? {
+        for word in split_exec(exec)? {
             match word.as_str() {
                 "%F" | "%U" => {
                     argv.extend(args.iter().cloned());
@@ -123,51 +137,138 @@ pub fn read(path: &Path) -> Result<Option<App>> {
 }
 
 pub fn parse(id: &str, text: &str) -> Option<App> {
-    let mut in_entry = false;
-    let (mut name, mut exec, mut wm_class) = (None, None, None);
+    parse_in(
+        id,
+        text,
+        &crate::locale::desktop_keys(&crate::locale::messages_locale()),
+    )
+}
+
+/// A localized value: the best rank seen so far, lower is better, and the
+/// value.
+type Local = Option<(usize, String)>;
+
+fn keep(slot: &mut Local, rank: usize, value: &str) {
+    if slot.as_ref().is_none_or(|(r, _)| rank < *r) {
+        *slot = Some((rank, value.to_string()));
+    }
+}
+
+/// `Key` or `Key[locale]` with the rank of its locale in `locales`; a key
+/// for another locale has none.
+fn split_key<'a>(key: &'a str, locales: &[String]) -> Option<(&'a str, usize)> {
+    match key.split_once('[') {
+        None => Some((key, locales.len())),
+        Some((base, rest)) => {
+            let loc = rest.strip_suffix(']')?;
+            locales.iter().position(|l| l == loc).map(|i| (base, i))
+        }
+    }
+}
+
+fn parse_in(id: &str, text: &str, locales: &[String]) -> Option<App> {
+    // The section a line is in: the entry, an action by its id, or another.
+    let mut section: Option<Option<String>> = None;
+    let (mut exec, mut wm_class, mut icon) = (None, None, None);
+    let (mut name, mut plain_name, mut generic): (Local, Option<String>, Local) =
+        (None, None, None);
     let mut terminal = false;
     let mut kind = None;
     let mut categories = Vec::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut actions: Vec<(String, Local, Option<String>)> = Vec::new();
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
-            in_entry = line == "[Desktop Entry]";
+            section = if line == "[Desktop Entry]" {
+                Some(None)
+            } else {
+                line.strip_prefix("[Desktop Action ")
+                    .and_then(|r| r.strip_suffix(']'))
+                    .map(|a| Some(a.to_string()))
+            };
             continue;
         }
-        if !in_entry || line.starts_with('#') {
+        if line.starts_with('#') {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
         let value = unescape(value.trim());
-        match key.trim() {
-            "Name" => name = Some(value),
-            "Exec" => exec = Some(value),
-            "StartupWMClass" => wm_class = Some(value),
-            "Terminal" => terminal = value == "true",
-            "Type" => kind = Some(value),
-            "Categories" => {
-                categories = value
-                    .split(';')
-                    .filter(|c| !c.is_empty())
-                    .map(str::to_string)
-                    .collect()
+        let Some((key, rank)) = split_key(key.trim(), locales) else {
+            continue;
+        };
+        let plain = rank == locales.len();
+        match &section {
+            Some(None) => match key {
+                "Name" => {
+                    keep(&mut name, rank, &value);
+                    if plain {
+                        plain_name = Some(value);
+                    }
+                }
+                "GenericName" => keep(&mut generic, rank, &value),
+                _ if !plain => {}
+                "Exec" => exec = Some(value),
+                "StartupWMClass" => wm_class = Some(value),
+                "Terminal" => terminal = value == "true",
+                "Type" => kind = Some(value),
+                "Icon" if !value.is_empty() => icon = Some(value),
+                "Categories" => categories = list(&value),
+                "Actions" => order = list(&value),
+                _ => {}
+            },
+            Some(Some(a)) => {
+                let i = match actions.iter().position(|(x, _, _)| x == a) {
+                    Some(i) => i,
+                    None => {
+                        actions.push((a.clone(), None, None));
+                        actions.len() - 1
+                    }
+                };
+                match key {
+                    "Name" => keep(&mut actions[i].1, rank, &value),
+                    "Exec" if plain => actions[i].2 = Some(value),
+                    _ => {}
+                }
             }
-            _ => {}
+            None => {}
         }
     }
     if kind.as_deref() != Some("Application") {
         return None;
     }
+    let actions = order
+        .iter()
+        .filter_map(|id| actions.iter().find(|(x, _, _)| x == id))
+        .filter_map(|(_, n, e)| {
+            Some(Action {
+                name: n.clone()?.1,
+                exec: e.clone()?,
+            })
+        })
+        .collect();
     Some(App {
         id: id.to_string(),
-        name: name.unwrap_or_else(|| id.to_string()),
+        name: name.map_or_else(|| id.to_string(), |(_, n)| n),
+        plain_name: plain_name.unwrap_or_else(|| id.to_string()),
         exec: exec?,
         wm_class,
         terminal,
         categories,
+        icon,
+        generic: generic.map(|(_, g)| g),
+        actions,
     })
+}
+
+fn list(value: &str) -> Vec<String> {
+    value
+        .split(';')
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// The escapes of a string value: `\s`, `\n`, `\t`, `\r`, `\\`.
@@ -279,6 +380,15 @@ pub fn find(configured: &[App], name: &str) -> Option<App> {
     if let Ok(a) = load(name) {
         return Some(a);
     }
+    scan(|a| a.is_named(name))
+}
+
+/// The app in the XDG dirs that a window with this WM_CLASS belongs to.
+pub fn owner(instance: &str, class: &str) -> Option<App> {
+    scan(|a| a.owns(instance, class))
+}
+
+fn scan(want: impl Fn(&App) -> bool) -> Option<App> {
     for dir in dirs() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -287,7 +397,7 @@ pub fn find(configured: &[App], name: &str) -> Option<App> {
             let p = e.path();
             if p.extension().is_some_and(|x| x == "desktop") {
                 if let Ok(Some(a)) = read(&p) {
-                    if a.is_named(name) {
+                    if want(&a) {
                         return Some(a);
                     }
                 }
@@ -305,10 +415,14 @@ mod tests {
         App {
             id: "org.example.Viewer".into(),
             name: "Viewer".into(),
+            plain_name: "Viewer".into(),
             exec: exec.into(),
             wm_class: None,
             terminal: false,
             categories: vec![],
+            icon: None,
+            generic: None,
+            actions: vec![],
         }
     }
 
@@ -316,8 +430,9 @@ mod tests {
     fn parses_an_entry() {
         let text = "[Desktop Entry]\nType=Application\nName=Calculator\nName[de]=Rechner\n\
                     Exec=gnome-calculator\nStartupWMClass=gnome-calculator\nCategories=GTK;Utility;\n\
-                    [Desktop Action new]\nName=New\nExec=other\n";
-        let a = parse("org.gnome.Calculator", text).unwrap();
+                    Icon=org.gnome.Calculator\nGenericName=Calculator\nActions=new;gone;\n\
+                    [Desktop Action new]\nName=New\nExec=other --new\n";
+        let a = parse_in("org.gnome.Calculator", text, &[]).unwrap();
         assert_eq!(a.name, "Calculator");
         assert_eq!(a.exec, "gnome-calculator");
         assert_eq!(a.wm_class.as_deref(), Some("gnome-calculator"));
@@ -327,7 +442,35 @@ mod tests {
         assert!(a.owns("gnome-calculator", "Gnome-calculator"));
         assert!(!a.owns("xterm", "XTerm"));
         assert_eq!(a.categories, vec!["GTK", "Utility"]);
-        assert_eq!(a.icon(), crate::chrome::Icon::Page);
+        assert_eq!(a.icon.as_deref(), Some("org.gnome.Calculator"));
+        assert_eq!(
+            a.actions,
+            vec![Action {
+                name: "New".into(),
+                exec: "other --new".into()
+            }]
+        );
+        assert_eq!(a.action_command(0).unwrap(), vec!["other", "--new"]);
+        assert!(!a.is_browser());
+    }
+
+    #[test]
+    fn localized_keys_follow_the_locale() {
+        let text = "[Desktop Entry]\nType=Application\nName=Files\nName[zh]=文件\n\
+                    Name[zh_CN]=文件管理\nName[de]=Dateien\nGenericName=File manager\n\
+                    GenericName[zh]=文件管理器\nExec=files\nExec[zh_CN]=nope\nActions=w;\n\
+                    [Desktop Action w]\nName=New Window\nName[zh_CN]=新建窗口\nExec=files -w\n";
+        let zh = parse_in("files", text, &crate::locale::desktop_keys("zh_CN.UTF-8")).unwrap();
+        assert_eq!(zh.name, "文件管理");
+        assert_eq!(zh.generic.as_deref(), Some("文件管理器"));
+        assert_eq!(zh.exec, "files");
+        assert_eq!(zh.actions[0].name, "新建窗口");
+        assert!(zh.is_named("Files"));
+        let sg = parse_in("files", text, &crate::locale::desktop_keys("zh_SG")).unwrap();
+        assert_eq!(sg.name, "文件");
+        let en = parse_in("files", text, &crate::locale::desktop_keys("en_US.UTF-8")).unwrap();
+        assert_eq!(en.name, "Files");
+        assert_eq!(en.actions[0].name, "New Window");
     }
 
     #[test]

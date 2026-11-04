@@ -1,0 +1,26 @@
+{
+  "distribution": {
+    "skip_first_run_ui": true,
+    "import_bookmarks": false,
+    "make_chrome_default_for_user": false,
+    "suppress_first_run_default_browser_prompt": true
+  },
+  "browser": {
+    "custom_chrome_frame": true,
+    "check_default_browser": false,
+    "has_seen_welcome_page": true
+  },
+  "extensions": {
+    "theme": {
+      "system_theme": 1
+    }
+  },
+  "credentials_enable_service": false,
+  "translate": {
+    "enabled": false
+  },
+  "download": {
+    "prompt_for_download": false,
+    "default_directory": "~/Downloads"
+  }
+}

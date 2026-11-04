@@ -1,0 +1,102 @@
+/* SuperHQ: Adwaita light in the tones of shuru-desktop, the default
+   appearance. Selection is RAISED with TEXT, the suggested action a TEXT
+   button, title bars WINBAR, and the window buttons the 12 px lights of
+   the desktop. */
+@import url("resource:///org/gtk/libgtk/theme/Adwaita/gtk-contained.css");
+
+@define-color theme_bg_color #fbfbfc;
+@define-color theme_base_color #fbfbfc;
+@define-color theme_fg_color #18181b;
+@define-color theme_text_color #18181b;
+@define-color theme_selected_bg_color #d6d6db;
+@define-color theme_selected_fg_color #18181b;
+@define-color insensitive_fg_color #a1a1a8;
+@define-color borders #dadade;
+@define-color unfocused_borders #dadade;
+
+* { outline-color: #c2c2c9; -gtk-secondary-caret-color: #18181b; }
+
+window, .background { background-color: #fbfbfc; color: #18181b; }
+textview text, treeview.view, iconview, .view { background-color: #fbfbfc; color: #18181b; }
+.view:selected, .view:selected:focus, treeview.view:selected, row:selected,
+textview text selection, entry selection, label selection {
+  background-color: #d6d6db; color: #18181b;
+}
+.dim-label, label.dim-label { color: #5c5c63; opacity: 1; }
+
+/* The desktop draws the ring and the resize band round every window. */
+window.solid-csd, window.csd.solid-csd {
+  margin: 0; padding: 0; border: none; border-radius: 0; box-shadow: none;
+}
+decoration, .solid-csd decoration, .solid-csd decoration:backdrop {
+  padding: 0; margin: 0; border: none; box-shadow: none;
+}
+
+headerbar, .titlebar {
+  background: #f5f5f7; border-bottom: 1px solid #dadade; box-shadow: none;
+  min-height: 46px; padding: 0 8px;
+}
+headerbar:backdrop, .titlebar:backdrop { background: #f5f5f7; }
+headerbar .title { font-weight: 500; font-size: 13px; color: #18181b; }
+headerbar .subtitle { font-size: 11px; color: #5c5c63; }
+
+entry {
+  background-color: #ffffff; color: #18181b; border: 1px solid #c2c2c9;
+  border-radius: 6px; box-shadow: none;
+}
+entry:focus { border-color: #8c8c93; box-shadow: none; }
+
+button {
+  background-image: none; background-color: #ffffff; color: #18181b;
+  border: none; border-radius: 8px; text-shadow: none; -gtk-icon-shadow: none;
+  box-shadow: inset 0 0 0 1px #c8c8ce, 0 1px 0 #d6d6db;
+}
+button:hover { background-color: #f5f5f7; }
+button:active, button:checked {
+  background-color: #ececef; box-shadow: inset 0 0 0 1px #b4b4bb;
+}
+button.flat, headerbar button.flat { background-color: transparent; box-shadow: none; }
+button.flat:hover { background-color: #e3e3e7; }
+button.suggested-action, button.default {
+  background-color: #18181b; color: #ffffff; font-weight: 600;
+  box-shadow: inset 0 0 0 1px #000000, inset 0 2px 0 #3a3a3f, 0 1px 0 #c4c4ca;
+}
+button.suggested-action:hover, button.default:hover { background-color: #000000; }
+button.suggested-action:active { background-color: #2c2c31; box-shadow: inset 0 0 0 1px #000000; }
+button.suggested-action label { color: #ffffff; }
+
+/* The lights: 12 px, 6 px apart, the same fills as the desktop draws.
+   Focused: close red, minimize yellow, maximize green, glyphs over the
+   group. Backdrop: all three a quiet neutral. */
+headerbar button.titlebutton, .titlebar button.titlebutton {
+  min-width: 12px; min-height: 12px; padding: 0; margin: 0; border: none;
+  border-radius: 6px; color: transparent; -gtk-icon-transform: scale(0.75);
+}
+headerbar button.titlebutton image, .titlebar button.titlebutton image { margin: -2px; }
+headerbar button.titlebutton.close, .titlebar button.titlebutton.close {
+  background-color: #e2574f; box-shadow: inset 0 0 0 1px #c4463f, inset 0 2px 0 #ec7a73, 0 1px 0 #dcdce0;
+}
+headerbar button.titlebutton.minimize, .titlebar button.titlebutton.minimize {
+  background-color: #e8c547; box-shadow: inset 0 0 0 1px #c9a737, inset 0 2px 0 #f1d677, 0 1px 0 #dcdce0;
+}
+headerbar button.titlebutton.maximize, .titlebar button.titlebutton.maximize {
+  background-color: #4cc777; box-shadow: inset 0 0 0 1px #3aa863, inset 0 2px 0 #74d696, 0 1px 0 #dcdce0;
+}
+headerbar:hover button.titlebutton.close, .titlebar:hover button.titlebutton.close { color: #4d0f0b; }
+headerbar:hover button.titlebutton.minimize, .titlebar:hover button.titlebutton.minimize { color: #5a4205; }
+headerbar:hover button.titlebutton.maximize, .titlebar:hover button.titlebutton.maximize { color: #0d4223; }
+headerbar button.titlebutton.close:active { background-color: #c4463f; box-shadow: inset 0 0 0 1px #c4463f; }
+headerbar button.titlebutton.minimize:active { background-color: #c9a737; box-shadow: inset 0 0 0 1px #c9a737; }
+headerbar button.titlebutton.maximize:active { background-color: #3aa863; box-shadow: inset 0 0 0 1px #3aa863; }
+headerbar button.titlebutton:backdrop, .titlebar button.titlebutton:backdrop,
+headerbar:backdrop button.titlebutton, .titlebar:backdrop button.titlebutton {
+  background-color: #d4d4d9; color: transparent;
+  box-shadow: inset 0 0 0 1px #c4c4ca, inset 0 2px 0 #e2e2e6, 0 1px 0 #dcdce0;
+}
+
+placessidebar, .sidebar, stacksidebar { background-color: #f0f0f2; border-right: 1px solid #dadade; }
+placessidebar row:selected { background-color: #d6d6db; color: #18181b; }
+scrollbar { background: transparent; border: none; }
+scrollbar slider { background-color: #c2c2c9; min-width: 6px; min-height: 6px; border: 3px solid transparent; }
+menu, .menu, popover, popover.background { background-color: #fbfbfc; color: #18181b; border: 1px solid #c2c2c9; }
+tooltip, tooltip.background { background-color: #e6e6ea; color: #18181b; border: 1px solid #c2c2c9; }

@@ -1,0 +1,27 @@
+! The SuperHQ terminal: dark, a mono font, no scrollbar.
+XTerm*background: #111113
+XTerm*foreground: #e4e4e7
+XTerm*cursorColor: #d6d6d9
+XTerm*faceName: DejaVu Sans Mono
+XTerm*faceSize: 10
+XTerm*internalBorder: 12
+XTerm*scrollBar: false
+XTerm*utf8Title: true
+XTerm*saveLines: 5000
+XTerm*geometry: 88x24
+XTerm*color0: #111113
+XTerm*color1: #e5534b
+XTerm*color2: #4cc777
+XTerm*color3: #e8b04a
+XTerm*color4: #8ab4f8
+XTerm*color5: #c792ea
+XTerm*color6: #6cc5d1
+XTerm*color7: #e4e4e7
+XTerm*color8: #6e6e74
+XTerm*color9: #f47067
+XTerm*color10: #6fdc95
+XTerm*color11: #f2c66d
+XTerm*color12: #a8c7fa
+XTerm*color13: #dcb0f5
+XTerm*color14: #8ad8e2
+XTerm*color15: #f2f2f3

@@ -80,12 +80,34 @@ async fn body<T: serde::de::DeserializeOwned>(request: Request<Incoming>) -> Res
         .await
         .map_err(|e| e.to_string())?
         .to_bytes();
-    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+    let bytes: &[u8] = if bytes.is_empty() { b"{}" } else { &bytes };
+    serde_json::from_slice(bytes).map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize)]
+struct NoteAction {
+    key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Appearance {
+    appearance: String,
 }
 
 #[derive(Deserialize)]
 struct Id {
     id: u32,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+struct Focus {
+    id: u32,
+    #[serde(default = "yes")]
+    maximize: bool,
 }
 
 #[derive(Deserialize)]
@@ -94,6 +116,8 @@ struct Launch {
     #[serde(default)]
     args: Vec<String>,
     timeout_ms: Option<u64>,
+    #[serde(default = "yes")]
+    maximize: bool,
 }
 
 #[derive(Deserialize)]
@@ -111,8 +135,17 @@ async fn route(state: State, request: Request<Incoming>) -> Response<Body> {
     match (method, path.as_str()) {
         (Method::GET, "/healthz") => json_reply(StatusCode::OK, json!({ "ok": true })),
         (Method::GET, "/windows") => answer(state.wm.call(Cmd::Windows).await),
-        (Method::POST, "/focus") => match body::<Id>(request).await {
-            Ok(b) => answer(state.wm.call(|r| Cmd::Focus(b.id, r)).await),
+        (Method::POST, "/focus") => match body::<Focus>(request).await {
+            Ok(b) => answer(
+                state
+                    .wm
+                    .call(|reply| Cmd::Focus {
+                        id: b.id,
+                        maximize: b.maximize,
+                        reply,
+                    })
+                    .await,
+            ),
             Err(e) => error(StatusCode::BAD_REQUEST, e),
         },
         (Method::POST, "/close") => match body::<Id>(request).await {
@@ -130,6 +163,7 @@ async fn route(state: State, request: Request<Incoming>) -> Response<Body> {
                             app: b.app,
                             args: b.args,
                             timeout,
+                            maximize: b.maximize,
                             reply,
                         })
                         .await,
@@ -137,6 +171,46 @@ async fn route(state: State, request: Request<Incoming>) -> Response<Body> {
             }
             Err(e) => error(StatusCode::BAD_REQUEST, e),
         },
+        (Method::GET, "/appearance") => answer(state.wm.call(|r| Cmd::Appearance(None, r)).await),
+        (Method::PUT, "/appearance") => match body::<Appearance>(request).await {
+            Ok(b) => {
+                let dark = match b.appearance.as_str() {
+                    "dark" => true,
+                    "light" => false,
+                    _ => {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "appearance is light or dark".to_string(),
+                        )
+                    }
+                };
+                answer(state.wm.call(|r| Cmd::Appearance(Some(dark), r)).await)
+            }
+            Err(e) => error(StatusCode::BAD_REQUEST, e),
+        },
+        (Method::GET, "/notifications") => answer(state.wm.call(Cmd::Notifications).await),
+        (Method::POST, p) if p.starts_with("/notifications/") && p.ends_with("/action") => {
+            let id = p
+                .trim_start_matches("/notifications/")
+                .trim_end_matches("/action")
+                .parse::<u32>();
+            let Ok(id) = id else {
+                return error(StatusCode::NOT_FOUND, "no such notification");
+            };
+            match body::<NoteAction>(request).await {
+                Ok(b) => answer(
+                    state
+                        .wm
+                        .call(|reply| Cmd::NoteAction {
+                            id,
+                            key: b.key.unwrap_or_else(|| "default".into()),
+                            reply,
+                        })
+                        .await,
+                ),
+                Err(e) => error(StatusCode::BAD_REQUEST, e),
+            }
+        }
         (Method::GET, "/settle") => {
             let quiet = match query_ms(&request, "quiet_ms", 300) {
                 Ok(v) => Duration::from_millis(v.min(60_000)),
@@ -190,9 +264,11 @@ async fn route(state: State, request: Request<Incoming>) -> Response<Body> {
                     .await,
             )
         }
-        (_, "/healthz" | "/windows" | "/focus" | "/close" | "/launch" | "/settle" | "/overlay") => {
-            error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
-        }
+        (
+            _,
+            "/healthz" | "/windows" | "/focus" | "/close" | "/launch" | "/settle" | "/overlay"
+            | "/appearance" | "/notifications",
+        ) => error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
         _ => error(StatusCode::NOT_FOUND, format!("no route {path}")),
     }
 }
