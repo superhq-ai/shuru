@@ -1,0 +1,29 @@
+[package]
+name = "shuru-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "An X11 window manager for a desktop an agent uses, with a panel, overlays and an API on a unix socket"
+license = "Apache-2.0"
+repository = "https://github.com/superhq-ai/shuru"
+publish = false
+
+[[bin]]
+name = "shuru-desktop"
+path = "src/main.rs"
+
+# Linux only. On other systems the binary only says so, which keeps
+# `cargo build --workspace` working there.
+[target.'cfg(target_os = "linux")'.dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+fontdue = { version = "0.9", default-features = false, features = ["std"] }
+form_urlencoded = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "net", "sync", "macros", "time", "signal"] }
+x11rb = { version = "0.13", features = ["damage", "shape", "xfixes", "xinput"] }
