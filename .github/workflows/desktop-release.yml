@@ -1,0 +1,87 @@
+name: Desktop release
+
+# shuru-desktop, shuru-screen and the patched Xvfb, for Debian trixie
+# guests. A tag desktop-v<version> must match the crate versions. Always a
+# pre-release, so the latest release stays the CLI one.
+on:
+  push:
+    tags:
+      - "desktop-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag against the crate versions
+        run: |
+          # desktop-v0.1.0-rc.1 is a rehearsal of 0.1.0.
+          VERSION="${GITHUB_REF_NAME#desktop-v}"
+          VERSION="${VERSION%%-*}"
+          for crate in shuru-desktop shuru-screen; do
+            got=$(sed -n 's/^version = "\(.*\)"/\1/p' "crates/$crate/Cargo.toml" | head -1)
+            if [ "$got" != "$VERSION" ]; then
+              echo "$crate is $got, the tag says $VERSION"
+              exit 1
+            fi
+          done
+
+      # Built on trixie so they link against the libraries the guest has.
+      - name: Build the binaries
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e CARGO_TERM_COLOR=always debian:trixie sh -euc '
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends \
+              ca-certificates curl build-essential pkg-config libx264-dev libyuv-dev >/dev/null
+            curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal
+            . "$HOME/.cargo/env"
+            CARGO_TARGET_DIR=/tmp/target cargo build --release --locked -p shuru-desktop -p shuru-screen
+            mkdir -p out
+            cp /tmp/target/release/shuru-desktop "out/shuru-desktop-${{ matrix.arch }}-linux"
+            cp /tmp/target/release/shuru-screen "out/shuru-screen-${{ matrix.arch }}-linux"
+            chown -R "$(stat -c %u:%g /src)" out
+          '
+
+      - name: Build the patched Xvfb
+        run: |
+          crates/shuru-screen/patches/build-xvfb-deb.sh xvfb-deb
+          cp xvfb-deb/xvfb_*.deb "out/xvfb-shuru-${{ matrix.arch }}.deb"
+          cp xvfb-deb/xserver-common_*.deb "out/xserver-common-shuru-${{ matrix.arch }}.deb"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-${{ matrix.arch }}
+          path: out/*
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd artifacts && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: shuru-desktop ${{ github.ref_name }}
+          body: shuru-desktop, shuru-screen and the patched Xvfb for Debian trixie guests. Checksums in SHA256SUMS.
+          prerelease: true
+          make_latest: false
+          files: artifacts/*

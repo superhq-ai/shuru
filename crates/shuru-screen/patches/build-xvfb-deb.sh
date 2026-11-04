@@ -26,7 +26,7 @@ docker run --rm \
     cd xorg-server-*/
     cp /patches/xorg-server-xtest-scroll.patch debian/patches/
     echo xorg-server-xtest-scroll.patch >> debian/patches/series
-    dch --local +scroll "XTEST pointer with scroll axes, for smooth scrolling."
+    dch --local +shuru "XTEST pointer with scroll axes, for smooth scrolling."
     DEB_BUILD_OPTIONS="nocheck parallel=$(nproc)" dpkg-buildpackage -b -uc -us -j"$(nproc)"
     cp ../xvfb_*.deb ../xserver-common_*.deb /out/
     ls -l /out
