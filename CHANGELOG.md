@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.12.0
+
+### Linux: x86_64 hosts
+
+The KVM backend now runs on x86_64 Linux as well as ARM64, with a release
+build of the CLI (`linux-x86_64`) and an x86_64 OS image. The guest has
+the architecture of the host. An x86_64 guest boots the uncompressed
+kernel through the 64-bit boot protocol and finds its CPUs and devices in
+hardware-reduced ACPI tables, with the in-kernel interrupt controllers
+and kvmclock. `install.sh` installs it on x86_64 Linux. Like ARM64 Linux,
+it is experimental.
+
+### Linux: VM snapshots
+
+`shuru-node run --snapshot-to DIR` saves a VM after its command, and
+`shuru-node restore` starts a new VM from it with its memory mapped from
+the snapshot and read ahead. On a1.metal a restore answers in 26 to 32 ms
+where a cold boot takes about 330 ms. Every restore gets a new guest
+identity, a new VM generation ID and a fresh seed for the guest random
+number generator, so two clones of one snapshot do not share keys. A
+snapshot from another CPU or another guest protocol is refused. RFC 0009
+has the design.
+
+### Linux: shuru-node
+
+`shuru-node` runs each VM in a jailed `shuru-vmm` and its network in a
+jailed `shuru-netd`, each under seccomp (RFC 0008). `shuru-node serve`
+keeps sandboxes on a host and serves the sandbox API on a unix socket:
+create, exec sessions that outlive their connection, the filesystem,
+ports, env and secrets, disk checkpoints, stop, idle park and park
+(RFC 0012).
+
+### Services start with the env of the sandbox
+
+A service started from init got only the env of its file, so a process
+that read `DATABASE_URL` or a secret from its env had neither. The host
+now sends the env of the sandbox and the placeholders of its secrets, and
+the guest starts the services with it. A service without a ready check
+counts as ready after 500 ms of running instead of at spawn. The guest
+protocol is now version 6, so a host and a guest that disagree refuse
+each other at once instead of waiting out a timeout.
+
+### Services can restart
+
+A service file takes `"restart": "always"`. Such a service starts again
+after it exits, waiting 1 s and doubling up to 60 s. It holds commands
+only until it is first ready, and never fails them. Service logs over
+1 MiB are rotated to `<name>.log.1`.
+
+### Secrets: every request gets the values of its moment
+
+An open connection resolved its secrets again only between reads, so a
+request head sent while a secret was removed could still carry the old
+value. Every request head is now held until its secrets are resolved.
+Updating a provided secret drops its cached value, so the next request
+asks the provider again instead of using a revoked token until it
+expires.
+
+### Network: a closing upload no longer takes the network down
+
+smoltcp 0.12.0 panics when a FIN lands at a zero window edge, which
+killed the guest network. The workspace carries the upstream fix until a
+release has it.
+
+### The guest no longer dies when its console breaks
+
+The guest agent is PID 1, and it logged with `eprintln!`, which panics on
+a failed write. A console that failed every write ended the guest at its
+first log line. Log writes that fail are now dropped.
+
+### Linux: a silent vsock client no longer holds up the others
+
+The vsock acceptor read every handshake itself, so a client that
+connected and sent nothing delayed every other connection for 2 s. Each
+handshake now has a short-lived thread of its own.
+
 ## 0.11.0
 
 ### Fast boot
