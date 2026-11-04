@@ -8,6 +8,7 @@ export type {
 	FileChangeEvent,
 	MkdirOptions,
 	NetworkConfig,
+	Owner,
 	RemoveOptions,
 	SecretConfig,
 	SpawnOptions,

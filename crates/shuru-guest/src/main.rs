@@ -34,6 +34,9 @@ mod files;
 #[cfg(target_os = "linux")]
 mod ports;
 
+#[cfg(target_os = "linux")]
+mod user;
+
 /// How the guest stops its VM. An x86_64 guest has no ACPI sleep registers
 /// to power off with, so it resets through the keyboard controller
 /// (reboot=k), which the VMM takes as the end of the VM.
@@ -1172,6 +1175,15 @@ mod guest {
         vsock_reader: std::net::TcpStream,
         vsock_writer: std::net::TcpStream,
     ) {
+        let account = match crate::user::of(&req.run_as) {
+            Ok(account) => account,
+            Err(e) => {
+                let msg = format!("failed to spawn: {}", e);
+                let mut w = vsock_writer;
+                let _ = frame::write_frame(&mut w, frame::ERROR, msg.as_bytes());
+                return;
+            }
+        };
         let mut cmd = Command::new(&req.argv[0]);
         if req.argv.len() > 1 {
             cmd.args(&req.argv[1..]);
@@ -1179,7 +1191,7 @@ mod guest {
         for (k, v) in &req.env {
             cmd.env(k, v);
         }
-        if let Some(ref cwd) = req.cwd {
+        if let (None, Some(cwd)) = (&account, &req.cwd) {
             cmd.current_dir(cwd);
         }
         cmd.stdin(Stdio::piped());
@@ -1216,6 +1228,14 @@ mod guest {
                 libc::setpgid(0, 0);
                 Ok(())
             });
+        }
+        if let Some(account) = &account {
+            if let Err(e) = account.apply(&mut cmd, &req.env, req.cwd.as_deref()) {
+                let msg = format!("failed to spawn: {}", e);
+                let mut w = vsock_writer;
+                let _ = frame::write_frame(&mut w, frame::ERROR, msg.as_bytes());
+                return;
+            }
         }
 
         match crate::children::spawn_waited(&mut cmd) {
@@ -1512,6 +1532,16 @@ mod guest {
     }
 
     fn handle_tty_exec(vsock_fd: i32, req: &ExecRequest) {
+        let account = crate::user::of(&req.run_as);
+        let account = match account {
+            Ok(account) => account,
+            Err(e) => {
+                let msg = format!("failed to spawn: {}", e);
+                write_frame_fd(vsock_fd, frame::ERROR, msg.as_bytes());
+                unsafe { libc::close(vsock_fd) };
+                return;
+            }
+        };
         unsafe {
             // Set up initial winsize
             let ws = libc::winsize {
@@ -1537,13 +1567,38 @@ mod guest {
                 return;
             }
 
+            // What the child needs of the account, made before the fork.
+            let run_as = match &account {
+                Some(account) => {
+                    let terminal = std::os::fd::BorrowedFd::borrow_raw(slave);
+                    let prepared = account.own_terminal(&terminal).and_then(|()| {
+                        Ok((
+                            account.switch(req.cwd.as_deref())?,
+                            account.env_vars(&req.env)?,
+                        ))
+                    });
+                    match prepared {
+                        Ok(prepared) => Some(prepared),
+                        Err(e) => {
+                            let msg = format!("failed to spawn: {}", e);
+                            write_frame_fd(vsock_fd, frame::ERROR, msg.as_bytes());
+                            libc::close(master);
+                            libc::close(slave);
+                            libc::close(vsock_fd);
+                            return;
+                        }
+                    }
+                }
+                None => None,
+            };
+
             let exit = crate::children::Exit::default();
             let status = exit.clone();
             let forked = crate::children::start(
                 || {
                     let pid = libc::fork();
                     if pid == 0 {
-                        tty_child(master, slave, vsock_fd, req);
+                        tty_child(master, slave, vsock_fd, req, run_as.as_ref());
                     }
                     if pid < 0 {
                         Err(std::io::Error::last_os_error())
@@ -1569,7 +1624,13 @@ mod guest {
     }
 
     /// The child side of a tty exec, between fork and exec.
-    unsafe fn tty_child(master: i32, slave: i32, vsock_fd: i32, req: &ExecRequest) -> ! {
+    unsafe fn tty_child(
+        master: i32,
+        slave: i32,
+        vsock_fd: i32,
+        req: &ExecRequest,
+        run_as: Option<&(crate::user::Switch, Vec<std::ffi::CString>)>,
+    ) -> ! {
         use std::ffi::CString;
 
         libc::close(master);
@@ -1588,8 +1649,16 @@ mod guest {
             libc::close(fd);
         }
 
-        // Change directory if requested
-        if let Some(ref cwd) = req.cwd {
+        if let Some((switch, env)) = run_as {
+            if let Err(e) = switch.enter() {
+                let msg = format!("shuru: cannot run as the user: {}\n", e);
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+                libc::_exit(126);
+            }
+            for var in env {
+                libc::putenv(var.as_ptr() as *mut libc::c_char);
+            }
+        } else if let Some(ref cwd) = req.cwd {
             if let Ok(dir) = CString::new(cwd.as_str()) {
                 libc::chdir(dir.as_ptr());
             }

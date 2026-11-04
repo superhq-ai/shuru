@@ -14,6 +14,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use shuru_node::control;
+use shuru_proto::RunAs;
 use shuru_proxy::Scope;
 
 use super::http::ApiError;
@@ -32,6 +33,9 @@ pub struct SandboxConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub secrets: BTreeMap<String, BoundSecret>,
+    /// Who an exec runs as when it names no user or group.
+    #[serde(flatten)]
+    pub run_as: RunAs,
     /// Raised by the caller with each change, so a change that arrives
     /// late is told from one that is new.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,16 +60,18 @@ fn is_head(scope: &Scope) -> bool {
 }
 
 impl SandboxConfig {
-    /// The `env`, `secrets` and `version` of a request body, checked. No
-    /// message carries a value, and none carries a name before it is
+    /// The `env`, `secrets`, user and `version` of a request body, checked.
+    /// No message carries a value, and none carries a name before it is
     /// checked.
     pub fn parse(
         env: Option<Value>,
         secrets: Option<Value>,
+        run_as: RunAs,
         version: Option<u64>,
     ) -> Result<Self, ApiError> {
         let config = SandboxConfig {
             version,
+            run_as,
             env: match env {
                 Some(env) => parse_env(env)?,
                 None => BTreeMap::new(),
@@ -308,7 +314,7 @@ mod tests {
     use serde_json::json;
 
     fn parse(env: Value, secrets: Value) -> Result<SandboxConfig, ApiError> {
-        SandboxConfig::parse(Some(env), Some(secrets), None)
+        SandboxConfig::parse(Some(env), Some(secrets), RunAs::default(), None)
     }
 
     #[test]
@@ -363,7 +369,7 @@ mod tests {
             config.secrets["TOKEN"].hosts,
             ["api.example.com", "*.example.org"]
         );
-        assert!(SandboxConfig::parse(None, None, None)
+        assert!(SandboxConfig::parse(None, None, RunAs::default(), None)
             .unwrap()
             .env
             .is_empty());
@@ -430,6 +436,17 @@ mod tests {
     }
 
     #[test]
+    fn the_user_of_a_sandbox_is_kept_and_none_is_root() {
+        let run_as = RunAs::parse("desktop").unwrap();
+        let config = SandboxConfig::parse(None, None, run_as.clone(), None).unwrap();
+        let written = serde_json::to_string(&config).unwrap();
+        let read: SandboxConfig = serde_json::from_str(&written).unwrap();
+        assert_eq!(read.run_as, run_as);
+        let old: SandboxConfig = serde_json::from_str(r#"{"env":{}}"#).unwrap();
+        assert_eq!(old.run_as, RunAs::default());
+    }
+
+    #[test]
     fn a_config_round_trips() {
         let config = parse(
             json!({ "A": "1" }),
@@ -470,6 +487,7 @@ mod tests {
                 "GH_TOKEN": { "provider": true, "hosts": ["github.com"], "in": "authorization" },
                 "KEY": { "value": "s3cret", "hosts": ["a.com"], "in": "head" },
             })),
+            RunAs::default(),
             Some(7),
         )
         .unwrap();

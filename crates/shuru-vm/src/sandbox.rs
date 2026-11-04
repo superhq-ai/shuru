@@ -63,8 +63,8 @@ impl Write for Capped {
 use shuru_proto::{
     frame, ChmodRequest, CopyRequest, DiscardRequest, ExecRequest, ForwardRequest, ForwardResponse,
     FsOkResponse, MkdirRequest, MountRequest, MountResponse, PortMapping, ReadDirRequest,
-    ReadDirResponse, ReadFileRequest, RemoveRequest, RenameRequest, ShutdownResponse, StatRequest,
-    StatResponse, WatchRequest, WriteFileRequest, WriteFileResponse, VSOCK_PORT,
+    ReadDirResponse, ReadFileRequest, RemoveRequest, RenameRequest, RunAs, ShutdownResponse,
+    StatRequest, StatResponse, WatchRequest, WriteFileRequest, WriteFileResponse, VSOCK_PORT,
     VSOCK_PORT_FORWARD,
 };
 
@@ -513,10 +513,11 @@ impl Sandbox {
         &self,
         argv: &[impl AsRef<str>],
         env: &HashMap<String, String>,
+        run_as: &RunAs,
     ) -> Result<ExecOutput> {
         let mut stdout = Capped::default();
         let mut stderr = Capped::default();
-        let exit_code = self.exec_with_env(argv, env, &mut stdout, &mut stderr)?;
+        let exit_code = self.exec_with_env(argv, env, run_as, &mut stdout, &mut stderr)?;
         Ok(ExecOutput {
             stdout: stdout.0,
             stderr: stderr.0,
@@ -524,21 +525,22 @@ impl Sandbox {
         })
     }
 
-    /// Run a command non-interactively over vsock, streaming output to the
-    /// provided writers. Returns the guest process exit code.
+    /// Run a command as root non-interactively over vsock, streaming
+    /// output to the provided writers. Returns the guest process exit code.
     pub fn exec(
         &self,
         argv: &[impl AsRef<str>],
         stdout: &mut impl Write,
         stderr: &mut impl Write,
     ) -> Result<i32> {
-        self.exec_with_env(argv, &HashMap::new(), stdout, stderr)
+        self.exec_with_env(argv, &HashMap::new(), &RunAs::default(), stdout, stderr)
     }
 
     pub fn exec_with_env(
         &self,
         argv: &[impl AsRef<str>],
         env: &HashMap<String, String>,
+        run_as: &RunAs,
         stdout: &mut impl Write,
         stderr: &mut impl Write,
     ) -> Result<i32> {
@@ -557,6 +559,7 @@ impl Sandbox {
             cwd: None,
             id: None,
             before_services: false,
+            run_as: run_as.clone(),
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -576,7 +579,7 @@ impl Sandbox {
                 }
                 Some((frame::ERROR, payload)) => {
                     let msg = String::from_utf8_lossy(&payload);
-                    write!(stderr, "guest error: {}", msg)?;
+                    writeln!(stderr, "guest error: {}", msg)?;
                     exit_code = 1;
                     break;
                 }
@@ -864,6 +867,7 @@ impl Sandbox {
         argv: &[impl AsRef<str>],
         env: &HashMap<String, String>,
         cwd: Option<&str>,
+        run_as: &RunAs,
     ) -> Result<(TcpStream, u64)> {
         let stream = self.connect_vsock()?;
         let mut writer = stream.try_clone()?;
@@ -883,6 +887,7 @@ impl Sandbox {
             cwd: cwd.map(|s| s.to_string()),
             id: Some(id),
             before_services: false,
+            run_as: run_as.clone(),
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -916,8 +921,9 @@ impl Sandbox {
         env: &HashMap<String, String>,
         rows: u16,
         cols: u16,
+        run_as: &RunAs,
     ) -> Result<TcpStream> {
-        self.open_shell_with_cwd(argv, env, rows, cols, None)
+        self.open_shell_with_cwd(argv, env, rows, cols, None, run_as)
     }
 
     pub fn open_shell_with_cwd(
@@ -927,6 +933,7 @@ impl Sandbox {
         rows: u16,
         cols: u16,
         cwd: Option<&str>,
+        run_as: &RunAs,
     ) -> Result<TcpStream> {
         let stream = self.connect_vsock()?;
         let mut writer = stream.try_clone()?;
@@ -943,6 +950,7 @@ impl Sandbox {
             cwd: cwd.map(|s| s.to_string()),
             id: None,
             before_services: false,
+            run_as: run_as.clone(),
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
@@ -972,7 +980,12 @@ impl Sandbox {
     /// Puts the host terminal in raw mode, relays I/O bidirectionally over
     /// vsock, and handles SIGWINCH for window resize.
     /// Returns the guest process exit code.
-    pub fn shell(&self, argv: &[impl AsRef<str>], env: &HashMap<String, String>) -> Result<i32> {
+    pub fn shell(
+        &self,
+        argv: &[impl AsRef<str>],
+        env: &HashMap<String, String>,
+        run_as: &RunAs,
+    ) -> Result<i32> {
         let stdin_fd = std::io::stdin().as_raw_fd();
         let (rows, cols) = terminal::terminal_size(stdin_fd);
 
@@ -993,6 +1006,7 @@ impl Sandbox {
             cwd: None,
             id: None,
             before_services: false,
+            run_as: run_as.clone(),
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 

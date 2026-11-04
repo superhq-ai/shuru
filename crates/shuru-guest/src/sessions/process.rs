@@ -28,15 +28,19 @@ pub fn spawn(
     cgroup: &Cgroup,
     on_exit: crate::children::OnExit,
 ) -> io::Result<Spawned> {
+    let account = crate::user::of(&exec.run_as)?;
     let procs_file = cgroup.procs()?;
     let procs = procs_file.as_raw_fd();
     let mut cmd = Command::new(&exec.argv[0]);
     cmd.args(&exec.argv[1..]).envs(&exec.env);
-    if let Some(cwd) = &exec.cwd {
+    if let (None, Some(cwd)) = (&account, &exec.cwd) {
         cmd.current_dir(cwd);
     }
     if exec.tty.unwrap_or(false) {
         let (master, slave) = open_pty(exec.rows.unwrap_or(24), exec.cols.unwrap_or(80))?;
+        if let Some(account) = &account {
+            account.own_terminal(&slave)?;
+        }
         let stdin = OwnedFd::from(master.try_clone()?);
         if !exec.env.contains_key("TERM") {
             cmd.env("TERM", "xterm-256color");
@@ -52,6 +56,9 @@ pub fn spawn(
                 }
                 Ok(())
             });
+        }
+        if let Some(account) = &account {
+            account.apply(&mut cmd, &exec.env, exec.cwd.as_deref())?;
         }
         let (child, pidfd) = crate::children::spawn(&mut cmd, on_exit)?;
         // The command holds our copies of the terminal; the process has its own.
@@ -74,6 +81,9 @@ pub fn spawn(
                 }
                 Ok(())
             });
+        }
+        if let Some(account) = &account {
+            account.apply(&mut cmd, &exec.env, exec.cwd.as_deref())?;
         }
         let (mut child, pidfd) = crate::children::spawn(&mut cmd, on_exit)?;
         let pid = child.id() as i32;

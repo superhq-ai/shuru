@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 
 use anyhow::{bail, Context, Result};
 
-use shuru_vm::{MountConfig, PortMapping, Sandbox};
+use shuru_vm::{MountConfig, PortMapping, RunAs, Sandbox};
 
 use crate::assets;
 use crate::cli::VmArgs;
@@ -39,6 +39,8 @@ pub(crate) struct PreparedVm {
     pub verbose: bool,
     pub forwards: Vec<PortMapping>,
     pub mounts: Vec<MountConfig>,
+    /// Who commands run as; set up by shuru itself still runs as root.
+    pub run_as: RunAs,
 }
 
 pub(crate) fn prepare_vm(vm: &VmArgs, cfg: &ShuruConfig, from: Option<&str>) -> Result<PreparedVm> {
@@ -50,6 +52,13 @@ pub(crate) fn prepare_vm(vm: &VmArgs, cfg: &ShuruConfig, from: Option<&str>) -> 
     let allow_net = vm.allow_net || cfg.allow_net.unwrap_or(false);
     let allow_host_writes = vm.allow_host_writes || cfg.allow_host_writes.unwrap_or(false);
     let verbose = vm.verbose;
+    let run_as = match (&vm.user, &cfg.user) {
+        (Some(run_as), _) => run_as.clone(),
+        (None, Some(spec)) => {
+            RunAs::parse(spec).map_err(|e| anyhow::anyhow!("user in the config: {e}"))?
+        }
+        (None, None) => RunAs::default(),
+    };
 
     let proxy_config = if allow_net {
         let mut proxy = cfg.to_proxy_config()?;
@@ -214,6 +223,7 @@ pub(crate) fn prepare_vm(vm: &VmArgs, cfg: &ShuruConfig, from: Option<&str>) -> 
         verbose,
         forwards,
         mounts,
+        run_as,
     })
 }
 
@@ -380,11 +390,12 @@ pub(crate) fn run_command(
     }
 
     let exit_code = if std::io::stdin().is_terminal() {
-        sandbox.shell(command, &env)?
+        sandbox.shell(command, &env, &prepared.run_as)?
     } else {
         sandbox.exec_with_env(
             command,
             &env,
+            &prepared.run_as,
             &mut std::io::stdout(),
             &mut std::io::stderr(),
         )?

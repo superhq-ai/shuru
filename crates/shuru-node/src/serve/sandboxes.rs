@@ -1760,6 +1760,7 @@ mod tests {
             Some(serde_json::json!({
                 "TOKEN": { "value": "s3cret", "hosts": ["api.example.com"] }
             })),
+            shuru_proto::RunAs::default(),
             None,
         )
         .unwrap()

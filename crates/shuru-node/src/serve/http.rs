@@ -17,6 +17,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use shuru_proto::RunAs;
 use tokio::sync::mpsc;
 
 use super::config::SandboxConfig;
@@ -318,7 +319,8 @@ async fn route(node: Arc<Node>, request: Request<Incoming>) -> Result<Response<B
         (&Method::PUT, [name, "config"]) => {
             let body = read_body(request.into_body(), MAX_CONFIG_BODY).await?;
             let put: ConfigRequest = parse_json(&body)?;
-            let config = SandboxConfig::parse(put.env, put.secrets, put.config_version)?;
+            let config =
+                SandboxConfig::parse(put.env, put.secrets, put.run_as, put.config_version)?;
             node.configure(name, config).await?;
             Ok(no_content())
         }
@@ -496,6 +498,8 @@ struct CreateRequest {
     start: bool,
     env: Option<Value>,
     secrets: Option<Value>,
+    #[serde(flatten)]
+    run_as: RunAs,
     config_version: Option<u64>,
 }
 
@@ -503,6 +507,8 @@ struct CreateRequest {
 struct ConfigRequest {
     env: Option<Value>,
     secrets: Option<Value>,
+    #[serde(flatten)]
+    run_as: RunAs,
     /// A config with a lower version than the one kept changes nothing.
     config_version: Option<u64>,
 }
@@ -529,7 +535,12 @@ fn no_content() -> Response<Body> {
 async fn create(node: &Arc<Node>, request: Request<Incoming>) -> Result<Response<Body>, ApiError> {
     let body = read_body(request.into_body(), MAX_CONFIG_BODY).await?;
     let create: CreateRequest = parse_json(&body)?;
-    let config = SandboxConfig::parse(create.env, create.secrets, create.config_version)?;
+    let config = SandboxConfig::parse(
+        create.env,
+        create.secrets,
+        create.run_as,
+        create.config_version,
+    )?;
     let entry = node
         .create(create.name, create.disk.as_deref(), config, create.start)
         .await?;

@@ -72,6 +72,17 @@ describe("buildArgs", () => {
 		expect(args).toEqual(["shuru", "run", "--stdio"]);
 	});
 
+	test("user", () => {
+		const args = buildArgs("shuru", { user: "desktop:video" });
+		expect(args).toEqual([
+			"shuru",
+			"run",
+			"--stdio",
+			"--user",
+			"desktop:video",
+		]);
+	});
+
 	test("port forwards", () => {
 		const args = buildArgs("shuru", { ports: ["8080:80", "3000:3000"] });
 		expect(args).toEqual([

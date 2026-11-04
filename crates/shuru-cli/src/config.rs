@@ -15,6 +15,8 @@ pub(crate) struct ShuruConfig {
     pub ports: Option<Vec<String>>,
     pub mounts: Option<Vec<String>>,
     pub command: Option<Vec<String>>,
+    /// The user commands run as, `user` or `user:group`.
+    pub user: Option<String>,
     pub secrets: Option<HashMap<String, SecretEntry>>,
     pub network: Option<NetworkEntry>,
     /// Host ports to expose to the guest (e.g. "3000:8080" or "5432").

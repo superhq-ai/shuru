@@ -557,7 +557,7 @@ fn step_command(recipe: &Recipe, index: usize, script: &str) -> Result<Vec<Strin
 
 /// VM settings for a build: the recipe decides size and network, the user
 /// may enlarge the VM, and nothing from the project config or the user
-/// mounts, ports and secrets reaches the build.
+/// mounts, ports, secrets and user reaches the build, which runs as root.
 fn build_args(vm: &VmArgs, spec: &RecipeSpec) -> VmArgs {
     VmArgs {
         cpus: vm.cpus.or(spec.cpus),
@@ -578,6 +578,7 @@ fn build_args(vm: &VmArgs, spec: &RecipeSpec) -> VmArgs {
             .map(|n| n.allow.clone())
             .unwrap_or_default(),
         expose_host: Vec::new(),
+        user: None,
         config: None,
         verbose: vm.verbose,
     }

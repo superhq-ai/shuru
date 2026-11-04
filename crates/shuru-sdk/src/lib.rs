@@ -100,6 +100,8 @@ pub struct SandboxConfig {
     /// Default environment variables for all commands.
     /// Merged with proxy placeholders; caller extra_env overrides both.
     pub env: HashMap<String, String>,
+    /// Who commands and shells run as. Default: root.
+    pub run_as: shuru_proto::RunAs,
 }
 
 impl Default for SandboxConfig {
@@ -118,6 +120,7 @@ impl Default for SandboxConfig {
             from: None,
             storage: StorageMode::default(),
             env: HashMap::new(),
+            run_as: shuru_proto::RunAs::default(),
         }
     }
 }
@@ -334,17 +337,7 @@ impl AsyncSandbox {
                     if ready_tx.send(Ok(())).is_err() {
                         return;
                     }
-                    run_vm_loop(
-                        booted.sandbox,
-                        booted.work_disk,
-                        &booted.data_dir,
-                        cmd_rx,
-                        booted.proxy_handle,
-                        booted.fwd_handle,
-                        #[cfg(feature = "cas")]
-                        booted.nbd_handle,
-                        booted.default_env,
-                    );
+                    run_vm_loop(booted, cmd_rx);
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -729,10 +722,12 @@ struct BootedVm {
     #[cfg(feature = "cas")]
     nbd_handle: Option<shuru_store::NbdHandle>,
     default_env: HashMap<String, String>,
+    run_as: shuru_proto::RunAs,
 }
 
 fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
     let default_env = config.env.clone();
+    let run_as = config.run_as.clone();
     let data_dir = config.data_dir.unwrap_or_else(shuru_vm::default_data_dir);
 
     // Resolve asset paths
@@ -933,19 +928,23 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
         #[cfg(feature = "cas")]
         nbd_handle,
         default_env,
+        run_as,
     })
 }
 
-fn run_vm_loop(
-    sandbox: shuru_vm::Sandbox,
-    work_disk: shuru_vm::WorkDisk,
-    data_dir: &str,
-    cmd_rx: std::sync::mpsc::Receiver<SandboxCmd>,
-    proxy_handle: Option<shuru_proxy::ProxyHandle>,
-    _fwd_handle: Option<shuru_vm::PortForwardHandle>,
-    #[cfg(feature = "cas")] nbd_handle: Option<shuru_store::NbdHandle>,
-    default_env: HashMap<String, String>,
-) {
+fn run_vm_loop(booted: BootedVm, cmd_rx: std::sync::mpsc::Receiver<SandboxCmd>) {
+    let BootedVm {
+        sandbox,
+        work_disk,
+        data_dir,
+        proxy_handle,
+        fwd_handle: _fwd_handle,
+        #[cfg(feature = "cas")]
+        nbd_handle,
+        default_env,
+        run_as,
+    } = booted;
+    let data_dir = data_dir.as_str();
     // Base env: config defaults, then proxy placeholders on top
     let mut env = default_env;
     if let Some(ref handle) = proxy_handle {
@@ -965,7 +964,7 @@ fn run_vm_loop(
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             SandboxCmd::Exec { argv, reply } => {
-                let result = exec_command(&sandbox, &argv, &env);
+                let result = exec_command(&sandbox, &argv, &env, &run_as);
                 let _ = reply.send(result);
             }
             // Reads open their own vsock connection per call and don't mutate
@@ -1039,6 +1038,7 @@ fn run_vm_loop(
                     rows,
                     cols,
                     cwd.as_deref(),
+                    &run_as,
                 );
                 let _ = reply.send(result);
             }
@@ -1127,8 +1127,9 @@ fn exec_command(
     sandbox: &shuru_vm::Sandbox,
     argv: &[String],
     env: &HashMap<String, String>,
+    run_as: &shuru_proto::RunAs,
 ) -> Result<ExecResult> {
-    let output = sandbox.exec_buffered(argv, env)?;
+    let output = sandbox.exec_buffered(argv, env, run_as)?;
     Ok(ExecResult {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),

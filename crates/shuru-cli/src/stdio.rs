@@ -9,7 +9,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use shuru_proto::{frame, watch_kind, WatchEvent};
-use shuru_vm::Sandbox;
+use shuru_vm::{RunAs, Sandbox};
 
 use crate::vm::{self, PreparedVm};
 
@@ -137,6 +137,8 @@ struct FileChangeParams {
 #[derive(Deserialize)]
 struct ExecParams {
     argv: Vec<String>,
+    #[serde(flatten)]
+    run_as: RunAs,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +147,8 @@ struct SpawnParams {
     #[serde(default)]
     env: HashMap<String, String>,
     cwd: Option<String>,
+    #[serde(flatten)]
+    run_as: RunAs,
 }
 
 #[derive(Deserialize)]
@@ -523,7 +527,14 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                         continue;
                     }
                 };
-                handle_exec(&sandbox, req.id, &params.argv, &secret_env, &out)?;
+                handle_exec(
+                    &sandbox,
+                    req.id,
+                    &params.argv,
+                    &secret_env,
+                    params.run_as.or(&prepared.run_as),
+                    &out,
+                )?;
             }
 
             method::SPAWN => {
@@ -563,23 +574,25 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let pid_clone = pid.clone();
                 let mut spawn_env = secret_env.clone();
                 spawn_env.extend(params.env);
+                let run_as = params.run_as.or(&prepared.run_as).clone();
 
                 bg_threads.push(std::thread::spawn(move || {
                     let argv: Vec<&str> = params.argv.iter().map(|s| s.as_str()).collect();
-                    let stream = match sb.open_exec(&argv, &spawn_env, params.cwd.as_deref()) {
-                        Ok((s, id)) => {
-                            *state.exec_id.lock().unwrap() = Some(id);
-                            s
-                        }
-                        Err(e) => {
-                            eprintln!("shuru: spawn failed: {}", e);
-                            let _ = tx.send(Event::Exit {
-                                pid: pid_clone,
-                                code: 1,
-                            });
-                            return;
-                        }
-                    };
+                    let stream =
+                        match sb.open_exec(&argv, &spawn_env, params.cwd.as_deref(), &run_as) {
+                            Ok((s, id)) => {
+                                *state.exec_id.lock().unwrap() = Some(id);
+                                s
+                            }
+                            Err(e) => {
+                                eprintln!("shuru: spawn failed: {}", e);
+                                let _ = tx.send(Event::Exit {
+                                    pid: pid_clone,
+                                    code: 1,
+                                });
+                                return;
+                            }
+                        };
 
                     let mut vsock_reader = match stream.try_clone() {
                         Ok(r) => r,
@@ -1050,9 +1063,10 @@ fn handle_exec(
     id: serde_json::Value,
     argv: &[String],
     env: &HashMap<String, String>,
+    run_as: &RunAs,
     out: &SharedWriter,
 ) -> Result<()> {
-    let output = match sandbox.exec_buffered(argv, env) {
+    let output = match sandbox.exec_buffered(argv, env, run_as) {
         Ok(output) => output,
         Err(e) => {
             return send_error_shared(out, id, SERVER_ERROR, format!("exec failed: {:#}", e));

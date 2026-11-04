@@ -4,7 +4,7 @@ use subtle::ConstantTimeEq;
 
 use crate::frame;
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Clone, Copy)]
 pub struct Identity {

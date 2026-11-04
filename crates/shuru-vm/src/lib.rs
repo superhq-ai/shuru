@@ -10,8 +10,9 @@ pub use sandbox::{
     AfterSave, ExecOutput, MountConfig, PortForwardHandle, Sandbox, VmConfigBuilder, MAX_BUFFERED,
 };
 pub use shuru_proto::{
-    frame, ExecRequest, ForwardRequest, ForwardResponse, MountRequest, MountResponse, PortMapping,
-    ReadFileRequest, WriteFileRequest, WriteFileResponse, VSOCK_PORT, VSOCK_PORT_FORWARD,
+    frame, ExecRequest, ForwardRequest, ForwardResponse, MountRequest, MountResponse, Owner,
+    PortMapping, ReadFileRequest, RunAs, WriteFileRequest, WriteFileResponse, VSOCK_PORT,
+    VSOCK_PORT_FORWARD,
 };
 pub use workdisk::WorkDisk;
 

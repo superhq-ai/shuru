@@ -14,6 +14,7 @@ Place `shuru.json` in the project root (or pass `--config <path>`). All fields a
 | `ports` | string[] | [] | Port forwards, `"HOST:GUEST"` format |
 | `mounts` | string[] | [] | Directory mounts, `"HOST:GUEST[:ro\|:rw]"` format (default: ro) |
 | `command` | string[] | ["/bin/sh"] | Default command to run |
+| `user` | string | root | User the command runs as, `"user"` or `"user:group"`, each a name or an id |
 | `secrets` | object | {} | Secrets to inject via proxy (see below) |
 | `network` | object | {} | Network access policy (see below) |
 
