@@ -54,6 +54,27 @@ const SHIFT_R: u32 = 0xffe2;
 
 const NOTCH: f64 = 120.0;
 
+/// Wheel units not sent yet, 120 a notch. A trackpad sends many small
+/// deltas; rounding each to a notch would scroll far too much or not at
+/// all, so the rest carries over to the next event.
+#[derive(Default)]
+struct WheelAcc {
+    x: f64,
+    y: f64,
+}
+
+impl WheelAcc {
+    /// Adds a delta and takes out whole multiples of `unit`.
+    fn take(&mut self, dx: f64, dy: f64, unit: f64) -> (i32, i32) {
+        self.x += dx;
+        self.y += dy;
+        let (nx, ny) = ((self.x / unit).trunc(), (self.y / unit).trunc());
+        self.x -= nx * unit;
+        self.y -= ny * unit;
+        (nx as i32, ny as i32)
+    }
+}
+
 /// Smooth scrolling through relative motion on the scroll axes of the
 /// XTEST pointer. Stock X servers give that device no scroll axes; an Xvfb
 /// built with the xtest scroll patch of voxl does.
@@ -153,8 +174,7 @@ struct Injector {
     buttons: [bool; 16],
     shift_down: u32,
     smooth: Option<SmoothScroll>,
-    /// Wheel units not sent yet.
-    scroll_acc: (f64, f64),
+    wheel: WheelAcc,
     shift_kc: u8,
     scratch_path: std::path::PathBuf,
 }
@@ -178,7 +198,7 @@ impl Injector {
             buttons: [false; 16],
             shift_down: 0,
             smooth: None,
-            scroll_acc: (0.0, 0.0),
+            wheel: WheelAcc::default(),
             shift_kc: 0,
             scratch_path: scratch_file(display),
         };
@@ -348,26 +368,16 @@ impl Injector {
                 if !dx.is_finite() || !dy.is_finite() {
                     return;
                 }
-                self.scroll_acc.0 += dx;
-                self.scroll_acc.1 += dy;
                 if let Some(sm) = &self.smooth {
-                    let (ux, uy) = (self.scroll_acc.0.trunc(), self.scroll_acc.1.trunc());
-                    if ux != 0.0 || uy != 0.0 {
-                        self.scroll_acc.0 -= ux;
-                        self.scroll_acc.1 -= uy;
-                        sm.send(&self.conn, uy as i32, ux as i32);
+                    // The scroll axes count 120 a notch too: whole units.
+                    let (ux, uy) = self.wheel.take(dx, dy, 1.0);
+                    if ux != 0 || uy != 0 {
+                        sm.send(&self.conn, uy, ux);
                     }
                     return;
                 }
-                // Whole notches only; the rest carries over to the next event.
-                let (nx, ny) = (
-                    (self.scroll_acc.0 / NOTCH).trunc(),
-                    (self.scroll_acc.1 / NOTCH).trunc(),
-                );
-                self.scroll_acc.0 -= nx * NOTCH;
-                self.scroll_acc.1 -= ny * NOTCH;
                 // X buttons 4 and 5 scroll up and down, 6 and 7 left and right.
-                let (nx, ny) = (nx as i32, ny as i32);
+                let (nx, ny) = self.wheel.take(dx, dy, NOTCH);
                 if ny > 0 {
                     self.click(5, ny);
                 } else if ny < 0 {
@@ -433,7 +443,7 @@ impl Injector {
                         self.fake(xproto::BUTTON_RELEASE_EVENT, b as u8, 0, 0);
                     }
                 }
-                self.scroll_acc = (0.0, 0.0);
+                self.wheel = WheelAcc::default();
             }
             InputEvent::Shutdown => {
                 self.handle(InputEvent::ReleaseAll);
@@ -473,4 +483,35 @@ pub fn spawn(display: &str) -> Result<mpsc::Sender<InputEvent>> {
             }
         })?;
     Ok(tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sub_notch_deltas_add_up_to_a_click() {
+        let mut w = WheelAcc::default();
+        // Four trackpad deltas of a quarter notch: one click, on the last.
+        assert_eq!(w.take(0.0, 30.0, NOTCH), (0, 0));
+        assert_eq!(w.take(0.0, 30.0, NOTCH), (0, 0));
+        assert_eq!(w.take(0.0, 30.0, NOTCH), (0, 0));
+        assert_eq!(w.take(0.0, 30.0, NOTCH), (0, 1));
+        // Back and forth cancels, nothing is sent.
+        assert_eq!(w.take(0.0, -100.0, NOTCH), (0, 0));
+        assert_eq!(w.take(0.0, 100.0, NOTCH), (0, 0));
+        // Up and left too, with the rest kept.
+        assert_eq!(w.take(-250.0, -130.0, NOTCH), (-2, -1));
+        assert_eq!(w.take(-10.0, -110.0, NOTCH), (0, -1));
+        assert_eq!(w.take(-100.0, 0.0, NOTCH), (-1, 0));
+    }
+
+    #[test]
+    fn smooth_units_keep_the_fraction() {
+        let mut w = WheelAcc::default();
+        assert_eq!(w.take(0.0, 2.5, 1.0), (0, 2));
+        assert_eq!(w.take(0.0, 2.5, 1.0), (0, 3));
+        assert_eq!(w.take(0.4, 0.0, 1.0), (0, 0));
+        assert_eq!(w.take(0.6, 0.0, 1.0), (1, 0));
+    }
 }

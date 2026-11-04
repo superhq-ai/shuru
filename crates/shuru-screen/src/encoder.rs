@@ -20,6 +20,7 @@ extern "C" {
         threads: i32,
         crf: f32,
         max_kbps: i32,
+        high: i32,
     ) -> *mut RawEncoder;
     fn screen_enc_avc(e: *mut RawEncoder, out: *mut u8) -> i32;
     fn screen_enc_set_rate(e: *mut RawEncoder, crf: f32, max_kbps: i32, buf_kbit: i32);
@@ -40,6 +41,15 @@ extern "C" {
     fn screen_enc_close(e: *mut RawEncoder);
 }
 
+/// The H.264 profile to encode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Profile {
+    /// Constrained Baseline: CAVLC, 4x4 transform only.
+    Baseline,
+    /// High: CABAC and the 8x8 transform, still no B frames.
+    High,
+}
+
 pub struct Encoder {
     raw: *mut RawEncoder,
     fps: u32,
@@ -50,7 +60,15 @@ pub struct Encoder {
 unsafe impl Send for Encoder {}
 
 impl Encoder {
-    pub fn new(width: u32, height: u32, fps: u32, threads: u32, crf: f32, max_kbps: u32) -> Result<Self> {
+    pub fn new(
+        width: u32,
+        height: u32,
+        fps: u32,
+        threads: u32,
+        crf: f32,
+        max_kbps: u32,
+        profile: Profile,
+    ) -> Result<Self> {
         let raw = unsafe {
             screen_enc_open(
                 width as i32,
@@ -59,6 +77,7 @@ impl Encoder {
                 threads as i32,
                 crf,
                 max_kbps as i32,
+                (profile == Profile::High) as i32,
             )
         };
         if raw.is_null() {

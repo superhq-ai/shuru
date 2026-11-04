@@ -7,6 +7,8 @@ mod capture;
 #[cfg(target_os = "linux")]
 mod convert;
 #[cfg(target_os = "linux")]
+mod cursor;
+#[cfg(target_os = "linux")]
 mod encoder;
 #[cfg(target_os = "linux")]
 mod hub;
@@ -45,6 +47,7 @@ mod linux {
     use clap::Parser;
     use tokio::signal::unix::{signal, SignalKind};
 
+    use crate::encoder::Profile;
     use crate::input::InputEvent;
     use crate::video::VideoConfig;
 
@@ -66,6 +69,9 @@ mod linux {
         /// Lowest bitrate the stream backs off to, in kbit/s.
         #[arg(long, default_value_t = 500)]
         min_kbps: u32,
+        /// The H.264 profile.
+        #[arg(long, value_enum, default_value_t = Profile::High)]
+        profile: Profile,
     }
 
     pub fn run() -> Result<()> {
@@ -89,10 +95,15 @@ mod linux {
             paintover_crf: 16.0,
             paintover_burst: 3,
             paintover_delay: Duration::from_millis(150),
+            profile: args.profile,
+            debug: std::env::var_os("SHURU_SCREEN_DEBUG").is_some(),
         };
         let input = crate::input::spawn(&args.display)
             .with_context(|| format!("input on {}", args.display))?;
+        let fps = cfg.fps;
         let hub = crate::video::start(&args.display, cfg, input.clone())?;
+        crate::cursor::spawn(&args.display, hub.clone(), fps)
+            .with_context(|| format!("cursor on {}", args.display))?;
         let listener = bind(&args.socket)?;
         eprintln!("shuru-screen: serving on {}", args.socket.display());
         let runtime = tokio::runtime::Builder::new_multi_thread()

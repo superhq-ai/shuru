@@ -1,0 +1,96 @@
+Give the XTEST pointer a vertical and a horizontal scroll axis, 120 units
+a wheel notch, so XTEST clients such as shuru-screen can send smooth
+scrolling as relative XI motion on those axes. Wheel clicks on buttons 4
+to 7 keep working as before.
+
+From voxl (https://github.com/tembo/voxl), Copyright (c) 2026 Tembo, under
+the MIT license: see ../LICENSE-voxl. It changes Xext/xtest.c of
+xorg-server, which is under the X11 license; the license header of that
+file stays as it is and covers the patched file.
+
+build-xvfb-deb.sh builds a Debian trixie Xvfb package with it.
+
+--- a/Xext/xtest.c
++++ b/Xext/xtest.c
+@@ -599,6 +599,72 @@
+ }
+ 
+ /**
++ * Pointer proc for the XTest pointer devices. Like CorePointerProc, plus a
++ * vertical and a horizontal scroll axis (120 units per wheel notch), so that
++ * XTest clients can inject smooth scrolling as relative XI motion on those
++ * axes. Legacy button 4-7 clicks keep working unchanged.
++ */
++static int
++XTestPointerProc(DeviceIntPtr pDev, int what)
++{
++#define XTEST_NBUTTONS 10
++#define XTEST_NAXES 4
++    BYTE map[XTEST_NBUTTONS + 1];
++    int i;
++    Atom btn_labels[XTEST_NBUTTONS] = { 0 };
++    Atom axes_labels[XTEST_NAXES] = { 0 };
++    ScreenPtr scr = screenInfo.screens[0];
++
++    switch (what) {
++    case DEVICE_INIT:
++        for (i = 1; i <= XTEST_NBUTTONS; i++)
++            map[i] = i;
++
++        btn_labels[0] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_LEFT);
++        btn_labels[1] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_MIDDLE);
++        btn_labels[2] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_RIGHT);
++        btn_labels[3] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_WHEEL_UP);
++        btn_labels[4] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_WHEEL_DOWN);
++        btn_labels[5] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_HWHEEL_LEFT);
++        btn_labels[6] = XIGetKnownProperty(BTN_LABEL_PROP_BTN_HWHEEL_RIGHT);
++
++        axes_labels[0] = XIGetKnownProperty(AXIS_LABEL_PROP_REL_X);
++        axes_labels[1] = XIGetKnownProperty(AXIS_LABEL_PROP_REL_Y);
++        axes_labels[2] = XIGetKnownProperty(AXIS_LABEL_PROP_REL_VSCROLL);
++        axes_labels[3] = XIGetKnownProperty(AXIS_LABEL_PROP_REL_HSCROLL);
++
++        if (!InitPointerDeviceStruct
++            ((DevicePtr) pDev, map, XTEST_NBUTTONS, btn_labels,
++             (PtrCtrlProcPtr) NoopDDA, GetMotionHistorySize(), XTEST_NAXES,
++             axes_labels)) {
++            ErrorF("Could not initialize device '%s'. Out of memory.\n",
++                   pDev->name);
++            return BadAlloc;
++        }
++        pDev->valuator->axisVal[0] = scr->width / 2;
++        pDev->last.valuators[0] = pDev->valuator->axisVal[0] + scr->x;
++        pDev->valuator->axisVal[1] = scr->height / 2;
++        pDev->last.valuators[1] = pDev->valuator->axisVal[1] + scr->y;
++
++        SetScrollValuator(pDev, 2, SCROLL_TYPE_VERTICAL, 120.0,
++                          SCROLL_FLAG_PREFERRED);
++        SetScrollValuator(pDev, 3, SCROLL_TYPE_HORIZONTAL, 120.0,
++                          SCROLL_FLAG_NONE);
++        break;
++
++    case DEVICE_CLOSE:
++        break;
++
++    default:
++        break;
++    }
++
++    return Success;
++#undef XTEST_NBUTTONS
++#undef XTEST_NAXES
++}
++
++/**
+  * Allocate a device pair that is initialised as a slave
+  * device with properties that identify the devices as belonging
+  * to XTest subsystem.
+@@ -618,7 +684,7 @@
+         return BadAlloc;
+ 
+     retval =
+-        AllocDevicePair(client, xtestname, ptr, keybd, CorePointerProc,
++        AllocDevicePair(client, xtestname, ptr, keybd, XTestPointerProc,
+                         CoreKeyboardProc, FALSE);
+     if (retval == Success) {
+         (*ptr)->xtest_master_id = master_ptr->id;

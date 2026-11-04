@@ -2,7 +2,7 @@
 // under the MIT license: see LICENSE-voxl.
 
 //! The pipeline: damage driven capture, I420, x264, viewers, with flow
-//! control and bitrate from their acks.
+//! control and bitrate from their acks or their send queues.
 
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -14,8 +14,8 @@ use bytes::Bytes;
 
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
-use crate::encoder::Encoder;
-use crate::hub::{wait_any, Client, Hub, Inflight, Out, Snapshot};
+use crate::encoder::{Encoder, Profile};
+use crate::hub::{wait_any, Client, Geometry, Hub, Inflight, Out, Snapshot};
 use crate::input::InputEvent;
 
 #[derive(Clone)]
@@ -30,6 +30,9 @@ pub struct VideoConfig {
     pub paintover_crf: f32,
     pub paintover_burst: u32,
     pub paintover_delay: Duration,
+    pub profile: Profile,
+    /// Log bitrate changes.
+    pub debug: bool,
 }
 
 /// Size of the header in front of each access unit.
@@ -41,6 +44,13 @@ const MAX_QUEUED: usize = 8 << 20;
 
 /// Frames kept for acks of one viewer.
 const MAX_INFLIGHT: usize = 600;
+
+/// Video waiting in the send queue of a viewer that does not ack: above
+/// HIGH the bitrate steps down, below LOW it may step up, and above HOLD
+/// frames wait until it drains.
+const QUEUE_HIGH_MS: f64 = 200.0;
+const QUEUE_LOW_MS: f64 = 50.0;
+const QUEUE_HOLD_MS: f64 = 400.0;
 
 struct Job {
     buf: Box<I420>,
@@ -54,38 +64,87 @@ struct Job {
     captured_at: Instant,
 }
 
-/// Opens the display and the encoder and starts capture. The hub it
-/// returns is how the server reaches the stream.
-pub fn start(display: &str, cfg: VideoConfig, input: mpsc::Sender<InputEvent>) -> Result<Arc<Hub>> {
+/// Capture and an encoder at the size of the screen now.
+fn open(display: &str, cfg: &VideoConfig) -> Result<(Capturer, Encoder, Geometry)> {
     let cap = Capturer::new(display)?;
     let (w, h) = (cap.width, cap.height);
-    let enc = Encoder::new(w, h, cfg.fps, cfg.threads, cfg.crf, cfg.max_kbps)?;
-    let hub = Hub::new(w, h, enc.codec()?, input)?;
+    let enc = Encoder::new(w, h, cfg.fps, cfg.threads, cfg.crf, cfg.max_kbps, cfg.profile)?;
+    let geometry = Geometry {
+        width: w,
+        height: h,
+        codec: enc.codec()?,
+    };
     eprintln!(
         "shuru-screen: {w}x{h} at {} fps, {}, {} encoder thread(s)",
-        cfg.fps, hub.codec, cfg.threads
+        cfg.fps, geometry.codec, cfg.threads
     );
-    let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
-    let (ret_tx, ret_rx) = mpsc::channel::<(usize, Box<I420>)>();
-    let (h2, c2) = (hub.clone(), cfg.clone());
-    std::thread::Builder::new()
-        .name("encode".into())
-        .spawn(move || encode_loop(enc, job_rx, ret_tx, h2, c2))?;
-    let h3 = hub.clone();
+    Ok((cap, enc, geometry))
+}
+
+/// Opens the display and the encoder and starts capture. The hub it
+/// returns is how the server reaches the stream. When the screen changes
+/// size, capture and the encoder are opened again at the new size.
+pub fn start(display: &str, cfg: VideoConfig, input: mpsc::Sender<InputEvent>) -> Result<Arc<Hub>> {
+    let (cap, enc, geometry) = open(display, &cfg)?;
+    let hub = Hub::new(geometry, input)?;
+    let h2 = hub.clone();
+    let display = display.to_string();
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
-            let mut cap = cap;
-            let e = capture_loop(&mut cap, cfg, h3, job_tx, ret_rx).unwrap_err();
-            eprintln!("shuru-screen: capture stopped: {e:#}");
-            std::process::exit(1);
+            let (mut cap, mut enc) = (cap, enc);
+            loop {
+                let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
+                let (ret_tx, ret_rx) = mpsc::channel::<(usize, Box<I420>)>();
+                let (h3, c3) = (h2.clone(), cfg.clone());
+                let encode = std::thread::Builder::new()
+                    .name("encode".into())
+                    .spawn(move || encode_loop(enc, job_rx, ret_tx, h3, c3))
+                    .expect("encode thread");
+                if let Err(e) = capture_loop(&mut cap, cfg.clone(), h2.clone(), job_tx, ret_rx) {
+                    eprintln!("shuru-screen: capture stopped: {e:#}");
+                    std::process::exit(1);
+                }
+                // Frames of the old size are out before the new hello.
+                let _ = encode.join();
+                drop(cap);
+                let geometry;
+                (cap, enc, geometry) = match open(&display, &cfg) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("shuru-screen: capture after a resize: {e:#}");
+                        std::process::exit(1);
+                    }
+                };
+                h2.set_geometry(geometry);
+            }
         })?;
     Ok(hub)
 }
 
-fn flow_ok(clients: &[Arc<Client>], interval_ms: f64) -> bool {
+/// Milliseconds of video in the send queue of `c`, at the rate it reads
+/// when known, else at the bitrate.
+fn queue_ms(pending: usize, capacity_bps: f64, target_kbps: f64) -> f64 {
+    let rate = if capacity_bps > 0.0 {
+        capacity_bps
+    } else {
+        target_kbps * 1000.0
+    };
+    pending as f64 * 8000.0 / rate.max(1000.0)
+}
+
+fn flow_ok(clients: &[Arc<Client>], interval_ms: f64, target_kbps: f64) -> bool {
     for c in clients {
         if !c.acks.load(Ordering::Relaxed) {
+            // Hold frames while one is far behind, unless it reads nothing
+            // at all.
+            if !c.started.load(Ordering::Relaxed) || c.stalled() {
+                continue;
+            }
+            let capacity = c.drain.lock().unwrap().capacity_bps;
+            if queue_ms(c.pending(), capacity, target_kbps) > QUEUE_HOLD_MS {
+                return false;
+            }
             continue;
         }
         let (n, age) = c.backlog();
@@ -110,8 +169,8 @@ fn flow_ok(clients: &[Arc<Client>], interval_ms: f64) -> bool {
     true
 }
 
-/// Delay based bitrate: back off toward the delivered rate when acks show
-/// queueing, probe upward slowly while the path is clear.
+/// Delay based bitrate: back off toward the delivered rate when acks or
+/// send queues show queueing, probe upward slowly while the path is clear.
 struct RateCtl {
     target: f64,
     max: f64,
@@ -124,12 +183,14 @@ struct RateCtl {
     /// Delivered rate at the last congestion: the likely capacity.
     ceiling: f64,
     ceiling_at: Instant,
+    debug: bool,
+    logged: f64,
 }
 
 const START_KBPS: f64 = 8000.0;
 
 impl RateCtl {
-    fn new(max: f64, min: f64) -> Self {
+    fn new(max: f64, min: f64, debug: bool) -> Self {
         let past = Instant::now() - Duration::from_secs(10);
         RateCtl {
             target: START_KBPS.min(max).max(min),
@@ -141,6 +202,8 @@ impl RateCtl {
             slow_start: true,
             ceiling: f64::MAX,
             ceiling_at: past,
+            debug,
+            logged: 0.0,
         }
     }
 
@@ -152,9 +215,30 @@ impl RateCtl {
         let mut congested = false;
         let mut clear = true;
         let mut rate = f64::MAX;
+        let mut capacity = f64::MAX;
         let mut delivered = 0f64;
         for c in clients {
-            if !c.started.load(Ordering::Relaxed) || !c.acks.load(Ordering::Relaxed) {
+            let qs = c.sample_queue();
+            if !c.started.load(Ordering::Relaxed) {
+                continue;
+            }
+            if !c.acks.load(Ordering::Relaxed) {
+                // Without acks the send queue tells: bytes waiting over the
+                // rate they leave at.
+                if c.stalled() {
+                    continue;
+                }
+                let q = queue_ms(qs.pending, qs.capacity_bps, self.target);
+                if q > QUEUE_HIGH_MS {
+                    congested = true;
+                    if qs.capacity_bps > 0.0 {
+                        capacity = capacity.min(qs.capacity_bps / 1000.0);
+                    }
+                }
+                if q > QUEUE_LOW_MS {
+                    clear = false;
+                }
+                delivered = delivered.max(qs.rate_bps / 1000.0);
                 continue;
             }
             let q = c.delay.lock().unwrap().queue_ms;
@@ -180,6 +264,12 @@ impl RateCtl {
                 self.ceiling = rate;
                 self.ceiling_at = now;
                 t = t.min(rate * 0.85);
+            }
+            // Measured with bytes waiting throughout, so a real capacity.
+            if capacity.is_finite() {
+                self.ceiling = capacity;
+                self.ceiling_at = now;
+                t = t.min(capacity * 0.85);
             }
             self.target = t.max(self.min);
             self.last_dec = now;
@@ -218,6 +308,10 @@ impl RateCtl {
             }
         }
         hub.target_kbps.store(self.target as u32, Ordering::Relaxed);
+        if self.debug && (self.target - self.logged).abs() > self.logged * 0.1 {
+            eprintln!("shuru-screen: bitrate {} kbps", self.target as u32);
+            self.logged = self.target;
+        }
     }
 }
 
@@ -319,6 +413,7 @@ fn answer_snapshots(cap: &mut Capturer, hub: &Hub) -> Result<()> {
         width: cap.width as usize,
         height: cap.height as usize,
         bgrx: cap.snapshot()?,
+        cursor: cap.cursor(hub.cursor_image.lock().unwrap().clone()),
     });
     for tx in waiting {
         let _ = tx.send(shot.clone());
@@ -326,6 +421,7 @@ fn answer_snapshots(cap: &mut Capturer, hub: &Hub) -> Result<()> {
     Ok(())
 }
 
+/// Runs until the screen changes size, which returns Ok.
 fn capture_loop(
     cap: &mut Capturer,
     cfg: VideoConfig,
@@ -350,14 +446,21 @@ fn capture_loop(
     let mut last_capture = Instant::now() - interval;
     let mut last_motion = Instant::now();
     let mut paintover_left = 0u32;
-    let mut rc = RateCtl::new(cfg.max_kbps as f64, cfg.min_kbps as f64);
-    hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
+    // Keep the bitrate across a resize.
+    let mut rc = RateCtl::new(cfg.max_kbps as f64, cfg.min_kbps as f64, cfg.debug);
+    match hub.target_kbps.load(Ordering::Relaxed) {
+        0 => hub.target_kbps.store(rc.target as u32, Ordering::Relaxed),
+        t => rc.target = (t as f64).clamp(rc.min, rc.max),
+    }
     let mut had_clients = false;
     let mut full_next = true;
     let mut refiner = Refiner::new(cap.mb_cols() * h.div_ceil(16), cap.mb_cols());
 
     loop {
         cap.pump()?;
+        if cap.resized {
+            return Ok(());
+        }
         hub.waker.drain();
         answer_snapshots(cap, &hub)?;
         while let Ok((i, b)) = ret_rx.try_recv() {
@@ -366,7 +469,7 @@ fn capture_loop(
         let clients = hub.clients();
         if clients.is_empty() {
             if had_clients {
-                rc = RateCtl::new(cfg.max_kbps as f64, cfg.min_kbps as f64);
+                rc = RateCtl::new(cfg.max_kbps as f64, cfg.min_kbps as f64, cfg.debug);
                 hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
             }
             had_clients = false;
@@ -375,7 +478,7 @@ fn capture_loop(
         }
         rc.update(&hub, &clients);
         let want_key = clients.iter().any(|c| {
-            c.needs_keyframe.load(Ordering::Relaxed) && c.queued() < MAX_QUEUED / 2
+            c.needs_keyframe.load(Ordering::Relaxed) && c.queued() < MAX_QUEUED / 2 && !c.stalled()
         });
         if !had_clients {
             had_clients = true;
@@ -404,7 +507,7 @@ fn capture_loop(
             wait_any(&[hub.waker.fd()], (rem.as_micros() as i32 + 999) / 1000);
             continue;
         }
-        if !want_key && !flow_ok(&clients, interval_ms) {
+        if !want_key && !flow_ok(&clients, interval_ms, rc.target) {
             wait_any(&[cap.fd(), hub.waker.fd()], 4);
             continue;
         }
@@ -483,7 +586,10 @@ fn capture_loop(
             false
         };
         if want_key {
-            for c in clients.iter().filter(|c| c.queued() < MAX_QUEUED / 2) {
+            for c in clients
+                .iter()
+                .filter(|c| c.queued() < MAX_QUEUED / 2 && !c.stalled())
+            {
                 c.needs_keyframe.store(false, Ordering::Relaxed);
             }
             // A keyframe is squeezed into the cap; sharpen all of it once still.
@@ -534,9 +640,7 @@ fn encode_loop(
     hub: Arc<Hub>,
     cfg: VideoConfig,
 ) {
-    let epoch = Instant::now();
-    let mut frame_id: u32 = 0;
-    let mut last_ts = 0u64;
+    let epoch = hub.epoch;
     let (mut applied_kbps, mut applied_crf) = (0u32, -1f32);
     while let Ok(job) = rx.recv() {
         if !job.force_idr && !job.paintover && job.band.is_none() {
@@ -583,9 +687,10 @@ fn encode_loop(
                 continue;
             }
         };
-        frame_id = frame_id.wrapping_add(1);
+        let frame_id = hub.frame_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let last_ts = hub.last_ts.load(Ordering::Relaxed);
         let ts_us = (job.captured_at.duration_since(epoch).as_micros() as u64).max(last_ts + 1);
-        last_ts = ts_us;
+        hub.last_ts.store(ts_us, Ordering::Relaxed);
         out[0] = 1;
         out[1] = key as u8 | (job.paintover as u8) << 1;
         out[4..8].copy_from_slice(&frame_id.to_be_bytes());
@@ -620,5 +725,18 @@ fn encode_loop(
             }
             c.send(Out::Bin(msg.clone()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_in_ms_of_video() {
+        // 25 kB at a measured 1 Mbit/s is 200 ms.
+        assert_eq!(queue_ms(25_000, 1_000_000.0, 6000.0), 200.0);
+        // Before a measure, at the bitrate: 75 kB at 6000 kbps is 100 ms.
+        assert_eq!(queue_ms(75_000, 0.0, 6000.0), 100.0);
     }
 }

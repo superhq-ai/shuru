@@ -4,20 +4,27 @@ use anyhow::Result;
 
 use crate::hub::Snapshot;
 
-/// The snapshot as a PNG at most `width` wide, keeping its aspect.
-pub fn png(shot: &Snapshot, width: Option<usize>) -> Result<Vec<u8>> {
+/// The snapshot as a PNG at most `width` wide, keeping its aspect, with
+/// the cursor drawn in when `cursor`.
+pub fn png(shot: &Snapshot, width: Option<usize>, cursor: bool) -> Result<Vec<u8>> {
     let (w, h) = (shot.width, shot.height);
     let ow = width.unwrap_or(w).clamp(1, w);
     let oh = ((h * ow + w / 2) / w).max(1);
+    let mut drawn = None;
+    if let (true, Some(c)) = (cursor, &shot.cursor) {
+        let mut px = shot.bgrx.clone();
+        c.composite(&mut px, w, h);
+        drawn = Some(px);
+    }
+    let bgrx = drawn.as_deref().unwrap_or(&shot.bgrx);
     let rgb = if ow == w {
-        shot.bgrx
-            .as_chunks::<4>()
+        bgrx.as_chunks::<4>()
             .0
             .iter()
             .flat_map(|p| [p[2], p[1], p[0]])
             .collect()
     } else {
-        scale(&shot.bgrx, w, h, ow, oh)
+        scale(bgrx, w, h, ow, oh)
     };
     let mut out = Vec::new();
     let mut enc = png::Encoder::new(&mut out, ow as u32, oh as u32);
@@ -67,8 +74,9 @@ mod tests {
             width: w,
             height: h,
             bgrx: vec![200; w * h * 4],
+            cursor: None,
         };
-        let png = png(&shot, Some(16)).unwrap();
+        let png = png(&shot, Some(16), false).unwrap();
         let decoder = png::Decoder::new(std::io::Cursor::new(png));
         let reader = decoder.read_info().unwrap();
         let info = reader.info();

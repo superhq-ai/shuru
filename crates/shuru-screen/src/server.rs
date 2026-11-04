@@ -1,7 +1,7 @@
 //! HTTP and WebSocket on the unix socket. See README.md for the interface.
 
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -76,9 +76,22 @@ struct GateBody {
 }
 
 pub async fn connection(hub: Arc<Hub>, stream: tokio::net::UnixStream) {
+    // Kept small so a slow viewer shows as queue here rather than hiding
+    // in the kernel.
+    let fd = stream.as_raw_fd();
+    let size: libc::c_int = 64 << 10;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&size as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
     let service = service_fn(move |request| {
         let hub = hub.clone();
-        async move { Ok::<_, Infallible>(route(hub, request).await) }
+        async move { Ok::<_, Infallible>(route(hub, fd, request).await) }
     });
     let _ = http1::Builder::new()
         .serve_connection(TokioIo::new(stream), service)
@@ -130,7 +143,7 @@ fn gate_json(gate: &Gate) -> serde_json::Value {
     }
 }
 
-async fn route(hub: Arc<Hub>, mut request: Request<Incoming>) -> Response<Body> {
+async fn route(hub: Arc<Hub>, fd: RawFd, mut request: Request<Incoming>) -> Response<Body> {
     let path = request.uri().path().to_string();
     match (request.method().clone(), path.as_str()) {
         (Method::GET, "/healthz") => reply(StatusCode::OK, "text/plain", "ok\n"),
@@ -140,14 +153,19 @@ async fn route(hub: Arc<Hub>, mut request: Request<Incoming>) -> Response<Body> 
                 Some(Ok(w)) if w > 0 => Some(w),
                 Some(_) => return error(StatusCode::BAD_REQUEST, "width is a positive number"),
             };
-            still(&hub, width).await
+            let cursor = match query(&request, "cursor").as_deref() {
+                None | Some("0") => false,
+                Some("1") => true,
+                Some(_) => return error(StatusCode::BAD_REQUEST, "cursor is 0 or 1"),
+            };
+            still(&hub, width, cursor).await
         }
         (Method::GET, "/stream") => {
             let viewer = query(&request, "viewer");
             if viewer.as_deref().is_some_and(|v| v.is_empty() || v == "agent") {
                 return error(StatusCode::BAD_REQUEST, "a viewer id is not empty and not \"agent\"");
             }
-            upgrade(&mut request, move |socket| stream(hub, viewer, socket))
+            upgrade(&mut request, move |socket| stream(hub, viewer, fd, socket))
         }
         (Method::GET, "/gate") => json(StatusCode::OK, gate_json(&hub.gate.lock().unwrap())),
         (Method::POST, "/gate") => {
@@ -197,14 +215,14 @@ async fn route(hub: Arc<Hub>, mut request: Request<Incoming>) -> Response<Body> 
     }
 }
 
-async fn still(hub: &Hub, width: Option<usize>) -> Response<Body> {
+async fn still(hub: &Hub, width: Option<usize>, cursor: bool) -> Response<Body> {
     let (tx, rx) = oneshot::channel();
     hub.snapshots.lock().unwrap().push(tx);
     hub.wake();
     let Ok(Ok(shot)) = tokio::time::timeout(Duration::from_secs(5), rx).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "no frame from capture");
     };
-    match tokio::task::spawn_blocking(move || crate::still::png(&shot, width)).await {
+    match tokio::task::spawn_blocking(move || crate::still::png(&shot, width, cursor)).await {
         Ok(Ok(png)) => reply(StatusCode::OK, "image/png", png),
         Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -265,13 +283,11 @@ where
     response
 }
 
-async fn stream(hub: Arc<Hub>, viewer: Option<String>, socket: Socket) {
+async fn stream(hub: Arc<Hub>, viewer: Option<String>, fd: RawFd, socket: Socket) {
     let (mut sink, mut source) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
-    let queued = Arc::new(AtomicUsize::new(0));
-    let client = hub.add_client(viewer.clone(), tx, queued.clone());
-    client.send(Out::Text(hub.hello()));
-    client.send(Out::Text(hub.gate_message(viewer.as_deref())));
+    let client = hub.add_client(viewer.clone(), tx, fd);
+    let c2 = client.clone();
     let writer = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
             let n = m.len();
@@ -280,7 +296,7 @@ async fn stream(hub: Arc<Hub>, viewer: Option<String>, socket: Socket) {
                 Out::Text(t) => Message::Text(t.into()),
             };
             let sent = sink.send(msg).await;
-            queued.fetch_sub(n, Ordering::Relaxed);
+            c2.wrote(n);
             if sent.is_err() {
                 break;
             }

@@ -17,7 +17,7 @@ struct screen_enc {
 };
 
 struct screen_enc *screen_enc_open(int width, int height, int fps, int threads, float crf,
-                                   int max_kbps)
+                                   int max_kbps, int high)
 {
     struct screen_enc *e = calloc(1, sizeof(*e));
     if (!e)
@@ -60,6 +60,13 @@ struct screen_enc *screen_enc_open(int width, int height, int fps, int threads, 
     p->analyse.i_me_range = 64;
     /* Unchanged macroblocks, from X damage, skip analysis. */
     p->analyse.b_mb_info = 1;
+    /* ultrafast turns CABAC and the 8x8 transform off, which leaves
+     * Constrained Baseline. High turns them back on and keeps the rest of
+     * ultrafast. */
+    if (high) {
+        p->b_cabac = 1;
+        p->analyse.b_transform_8x8 = 1;
+    }
     if (max_kbps > 0) {
         p->rc.i_vbv_max_bitrate = max_kbps;
         p->rc.i_vbv_buffer_size = max_kbps / (fps > 0 ? fps : 1) * 5 / 4;
@@ -69,7 +76,10 @@ struct screen_enc *screen_enc_open(int width, int height, int fps, int threads, 
     p->vui.i_transfer = 1;
     p->vui.i_colmatrix = 6;
     p->vui.b_fullrange = 0;
-    x264_param_apply_profile(p, "high");
+    if (x264_param_apply_profile(p, high ? "high" : "baseline") < 0) {
+        free(e);
+        return NULL;
+    }
     e->h = x264_encoder_open(p);
     if (!e->h) {
         free(e);

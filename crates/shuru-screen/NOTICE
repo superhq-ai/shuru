@@ -17,3 +17,8 @@ this crate, in the public shuru repository:
 The binary links x264 and libyuv dynamically, from the system (the Debian
 packages libx264 and libyuv). No other shuru crate links x264: programs
 talk to shuru-screen over its unix socket.
+
+patches/xorg-server-xtest-scroll.patch is a change to xorg-server
+(Xext/xtest.c), from voxl under the MIT license. xorg-server is under the
+X11 license; an Xvfb built with the patch is distributed under that
+license, with the license header of the patched file kept as it is.

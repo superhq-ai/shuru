@@ -4,7 +4,7 @@
 //! State shared by the capture and encode threads and the viewers.
 
 use std::collections::VecDeque;
-use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::time::Instant;
@@ -40,7 +40,12 @@ pub struct Client {
     pub viewer: Option<String>,
     tx: mpsc::UnboundedSender<Out>,
     /// Bytes handed to the writer and not yet on the socket.
-    queued: Arc<AtomicUsize>,
+    queued: AtomicUsize,
+    /// Bytes the writer has put on the socket.
+    written: AtomicU64,
+    /// The socket, for the bytes in it the viewer has not read yet.
+    fd: RawFd,
+    pub drain: Mutex<DrainEst>,
     /// Frames sent and not yet acknowledged.
     pub inflight: Mutex<VecDeque<Inflight>>,
     /// Has acknowledged a frame: only such clients steer flow and bitrate.
@@ -60,6 +65,33 @@ pub struct DelayEst {
     pub queue_ms: f64,
 }
 
+/// How fast a viewer reads, from the send queue: what the writer put on
+/// the socket less what is still in it.
+pub struct DrainEst {
+    pub at: Instant,
+    pub delivered: u64,
+    /// Every sample of this window had bytes waiting.
+    pub busy: bool,
+    /// Read rate over all windows, bit/s.
+    pub rate_bps: f64,
+    /// Read rate over windows with bytes waiting throughout: what the
+    /// viewer can take. 0 until one.
+    pub capacity_bps: f64,
+    /// Last time the viewer read something or had nothing waiting.
+    pub progress_at: Instant,
+}
+
+/// What the send queue of a viewer says now.
+pub struct QueueState {
+    /// Bytes waiting, in the writer and in the socket.
+    pub pending: usize,
+    pub rate_bps: f64,
+    pub capacity_bps: f64,
+}
+
+/// The window the read rate is measured over.
+const DRAIN_WINDOW: f64 = 0.3;
+
 pub struct RateEst {
     pub window_start: Instant,
     pub bytes: usize,
@@ -74,6 +106,53 @@ impl Client {
 
     pub fn queued(&self) -> usize {
         self.queued.load(Ordering::Relaxed)
+    }
+
+    /// The writer put `n` bytes on the socket.
+    pub fn wrote(&self, n: usize) {
+        self.queued.fetch_sub(n, Ordering::Relaxed);
+        self.written.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// Bytes in the socket the viewer has not read. Counts kernel buffers,
+    /// so a little above the payload.
+    fn socket_queued(&self) -> usize {
+        if self.fd < 0 {
+            return 0;
+        }
+        let mut n: libc::c_int = 0;
+        if unsafe { libc::ioctl(self.fd, libc::TIOCOUTQ, &mut n) } != 0 {
+            return 0;
+        }
+        n.max(0) as usize
+    }
+
+    /// Bytes waiting for this viewer, in the writer and in the socket.
+    pub fn pending(&self) -> usize {
+        self.queued() + self.socket_queued()
+    }
+
+    /// Samples the send queue; called about every 100 ms.
+    pub fn sample_queue(&self) -> QueueState {
+        let outq = self.socket_queued();
+        let pending = self.queued() + outq;
+        let delivered = self
+            .written
+            .load(Ordering::Relaxed)
+            .saturating_sub(outq as u64);
+        let mut d = self.drain.lock().unwrap();
+        d.sample(Instant::now(), pending, delivered);
+        QueueState {
+            pending,
+            rate_bps: d.rate_bps,
+            capacity_bps: d.capacity_bps,
+        }
+    }
+
+    /// Nothing read for a while with bytes waiting: a hidden tab or a dead
+    /// peer, not a slow path.
+    pub fn stalled(&self) -> bool {
+        self.drain.lock().unwrap().progress_at.elapsed().as_secs() >= 4
     }
 
     pub fn resync(&self) {
@@ -142,6 +221,46 @@ impl Client {
     }
 }
 
+impl DrainEst {
+    pub fn new(now: Instant) -> Self {
+        DrainEst {
+            at: now,
+            delivered: 0,
+            busy: false,
+            rate_bps: 0.0,
+            capacity_bps: 0.0,
+            progress_at: now,
+        }
+    }
+
+    fn sample(&mut self, now: Instant, pending: usize, delivered: u64) {
+        if pending == 0 || delivered > self.delivered {
+            self.progress_at = now;
+        }
+        self.busy &= pending > 0;
+        let el = now.duration_since(self.at).as_secs_f64();
+        if el < DRAIN_WINDOW {
+            return;
+        }
+        let r = delivered.saturating_sub(self.delivered) as f64 * 8.0 / el;
+        self.rate_bps = ewma(self.rate_bps, r);
+        if self.busy {
+            self.capacity_bps = ewma(self.capacity_bps, r);
+        }
+        self.at = now;
+        self.delivered = delivered;
+        self.busy = pending > 0;
+    }
+}
+
+fn ewma(old: f64, new: f64) -> f64 {
+    if old == 0.0 {
+        new
+    } else {
+        old * 0.6 + new * 0.4
+    }
+}
+
 fn wrapping_le(a: u32, b: u32) -> bool {
     b.wrapping_sub(a) < 0x8000_0000
 }
@@ -204,19 +323,37 @@ pub enum Gate {
     Viewer(String),
 }
 
-/// The screen as captured: BGRX, rows packed.
+/// The screen as captured: BGRX, rows packed, and the cursor then.
 pub struct Snapshot {
     pub width: usize,
     pub height: usize,
     pub bgrx: Vec<u8>,
+    pub cursor: Option<crate::cursor::CursorImage>,
+}
+
+/// The size of the stream and its codec, as the hello says them.
+#[derive(Clone)]
+pub struct Geometry {
+    pub width: u32,
+    pub height: u32,
+    pub codec: String,
 }
 
 pub struct Hub {
     clients: Mutex<Vec<Arc<Client>>>,
     next_id: AtomicU64,
-    pub width: u32,
-    pub height: u32,
-    pub codec: String,
+    pub geometry: Mutex<Geometry>,
+    /// Timestamps count from here, across encoder rebuilds.
+    pub epoch: Instant,
+    /// The number of the last frame sent, across encoder rebuilds.
+    pub frame_id: AtomicU32,
+    pub last_ts: AtomicU64,
+    /// The last cursor message, for new viewers.
+    pub cursor: Mutex<Option<String>>,
+    /// The last cursor image, for stills when the server refuses one.
+    pub cursor_image: Mutex<Option<crate::cursor::CursorImage>>,
+    /// The last pointer position sent.
+    pub pointer: Mutex<Option<(i32, i32)>>,
     /// The bitrate cap the encoder applies, kbit/s.
     pub target_kbps: AtomicU32,
     pub waker: Wake,
@@ -228,17 +365,19 @@ pub struct Hub {
 
 impl Hub {
     pub fn new(
-        width: u32,
-        height: u32,
-        codec: String,
+        geometry: Geometry,
         input: std_mpsc::Sender<InputEvent>,
     ) -> std::io::Result<Arc<Self>> {
         Ok(Arc::new(Hub {
             clients: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
-            width,
-            height,
-            codec,
+            geometry: Mutex::new(geometry),
+            epoch: Instant::now(),
+            frame_id: AtomicU32::new(0),
+            last_ts: AtomicU64::new(0),
+            cursor: Mutex::new(None),
+            cursor_image: Mutex::new(None),
+            pointer: Mutex::new(None),
             target_kbps: AtomicU32::new(0),
             waker: Wake::new()?,
             input,
@@ -251,18 +390,22 @@ impl Hub {
         self.waker.signal();
     }
 
-    /// A new stream; `queued` is shared with its writer.
+    /// A new stream on the socket `fd`, -1 for none. It gets the hello,
+    /// the gate, the cursor and the pointer before any frame.
     pub fn add_client(
         &self,
         viewer: Option<String>,
         tx: mpsc::UnboundedSender<Out>,
-        queued: Arc<AtomicUsize>,
+        fd: RawFd,
     ) -> Arc<Client> {
         let c = Arc::new(Client {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             viewer,
             tx,
-            queued,
+            queued: AtomicUsize::new(0),
+            written: AtomicU64::new(0),
+            fd,
+            drain: Mutex::new(DrainEst::new(Instant::now())),
             inflight: Mutex::new(VecDeque::new()),
             acks: AtomicBool::new(false),
             delivered: Mutex::new(RateEst {
@@ -278,9 +421,27 @@ impl Hub {
             needs_keyframe: AtomicBool::new(true),
             started: AtomicBool::new(false),
         });
-        self.clients.lock().unwrap().push(c.clone());
+        // Under the client lock, so no broadcast slips in between.
+        let mut clients = self.clients.lock().unwrap();
+        c.send(Out::Text(self.hello()));
+        c.send(Out::Text(self.gate_message(c.viewer.as_deref())));
+        if let Some(m) = self.cursor.lock().unwrap().clone() {
+            c.send(Out::Text(m));
+        }
+        if let Some((x, y)) = *self.pointer.lock().unwrap() {
+            c.send(Out::Text(pointer_message(x, y)));
+        }
+        clients.push(c.clone());
+        drop(clients);
         self.wake();
         c
+    }
+
+    /// Sends `m` to every stream.
+    pub fn broadcast(&self, m: &str) {
+        for c in self.clients.lock().unwrap().iter() {
+            c.send(Out::Text(m.to_string()));
+        }
     }
 
     pub fn remove_client(&self, id: u64) {
@@ -293,14 +454,27 @@ impl Hub {
     }
 
     pub fn hello(&self) -> String {
+        let g = self.geometry.lock().unwrap();
         serde_json::json!({
             "type": "hello",
-            "codec": self.codec,
+            "codec": g.codec,
             "format": "annexb",
-            "width": self.width,
-            "height": self.height,
+            "width": g.width,
+            "height": g.height,
         })
         .to_string()
+    }
+
+    /// The screen changed size: every stream gets the new hello and starts
+    /// again at a keyframe.
+    pub fn set_geometry(&self, geometry: Geometry) {
+        *self.geometry.lock().unwrap() = geometry;
+        let hello = self.hello();
+        for c in self.clients.lock().unwrap().iter() {
+            c.resync();
+            c.send(Out::Text(hello.clone()));
+        }
+        self.wake();
     }
 
     /// Whether input from `viewer` lands now.
@@ -329,5 +503,40 @@ impl Hub {
         for c in self.clients() {
             c.send(Out::Text(self.gate_message(c.viewer.as_deref())));
         }
+    }
+}
+
+pub fn pointer_message(x: i32, y: i32) -> String {
+    serde_json::json!({"type": "pointer", "x": x, "y": y}).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn capacity_only_from_busy_windows() {
+        let t0 = Instant::now();
+        let mut d = DrainEst::new(t0);
+        // A window with nothing waiting at one sample.
+        d.sample(t0 + Duration::from_millis(100), 0, 50_000);
+        d.sample(t0 + Duration::from_millis(400), 1000, 100_000);
+        assert!(d.rate_bps > 0.0);
+        assert_eq!(d.capacity_bps, 0.0);
+        // Bytes waiting throughout: 37.5 kB in 300 ms is 1 Mbit/s.
+        d.sample(t0 + Duration::from_millis(550), 5000, 120_000);
+        d.sample(t0 + Duration::from_millis(700), 5000, 137_500);
+        assert!((d.capacity_bps - 1_000_000.0).abs() < 1.0, "{}", d.capacity_bps);
+    }
+
+    #[test]
+    fn no_progress_is_a_stall() {
+        let t0 = Instant::now();
+        let mut d = DrainEst::new(t0);
+        d.sample(t0 + Duration::from_secs(1), 500, 0);
+        assert_eq!(d.progress_at, t0);
+        d.sample(t0 + Duration::from_secs(2), 500, 10);
+        assert_eq!(d.progress_at, t0 + Duration::from_secs(2));
     }
 }

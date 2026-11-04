@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::damage::{self, ConnectionExt as _};
+use x11rb::protocol::randr::{self, ConnectionExt as _};
 use x11rb::protocol::shm::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
@@ -119,6 +120,8 @@ pub struct Capturer {
     /// Macroblocks (16x16) touched since the last take, row major.
     mb_dirty: Vec<u8>,
     mb_cols: usize,
+    /// The screen changed size: capture must be set up again.
+    pub resized: bool,
 }
 
 impl Capturer {
@@ -127,8 +130,9 @@ impl Capturer {
             RustConnection::connect(Some(display)).map_err(|e| anyhow!("X display {display}: {e}"))?;
         let screen = &conn.setup().roots[screen_num];
         let root = screen.root;
-        let width = screen.width_in_pixels as u32;
-        let height = screen.height_in_pixels as u32;
+        // Even sizes for 4:2:0; an odd last row or column is left out.
+        let width = screen.width_in_pixels as u32 & !1;
+        let height = screen.height_in_pixels as u32 & !1;
         if screen.root_depth != 24 && screen.root_depth != 32 {
             bail!("unsupported root depth {}", screen.root_depth);
         }
@@ -137,6 +141,8 @@ impl Capturer {
         conn.shm_query_version()?.reply()?;
         conn.damage_query_version(1, 1)?.reply()?;
         conn.xfixes_query_version(5, 0)?.reply()?;
+        conn.randr_query_version(1, 2)?.reply()?;
+        conn.randr_select_input(root, randr::NotifyMask::SCREEN_CHANGE)?;
         let mut stride = width as usize * 4;
         let seg = conn.generate_id()?;
         let (buf, offset, direct) =
@@ -178,6 +184,7 @@ impl Capturer {
             acc: None,
             mb_dirty: vec![0; (width as usize).div_ceil(16) * (height as usize).div_ceil(16)],
             mb_cols: (width as usize).div_ceil(16),
+            resized: false,
         })
     }
 
@@ -188,8 +195,15 @@ impl Capturer {
     /// Takes in the X events queued so far.
     pub fn pump(&mut self) -> Result<()> {
         while let Some(ev) = self.conn.poll_for_event()? {
-            let Event::DamageNotify(e) = ev else {
-                continue;
+            let e = match ev {
+                Event::DamageNotify(e) => e,
+                Event::RandrScreenChangeNotify(e) => {
+                    if (e.width as u32 & !1, e.height as u32 & !1) != (self.width, self.height) {
+                        self.resized = true;
+                    }
+                    continue;
+                }
+                _ => continue,
             };
             let top = e.area.y.max(0) as u32;
             let bot = (e.area.y as i32 + e.area.height as i32).clamp(0, self.height as i32) as u32;
@@ -273,6 +287,21 @@ impl Capturer {
             out.extend_from_slice(&line[..row]);
         }
         Ok(out)
+    }
+
+    /// The cursor and where it is, for stills. When the server refuses
+    /// the image, `last` at the pointer.
+    pub fn cursor(
+        &self,
+        last: Option<crate::cursor::CursorImage>,
+    ) -> Option<crate::cursor::CursorImage> {
+        if let Ok(c) = crate::cursor::CursorImage::fetch(&self.conn) {
+            return Some(c);
+        }
+        let mut c = last?;
+        let p = self.conn.query_pointer(self.root).ok()?.reply().ok()?;
+        (c.x, c.y) = (p.root_x as i32, p.root_y as i32);
+        Some(c)
     }
 
     fn pixels(&self) -> &[u8] {
