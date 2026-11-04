@@ -630,6 +630,7 @@ fn exec(mut guest: UnixStream, argv: Vec<String>, env: HashMap<String, String>) 
         cwd: None,
         id: None,
         before_services: false,
+        run_as: Default::default(),
     };
     frame::send_json(&mut guest, frame::EXEC_REQ, &request)?;
     let mut stdout = io::stdout().lock();

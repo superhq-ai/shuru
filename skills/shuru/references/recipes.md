@@ -94,7 +94,9 @@ Any image can declare long-running processes in `/etc/shuru/services/<name>.json
 | `ready_timeout_secs` | give up and fail the run if `ready` never passes |
 | `stop_timeout_secs` | wait this long after SIGTERM before SIGKILL |
 | `env` | extra environment for the daemon |
-| `cwd` | working directory for the daemon |
+| `cwd` | working directory for the daemon; the home of `user` when unset, else `/` |
+| `user` | user the daemon and its `ready` check run as, a name or an id; root when unset |
+| `group` | the one group to run with, in place of the groups of `user` |
 
 A recipe writes these files for you through its `services` block. A hand-built checkpoint can write them directly during `checkpoint create`.
 

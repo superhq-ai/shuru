@@ -41,7 +41,7 @@ fn parameter<const N: usize>(cmdline: &str, name: &str) -> io::Result<[u8; N]> {
         return Err(invalid());
     }
     let mut bytes = [0; N];
-    for (out, pair) in bytes.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+    for (out, pair) in bytes.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
         let hex = std::str::from_utf8(pair).map_err(|_| invalid())?;
         *out = u8::from_str_radix(hex, 16).map_err(|_| invalid())?;
     }

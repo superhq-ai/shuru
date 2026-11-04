@@ -158,6 +158,7 @@ Shuru loads `shuru.json` from the current directory (or `--config PATH`). All fi
   "ports": ["8080:80"],
   "mounts": ["./src:/workspace", "./data:/data"],
   "command": ["python", "script.py"],
+  "user": "dev",
   "secrets": {
     "API_KEY": {
       "from": "OPENAI_API_KEY",
@@ -171,6 +172,8 @@ Shuru loads `shuru.json` from the current directory (or `--config PATH`). All fi
 ```
 
 The `network.allow` list restricts which hosts the guest can reach. Omit it to allow all hosts.
+
+`user` (or `--user name[:group]`) runs the command as a user of the image instead of root, in its home, with its groups. The user must exist in the image. Setup shuru does itself still runs as root.
 
 ### Environment variables
 

@@ -31,6 +31,56 @@ pub struct ExecRequest {
     /// before it sends their env, never a command asked for by a user.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub before_services: bool,
+    #[serde(flatten)]
+    pub run_as: RunAs,
+}
+
+/// Who a process runs as (RFC 0015). Root when neither is set.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunAs {
+    /// The user, with the groups and the home of its passwd entry; the
+    /// process starts in the home when it is given no directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<Owner>,
+    /// The one group to run with, in place of the groups of the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<Owner>,
+}
+
+impl Owner {
+    /// A number is an id, anything else a name.
+    pub fn parse(s: &str) -> Owner {
+        match s.parse() {
+            Ok(id) => Owner::Id(id),
+            Err(_) => Owner::Name(s.to_string()),
+        }
+    }
+}
+
+impl RunAs {
+    /// This, or `default` when this names neither a user nor a group.
+    pub fn or<'a>(&'a self, default: &'a RunAs) -> &'a RunAs {
+        if self.user.is_none() && self.group.is_none() {
+            default
+        } else {
+            self
+        }
+    }
+
+    /// `user` or `user:group`, each a name or a number.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let (user, group) = match spec.split_once(':') {
+            Some((user, group)) => (user, Some(group)),
+            None => (spec, None),
+        };
+        if user.is_empty() || group.is_some_and(str::is_empty) {
+            return Err(format!("{spec}: expected user or user:group"));
+        }
+        Ok(RunAs {
+            user: Some(Owner::parse(user)),
+            group: group.map(Owner::parse),
+        })
+    }
 }
 
 /// Kill an exec by the id it was started with. Sent on its own connection,
@@ -523,6 +573,48 @@ pub const VSOCK_PORT_FORWARD: u32 = 1025;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_as_from_user_and_group() {
+        let parse = |s| RunAs::parse(s).unwrap();
+        assert_eq!(parse("desktop").user, Some(Owner::Name("desktop".into())));
+        assert_eq!(parse("desktop").group, None);
+        assert_eq!(
+            parse("1000:video"),
+            RunAs {
+                user: Some(Owner::Id(1000)),
+                group: Some(Owner::Name("video".into())),
+            }
+        );
+        for bad in ["", ":video", "desktop:"] {
+            assert!(RunAs::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn run_as_is_flat_in_an_exec_request_and_left_out_when_root() {
+        let json = r#"{"argv":["id"],"user":"desktop","group":44}"#;
+        let req: ExecRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.run_as, RunAs::parse("desktop:44").unwrap());
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            (&json["user"], &json["group"]),
+            (&"desktop".into(), &44.into())
+        );
+
+        let req: ExecRequest = serde_json::from_str(r#"{"argv":["id"]}"#).unwrap();
+        assert_eq!(req.run_as, RunAs::default());
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("user").is_none() && json.get("group").is_none());
+    }
+
+    #[test]
+    fn run_as_falls_back_only_when_it_names_neither() {
+        let default = RunAs::parse("desktop").unwrap();
+        let root = RunAs::parse("root").unwrap();
+        assert_eq!(RunAs::default().or(&default), &default);
+        assert_eq!(root.or(&default), &root);
+    }
 
     #[test]
     fn mount_request_read_only_true_by_default() {

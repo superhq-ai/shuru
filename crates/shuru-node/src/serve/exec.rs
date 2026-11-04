@@ -11,7 +11,8 @@ use hyper::body::{Bytes, Incoming};
 use hyper::{Request, Response, StatusCode};
 use serde_json::{json, Value};
 use shuru_proto::{
-    frame, ExecRequest, KillEvent, SessionInfo, SessionKill, SessionList, SessionStart,
+    frame, ExecRequest, KillEvent, Owner, RunAs, SessionInfo, SessionKill, SessionList,
+    SessionStart,
 };
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -51,6 +52,7 @@ fn start_request(query: Option<&str>, websocket: bool) -> Result<(SessionStart, 
     let mut rows = None;
     let mut cols = None;
     let mut max_run_after_disconnect = None;
+    let mut run_as = RunAs::default();
     for (key, value) in query_pairs(query) {
         match key.as_str() {
             "cmd" => argv.push(value),
@@ -63,6 +65,8 @@ fn start_request(query: Option<&str>, websocket: bool) -> Result<(SessionStart, 
                 env.insert(name.to_string(), value.to_string());
             }
             "dir" if !value.is_empty() => cwd = Some(value),
+            "user" if !value.is_empty() => run_as.user = Some(Owner::parse(&value)),
+            "group" if !value.is_empty() => run_as.group = Some(Owner::parse(&value)),
             "stdin" => stdin = parse_bool(&key, &value)?,
             "tty" if websocket => tty = parse_bool(&key, &value)?,
             "rows" if websocket => rows = Some(parse_number(&key, &value)?),
@@ -89,6 +93,7 @@ fn start_request(query: Option<&str>, websocket: bool) -> Result<(SessionStart, 
             cwd,
             id: None,
             before_services: false,
+            run_as,
         },
         max_run_after_disconnect,
     };
@@ -96,10 +101,13 @@ fn start_request(query: Option<&str>, websocket: bool) -> Result<(SessionStart, 
 }
 
 /// Puts the sandbox env and the placeholders of its secrets under the env
-/// the request asked for.
-fn give_env(entry: &Entry, addr: &GuestAddr, start: &mut SessionStart) {
+/// the request asked for, and runs it as the user of the sandbox when it
+/// names none.
+fn give_config(entry: &Entry, addr: &GuestAddr, start: &mut SessionStart) {
+    let config = entry.config();
     let request = std::mem::take(&mut start.exec.env);
-    start.exec.env = config::exec_env(&entry.config().env, &addr.placeholders, request);
+    start.exec.env = config::exec_env(&config.env, &addr.placeholders, request);
+    start.exec.run_as = start.exec.run_as.or(&config.run_as).clone();
 }
 
 fn tagged(stream: u8, data: &[u8]) -> Bytes {
@@ -131,7 +139,7 @@ pub async fn http(
         Bytes::new()
     };
     let addr = node.guest(entry).await?;
-    give_env(entry, &addr, &mut start);
+    give_config(entry, &addr, &mut start);
     let mut attachment = addr.hubs.start(&addr, &start).await?;
     let (tx, rx) = mpsc::channel(16);
     let feed = feed(attachment.input(), input);
@@ -185,7 +193,7 @@ pub async fn websocket(
         None => {
             let (mut start, _) = start_request(query, true)?;
             let addr = node.guest(entry).await?;
-            give_env(entry, &addr, &mut start);
+            give_config(entry, &addr, &mut start);
             addr.hubs.start(&addr, &start).await?
         }
         Some(id) => {
@@ -492,6 +500,14 @@ mod tests {
         assert_eq!(start.exec.env.get("A").map(String::as_str), Some("1"));
         assert!(stdin);
         assert_eq!(start.exec.tty, None);
+    }
+
+    #[test]
+    fn a_user_and_a_group() {
+        let (start, _) = parse("cmd=id&user=desktop&group=44", false);
+        assert_eq!(start.exec.run_as, RunAs::parse("desktop:44").unwrap());
+        let (start, _) = parse("cmd=id&user=", true);
+        assert_eq!(start.exec.run_as, RunAs::default());
     }
 
     #[test]

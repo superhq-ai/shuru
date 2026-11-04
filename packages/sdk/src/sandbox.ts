@@ -57,7 +57,11 @@ export class Sandbox {
 			typeof command === "string"
 				? [opts?.shell ?? "sh", "-c", command]
 				: command;
-		const resp = await this.proc.send(Method.EXEC, { argv });
+		const resp = await this.proc.send(Method.EXEC, {
+			argv,
+			user: opts?.user,
+			group: opts?.group,
+		});
 		const r = resp.result as {
 			stdout: string;
 			stderr: string;
@@ -82,6 +86,8 @@ export class Sandbox {
 			argv,
 			cwd: opts?.cwd,
 			env: opts?.env,
+			user: opts?.user,
+			group: opts?.group,
 		});
 		const { pid } = resp.result as { pid: string };
 		return new SandboxProcess(this.proc, pid);
@@ -211,6 +217,7 @@ export function buildArgs(bin: string, opts: StartOptions): string[] {
 	}
 	if (opts.allowNet) args.push("--allow-net");
 	if (opts.allowHostWrites) args.push("--allow-host-writes");
+	if (opts.user) args.push("--user", opts.user);
 
 	if (opts.secrets) {
 		for (const [name, secret] of Object.entries(opts.secrets)) {

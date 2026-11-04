@@ -652,6 +652,7 @@ impl Vm {
             cwd: None,
             id: None,
             before_services: true,
+            run_as: Default::default(),
         };
         frame::send_json(&mut guest, frame::EXEC_REQ, &request)?;
         loop {

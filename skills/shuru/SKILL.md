@@ -62,6 +62,9 @@ shuru run --allow-net -p 8080:80 -- nginx -g 'daemon off;'
 # Multiple mounts
 shuru run --mount ./src:/src --mount ./data:/data -- ls /src /data
 
+# As a user of the image instead of root, in its home
+shuru run --user desktop -- id
+
 # From a checkpoint
 shuru run --from myenv -- npm test
 

@@ -108,11 +108,14 @@ fn exit_code(status: libc::c_int) -> i32 {
 
 /// Counts a session as running unless MAX_RUNNING already are.
 fn reserve(running: &AtomicUsize) -> bool {
-    running
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < MAX_RUNNING).then_some(n + 1)
-        })
-        .is_ok()
+    let mut n = running.load(Ordering::Acquire);
+    while n < MAX_RUNNING {
+        match running.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => n = now,
+        }
+    }
+    false
 }
 
 fn release() {
@@ -248,7 +251,7 @@ pub fn kill(req: SessionKill, conn: &mut TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shuru_proto::{ExecRequest, SessionInfo};
+    use shuru_proto::{ExecRequest, Owner, RunAs, SessionInfo};
     use std::collections::HashMap;
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
@@ -320,10 +323,20 @@ mod tests {
     }
 
     fn start_on(
+        pair: (TcpStream, TcpStream),
+        argv: &[&str],
+        tty: bool,
+        hangup: Option<u64>,
+    ) -> TcpStream {
+        start_as(pair, argv, tty, hangup, RunAs::default())
+    }
+
+    fn start_as(
         (client, server): (TcpStream, TcpStream),
         argv: &[&str],
         tty: bool,
         hangup: Option<u64>,
+        run_as: RunAs,
     ) -> TcpStream {
         let req = SessionStart {
             exec: ExecRequest {
@@ -335,6 +348,7 @@ mod tests {
                 cwd: None,
                 id: None,
                 before_services: false,
+                run_as,
             },
             max_run_after_disconnect: hangup,
         };
@@ -727,6 +741,75 @@ wait"#;
             other => panic!("{:?}", other.map(|(t, _)| t)),
         }
         assert_eq!(kinds(&kill_all("999999")), ["error"]);
+    }
+
+    fn nobody(group: Option<Owner>) -> RunAs {
+        RunAs {
+            user: Some(Owner::Name("nobody".into())),
+            group,
+        }
+    }
+
+    #[test]
+    fn a_session_runs_as_its_user_in_its_home_or_the_root() {
+        let script = "id -u; id -g; id -G; pwd; echo $HOME $USER $LOGNAME";
+        let mut conn = start_as(pair(), &["sh", "-c", script], false, None, nobody(None));
+        info(&mut conn);
+        let (out, err, code) = drain(&mut conn);
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        // The home of nobody is /nonexistent, so it starts in the root.
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "65534\n65534\n65534\n/\n/nonexistent nobody nobody\n"
+        );
+    }
+
+    #[test]
+    fn a_group_replaces_the_groups_of_the_user() {
+        let run_as = nobody(Some(Owner::Id(0)));
+        let mut conn = start_as(pair(), &["sh", "-c", "id -g; id -G"], false, None, run_as);
+        info(&mut conn);
+        let (out, _, code) = drain(&mut conn);
+        assert_eq!(
+            (String::from_utf8_lossy(&out).as_ref(), code),
+            ("0\n0\n", 0)
+        );
+    }
+
+    #[test]
+    fn a_terminal_belongs_to_the_user() {
+        let argv = [
+            "sh",
+            "-c",
+            "stat -c owner=%u /proc/self/fd/0; test -w /proc/self/fd/0 && echo writable",
+        ];
+        let mut conn = start_as(pair(), &argv, true, None, nobody(None));
+        info(&mut conn);
+        let got = read_until(&mut conn, b"writable");
+        assert!(String::from_utf8_lossy(&got).contains("owner=65534"));
+    }
+
+    #[test]
+    fn an_unknown_user_is_an_error_and_nothing_runs() {
+        let run_as = RunAs {
+            user: Some(Owner::Name("nobody-at-all".into())),
+            group: None,
+        };
+        let mut conn = start_as(
+            pair(),
+            &["touch", "/tmp/ran-as-nobody-at-all"],
+            false,
+            None,
+            run_as,
+        );
+        match frame::read_frame(&mut conn).unwrap() {
+            Some((frame::ERROR, msg)) => assert_eq!(
+                String::from_utf8_lossy(&msg),
+                "failed to spawn: no user nobody-at-all in the guest"
+            ),
+            other => panic!("{:?}", other.map(|(t, _)| t)),
+        }
+        assert!(!std::path::Path::new("/tmp/ran-as-nobody-at-all").exists());
     }
 
     #[test]

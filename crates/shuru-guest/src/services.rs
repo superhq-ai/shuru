@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use shuru_proto::ShutdownResponse;
+use shuru_proto::{RunAs, ShutdownResponse};
 
 use crate::children::{Exit, Watch};
 
@@ -58,7 +58,10 @@ struct Spec {
     ready_timeout: Duration,
     stop_timeout: Duration,
     env: HashMap<String, String>,
-    cwd: String,
+    cwd: Option<String>,
+    // Who it runs as (RFC 0015), looked up each time it starts, so a user
+    // made after boot is found on the next restart.
+    run_as: RunAs,
     restart: Restart,
 }
 
@@ -166,12 +169,15 @@ fn parse_spec(name: &str, text: &str) -> Result<Spec, String> {
         }
     }
     let cwd = match value.get("cwd") {
-        None | Some(serde_json::Value::Null) => "/".to_string(),
-        Some(v) => v
-            .as_str()
-            .map(str::to_string)
-            .ok_or("cwd must be a string")?,
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .map(str::to_string)
+                .ok_or("cwd must be a string")?,
+        ),
     };
+    let run_as: RunAs = serde_json::from_value(value.clone())
+        .map_err(|_| "user and group must each be a name or a number")?;
     let restart = match value.get("restart") {
         None | Some(serde_json::Value::Null) => Restart::No,
         Some(v) => match v.as_str() {
@@ -188,8 +194,23 @@ fn parse_spec(name: &str, text: &str) -> Result<Spec, String> {
         stop_timeout,
         env,
         cwd,
+        run_as,
         restart,
     })
+}
+
+impl Spec {
+    /// Starts `cmd` as the user of the service, in its directory: the one
+    /// in its file, else the home of its user, else the root.
+    fn run_as(&self, cmd: &mut Command) -> std::io::Result<()> {
+        match crate::user::of(&self.run_as)? {
+            Some(account) => account.apply(cmd, &self.env, self.cwd.as_deref()),
+            None => {
+                cmd.current_dir(self.cwd.as_deref().unwrap_or("/"));
+                Ok(())
+            }
+        }
+    }
 }
 
 /// The wait before the next restart: RESTART_FIRST after a healthy run,
@@ -269,7 +290,6 @@ fn spawn(spec: &Spec) -> std::io::Result<(Watch, Exit)> {
     let mut cmd = Command::new(&spec.exec[0]);
     cmd.args(&spec.exec[1..]);
     cmd.envs(&spec.env);
-    cmd.current_dir(&spec.cwd);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::from(log));
     cmd.stderr(Stdio::from(log_err));
@@ -280,6 +300,7 @@ fn spawn(spec: &Spec) -> std::io::Result<(Watch, Exit)> {
             Ok(())
         });
     }
+    spec.run_as(&mut cmd)?;
     let exit = Exit::default();
     let (status, name) = (exit.clone(), spec.name.clone());
     let (_, child) = crate::children::spawn_with(
@@ -413,6 +434,9 @@ fn ready_check_passes(spec: &Spec, ready: &[String]) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if spec.run_as(&mut cmd).is_err() {
+        return false;
+    }
     match crate::children::spawn_waited(&mut cmd) {
         Ok((_, _, exit)) => {
             let status = exit.wait();
@@ -741,6 +765,7 @@ pub fn shutdown() -> ShutdownResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shuru_proto::Owner;
     use std::path::PathBuf;
 
     struct Scratch(PathBuf);
@@ -759,6 +784,25 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn service_file_user_and_group() {
+        let spec = parse_spec(
+            "wm",
+            r#"{"exec": ["/bin/true"], "user": "desktop", "group": 44}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            spec.run_as,
+            RunAs {
+                user: Some(Owner::Name("desktop".into())),
+                group: Some(Owner::Id(44)),
+            }
+        );
+        let spec = parse_spec("wm", r#"{"exec": ["/bin/true"]}"#).unwrap();
+        assert_eq!((spec.run_as, spec.cwd), (RunAs::default(), None));
+        assert!(parse_spec("wm", r#"{"exec": ["/bin/true"], "user": ["a"]}"#).is_err());
     }
 
     #[test]

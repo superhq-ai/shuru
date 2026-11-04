@@ -26,8 +26,13 @@ export interface StartOptions {
 	mounts?: Record<string, string>;
 	secrets?: Record<string, SecretConfig>;
 	network?: NetworkConfig;
+	/** The user commands run as, "user" or "user:group", each a name or an id. Default: root. */
+	user?: string;
 	shuruBin?: string;
 }
+
+/** A user or a group in the guest, by name or by id. */
+export type Owner = string | number;
 
 export interface ExecResult {
 	stdout: string;
@@ -38,6 +43,10 @@ export interface ExecResult {
 export interface ExecOptions {
 	/** Shell to use when command is a string. Defaults to "sh". Ignored when command is an array. */
 	shell?: string;
+	/** Runs as this user, in place of the one the sandbox started with. */
+	user?: Owner;
+	/** The one group to run with, in place of the groups of the user. */
+	group?: Owner;
 }
 
 export interface SpawnOptions {
@@ -45,6 +54,10 @@ export interface SpawnOptions {
 	env?: Record<string, string>;
 	/** Shell to use when command is a string. Defaults to "sh". Ignored when command is an array. */
 	shell?: string;
+	/** Runs as this user, in place of the one the sandbox started with. */
+	user?: Owner;
+	/** The one group to run with, in place of the groups of the user. */
+	group?: Owner;
 }
 
 export interface WatchOptions {

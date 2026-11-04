@@ -60,6 +60,10 @@ pub(crate) struct VmArgs {
     #[arg(long = "expose-host", value_name = "HOST:GUEST", hide = true)]
     pub expose_host: Vec<String>,
 
+    /// Run commands as this user, a name or a uid, with an optional group
+    #[arg(long, value_name = "USER[:GROUP]", value_parser = shuru_vm::RunAs::parse)]
+    pub user: Option<shuru_vm::RunAs>,
+
     /// Path to config file (default: ./shuru.json)
     #[arg(long)]
     pub config: Option<String>,
