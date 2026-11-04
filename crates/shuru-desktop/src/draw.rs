@@ -490,8 +490,11 @@ impl Font {
     pub fn new() -> Self {
         let mut db = fontdb::Database::new();
         db.load_font_data(FONT.to_vec());
+        let family = db.faces().next().map(|f| f.families[0].0.clone());
         db.load_system_fonts();
-        db.set_sans_serif_family("Inter");
+        if let Some(family) = family {
+            db.set_sans_serif_family(family);
+        }
         let locale = crate::locale::messages_locale();
         let locale = locale
             .split(['.', '@'])
