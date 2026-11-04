@@ -14,7 +14,7 @@ listed in its `SHA256SUMS`.
 | `themes/SuperHQ/` | `/usr/share/themes/SuperHQ/` | the light GTK 3 theme (the default) |
 | `themes/SuperHQ-dark/` | `/usr/share/themes/SuperHQ-dark/` | the dark GTK 3 theme |
 | `gtk-3.0/settings.ini` | `/etc/gtk-3.0/settings.ini` | the theme, Inter, the window buttons on the left, no animations |
-| `chromium/initial_preferences` | `/usr/lib/chromium/initial_preferences` | the first run settings of a new Chromium profile |
+| `chromium/initial_preferences` | `/etc/chromium/master_preferences` | the first run settings of a new Chromium profile, in place of the Debian ones |
 | `chromium/policy.json` | `/etc/chromium/policies/managed/superhq.json` | no sign in, no sync, no promotions, no default browser check, no password manager |
 | `xterm/XTerm` | appended to `/etc/X11/app-defaults/XTerm` | the terminal colors and font, titles in UTF-8 |
 | `mimeapps.list` | `/etc/xdg/mimeapps.list` | which app opens what |
@@ -31,11 +31,12 @@ apt-get install --no-install-recommends \
 ## Display
 
 ```sh
-Xvfb :1 -screen 0 1280x800x24 -shmem -dpi 96 -s 0 -nodpms
+Xvfb :1 -screen 0 1280x800x24 -shmem -dpi 96 -s 0
 ```
 
-`-s 0` turns the screen saver off and `-nodpms` power management, so the
-screen never blanks while an agent works without input for a while.
+`-s 0` turns the screen saver off, so the screen never blanks while an
+agent works without input for a while. Xvfb has no DPMS, and refuses
+`-nodpms`.
 `shuru-desktop` also sets the screen saver timeout to 0 when it starts.
 
 ## Session bus
@@ -112,8 +113,11 @@ on the focused window, gray on the others.
 
 ## Chromium
 
-`initial_preferences` and the policy give a new profile no first run
-screens and no sign in prompt. Do not pass `--no-first-run`: it skips
+Debian builds Chromium to read its initial preferences from
+`/etc/chromium/master_preferences`, which the package ships with a
+bookmarks bar of Debian links; the guest file replaces it. It and the
+policy give a new profile no first run screens and no sign in prompt.
+Do not pass `--no-first-run`: it skips
 `initial_preferences` too. Chromium follows the GTK theme for its frame
 and for `prefers-color-scheme`; nothing in the flags or preferences pins
 either.
