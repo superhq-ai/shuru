@@ -221,7 +221,11 @@ impl NetworkStack {
     }
 
     async fn run_async(&mut self) {
-        let async_fd = match AsyncFd::with_interest(self.device.fd(), Interest::READABLE) {
+        // SAFETY: the device owns the fd and outlives this AsyncFd, which is
+        // dropped when run_async returns.
+        let async_fd = match unsafe {
+            AsyncFd::register_with_interest(self.device.fd(), Interest::READABLE)
+        } {
             Ok(fd) => fd,
             Err(e) => {
                 warn!("AsyncFd registration failed for host_fd: {e}");
