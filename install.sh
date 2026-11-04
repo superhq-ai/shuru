@@ -22,13 +22,16 @@ case "$OS" in
         case "$ARCH" in
             aarch64|arm64)
                 PLATFORM="linux-aarch64"
-                echo "Warning: Linux support is experimental and not ready for production use yet." >&2
+                ;;
+            x86_64|amd64)
+                PLATFORM="linux-x86_64"
                 ;;
             *)
-                echo "Error: shuru Linux builds currently support ARM64 only. Detected: $ARCH" >&2
+                echo "Error: shuru Linux builds support ARM64 and x86_64. Detected: $ARCH" >&2
                 exit 1
                 ;;
         esac
+        echo "Warning: Linux support is experimental and not ready for production use yet." >&2
         ;;
     *)
         echo "Error: shuru only supports macOS and Linux. Detected: $OS" >&2

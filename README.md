@@ -4,7 +4,7 @@ Local-first microVM sandbox for AI agents on macOS, with experimental Linux supp
 
 <a href="https://superhq.ai"><img src=".github/assets/superhq-banner.png" alt="SuperHQ: Shuru sandboxes in the cloud, and agents that run 24/7" width="100%"></a>
 
-Shuru boots lightweight Linux VMs for AI agents. On macOS it uses Apple's Virtualization.framework. On Linux it uses a KVM backend that is now available as an experimental release build for ARM64 hosts. Every sandbox is ephemeral: the rootfs resets on every run, giving agents a disposable environment to execute code, install packages, and run tools without touching your host.
+Shuru boots lightweight Linux VMs for AI agents. On macOS it uses Apple's Virtualization.framework. On Linux it uses a KVM backend that is now available as an experimental release build for ARM64 and x86_64 hosts. Every sandbox is ephemeral: the rootfs resets on every run, giving agents a disposable environment to execute code, install packages, and run tools without touching your host.
 
 > [!WARNING]
 > **Experimental Linux support.** Linux builds are available for testing, but they are not ready for production use yet. Expect rough edges, missing polish, and compatibility gaps.
@@ -12,7 +12,7 @@ Shuru boots lightweight Linux VMs for AI agents. On macOS it uses Apple's Virtua
 ## Requirements
 
 - macOS 14 (Sonoma) or later on Apple Silicon
-- Linux ARM64 with KVM access (`/dev/kvm`) for experimental testing only
+- Linux ARM64 or x86_64 with KVM access (`/dev/kvm`) for experimental testing only
 
 On Linux, keep the data directory (`~/.local/share/shuru` or `SHURU_DATA_DIR`) on a filesystem with reflinks, XFS with `reflink=1` or btrfs. Every boot and every checkpoint is then a copy-on-write clone that costs no disk and no time, as on APFS. On ext4 shuru falls back to copying the disk image, which turns a one second boot into ten and makes each checkpoint a full copy.
 
@@ -28,7 +28,7 @@ Or via the install script:
 curl -fsSL https://raw.githubusercontent.com/superhq-ai/shuru/main/install.sh | sh
 ```
 
-The install script supports macOS on Apple Silicon and experimental Linux ARM64. Linux users can also download the `linux-aarch64` release tarball manually from GitHub Releases if they prefer.
+The install script supports macOS on Apple Silicon and experimental Linux ARM64 and x86_64. Linux users can also download the `linux-aarch64` or `linux-x86_64` release tarball manually from GitHub Releases if they prefer.
 
 > [!NOTE]
 > Homebrew remains macOS-only. Linux installs via the script are still experimental and not ready for production use.

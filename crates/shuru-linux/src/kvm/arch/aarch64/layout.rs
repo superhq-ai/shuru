@@ -11,6 +11,8 @@ pub const GIC_DIST_BASE: u64 = 0x0800_0000;
 pub const GIC_DIST_SIZE: u64 = 0x1_0000;
 pub const GIC_REDIST_BASE: u64 = 0x080A_0000;
 pub const GIC_REDIST_SIZE_PER_CPU: u64 = 0x2_0000;
+/// Interrupt lines the GIC is created with: 32 private, the rest shared.
+pub const NR_IRQS: u32 = 128;
 
 // PL011 UART
 pub const UART_BASE: u64 = 0x0900_0000;
@@ -26,6 +28,9 @@ pub const RTC_SIZE: u64 = 0x1000;
 pub const VMGENID_BASE: u64 = 0x0902_0000;
 pub const VMGENID_SIZE: u64 = 0x1000;
 pub const VMGENID_SPI: u32 = 2;
+pub const VMGENID_IRQ: u32 = spi_to_irq(VMGENID_SPI);
+/// The KVM memory slot after the one RAM range.
+pub const VMGENID_SLOT: u32 = 1;
 
 // Virtio MMIO devices
 pub const VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;

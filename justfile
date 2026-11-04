@@ -1,11 +1,12 @@
-guest_target := "aarch64-unknown-linux-musl"
+guest_target := arch() + "-unknown-linux-musl"
+node_target := arch() + "-unknown-linux-gnu"
 binary := "target/debug/shuru"
 
 # List available recipes
 default:
     @just --list
 
-# Build the guest init binary (cross-compiled to aarch64 musl)
+# Build the guest init binary (musl, for the host architecture)
 build-guest:
     cargo build -p shuru-guest --target {{ guest_target }} --release
 
@@ -35,11 +36,10 @@ shell:
 # Full setup from scratch: rootfs + build
 setup: prepare-rootfs build
 
-# Build shuru-node, shuru-vmm and shuru-netd as static PIE, on aarch64 Linux
+# Build shuru-node, shuru-vmm and shuru-netd as static PIE, on Linux
 build-node:
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER={{ justfile_directory() }}/scripts/static-pie-cc \
-    RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=pie" \
-    cargo build --release -p shuru-node --target aarch64-unknown-linux-gnu
+    RUSTFLAGS="-C linker={{ justfile_directory() }}/scripts/static-pie-cc -C target-feature=+crt-static -C relocation-model=pie" \
+    cargo build --release -p shuru-node --target {{ node_target }}
 
 # Check all crates compile (host targets only)
 check:

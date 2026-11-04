@@ -39,8 +39,11 @@ jobs:
       - run: cargo check -p shuru-cli
 
   linux-test:
-    name: Linux tests
-    runs-on: ubuntu-24.04-arm
+    name: Linux tests (${{ matrix.runner }})
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04-arm, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -50,3 +53,4 @@ jobs:
       - run: cargo test -p shuru-guest
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E

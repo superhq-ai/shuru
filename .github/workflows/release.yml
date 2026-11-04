@@ -12,15 +12,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The guest has the host architecture, so each OS image is built on a
+  # runner of its own architecture.
   build-os-image:
-    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-linux-musl
+          targets: ${{ matrix.arch }}-unknown-linux-musl
 
       - name: Install musl toolchain and kernel build deps
         run: |
@@ -29,9 +38,13 @@ jobs:
             libelf-dev libssl-dev wget xz-utils
 
       - name: Build shuru-guest
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: cargo build -p shuru-guest --target aarch64-unknown-linux-musl --release
+        run: |
+          if [ "${{ matrix.arch }}" = aarch64 ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+          else
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+          fi
+          cargo build -p shuru-guest --target ${{ matrix.arch }}-unknown-linux-musl --release
 
       - name: Build OS image
         run: ./scripts/prepare-rootfs.sh
@@ -40,14 +53,14 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME}"
           DATA_DIR="${HOME}/.local/share/shuru"
-          tar czf "shuru-os-${VERSION}-aarch64.tar.gz" \
+          tar czf "shuru-os-${VERSION}-${{ matrix.arch }}.tar.gz" \
             -C "${DATA_DIR}" \
             Image initramfs.cpio rootfs.ext4
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: os-image
+          name: os-image-${{ matrix.arch }}
           path: shuru-os-*.tar.gz
           retention-days: 1
 
@@ -80,7 +93,14 @@ jobs:
           retention-days: 1
 
   build-cli-linux:
-    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
 
@@ -93,14 +113,14 @@ jobs:
       - name: Package CLI binary
         run: |
           VERSION="${GITHUB_REF_NAME}"
-          tar czf "shuru-${VERSION}-linux-aarch64.tar.gz" \
+          tar czf "shuru-${VERSION}-linux-${{ matrix.arch }}.tar.gz" \
             -C target/release \
             shuru
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: cli-binary-linux
+          name: cli-binary-linux-${{ matrix.arch }}
           path: shuru-*.tar.gz
           retention-days: 1
 
@@ -110,18 +130,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: os-image
           path: artifacts/
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: cli-binary-darwin
-          path: artifacts/
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: cli-binary-linux
-          path: artifacts/
+          merge-multiple: true
 
       - name: Create release
         uses: softprops/action-gh-release@v3

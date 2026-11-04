@@ -1,3 +1,14 @@
+/// `eprintln!` that drops write errors. PID 1 must outlive a console it
+/// cannot write to: `eprintln!` panics on a failed write, and the panic
+/// takes the guest down with it.
+#[cfg(target_os = "linux")]
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 #[cfg(any(target_os = "linux", test))]
 mod identity;
 
@@ -22,6 +33,14 @@ mod files;
 
 #[cfg(target_os = "linux")]
 mod ports;
+
+/// How the guest stops its VM. An x86_64 guest has no ACPI sleep registers
+/// to power off with, so it resets through the keyboard controller
+/// (reboot=k), which the VMM takes as the end of the VM.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const POWER_OFF: libc::c_int = libc::LINUX_REBOOT_CMD_RESTART;
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+const POWER_OFF: libc::c_int = libc::LINUX_REBOOT_CMD_POWER_OFF;
 
 #[cfg(target_os = "linux")]
 mod guest {
@@ -131,7 +150,7 @@ mod guest {
             )
         };
         if ret != 0 {
-            eprintln!(
+            log!(
                 "shuru-guest: failed to mount {} on {}: {}",
                 source,
                 target,
@@ -190,9 +209,10 @@ mod guest {
                 "/sys/fs/cgroup/cgroup.subtree_control",
                 format!("+{}", name),
             ) {
-                eprintln!(
+                log!(
                     "shuru-guest: failed to enable cgroup controller {}: {}",
-                    name, e
+                    name,
+                    e
                 );
             }
         }
@@ -261,7 +281,7 @@ mod guest {
             return Err(format!("failed to mount overlay at {}", guest_path));
         }
 
-        eprintln!("shuru-guest: mounted {} -> {} (overlay)", tag, guest_path);
+        log!("shuru-guest: mounted {} -> {} (overlay)", tag, guest_path);
         Ok(())
     }
 
@@ -272,7 +292,7 @@ mod guest {
                 tag, guest_path
             ));
         }
-        eprintln!("shuru-guest: mounted {} -> {} (direct rw)", tag, guest_path);
+        log!("shuru-guest: mounted {} -> {} (direct rw)", tag, guest_path);
         Ok(())
     }
 
@@ -288,13 +308,13 @@ mod guest {
 
             let display_name = String::from_utf8_lossy(&name[..name.len().saturating_sub(1)]);
             if libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) < 0 {
-                eprintln!("shuru-guest: failed to get {} flags", display_name);
+                log!("shuru-guest: failed to get {} flags", display_name);
                 return;
             }
 
             ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
             if libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) < 0 {
-                eprintln!("shuru-guest: failed to bring up {}", display_name);
+                log!("shuru-guest: failed to bring up {}", display_name);
             }
         }
     }
@@ -1173,7 +1193,7 @@ mod guest {
         let cgroup = match crate::cgroup::Cgroup::create(&name) {
             Ok(cgroup) => Some(cgroup),
             Err(e) => {
-                eprintln!("shuru-guest: exec without a cgroup: {}", e);
+                log!("shuru-guest: exec without a cgroup: {}", e);
                 None
             }
         };
@@ -1869,7 +1889,7 @@ mod guest {
     extern "C" fn sigterm_handler(_: libc::c_int) {
         unsafe {
             libc::sync();
-            libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+            libc::reboot(crate::POWER_OFF);
         }
     }
 
@@ -1886,7 +1906,7 @@ mod guest {
         if let Err(e) = crate::disk::boot() {
             stage(&format!("root boot failed: {e}"));
             unsafe {
-                libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+                libc::reboot(crate::POWER_OFF);
             }
             loop {
                 std::thread::park();
@@ -1896,7 +1916,7 @@ mod guest {
         if let Err(e) = crate::disk::check_root() {
             stage(&format!("root boot failed: {e}"));
             unsafe {
-                libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+                libc::reboot(crate::POWER_OFF);
             }
             loop {
                 std::thread::park();
@@ -1909,7 +1929,7 @@ mod guest {
         let boot_identity = std::fs::read_to_string("/proc/cmdline")
             .and_then(|cmdline| crate::identity::parse(&cmdline))
             .unwrap_or_else(|_| {
-                eprintln!("shuru-guest: missing or invalid guest identity");
+                log!("shuru-guest: missing or invalid guest identity");
                 std::process::exit(1);
             });
         crate::identity::set(boot_identity);
@@ -1924,7 +1944,7 @@ mod guest {
         stage("networking ready");
 
         if let Err(e) = crate::cgroup::init() {
-            eprintln!("shuru-guest: no exec cgroups: {}", e);
+            log!("shuru-guest: no exec cgroups: {}", e);
         }
         crate::children::start_reaper().expect("start the reaper");
 
@@ -1968,7 +1988,7 @@ mod guest {
                 continue;
             }
 
-            eprintln!("shuru-guest: accepted vsock connection");
+            log!("shuru-guest: accepted vsock connection");
 
             std::thread::spawn(move || {
                 handle_connection(client_fd);

@@ -31,19 +31,39 @@ const fn ior(nr: u64, size: usize) -> u64 {
     ioc(IOC_READ, nr, size)
 }
 
+const fn iowr(nr: u64, size: usize) -> u64 {
+    ioc(IOC_READ | IOC_WRITE, nr, size)
+}
+
 const KVM_RUN: u64 = io(0x80);
 const KVM_IRQ_LINE: u64 = iow(0x61, size_of::<kvm_bindings::kvm_irq_level>());
 const KVM_IOEVENTFD: u64 = iow(0x79, size_of::<kvm_bindings::kvm_ioeventfd>());
-// Reading the vCPUs and the GIC for a snapshot.
-const KVM_GET_ONE_REG: u64 = iow(0xab, size_of::<kvm_bindings::kvm_one_reg>());
-const KVM_GET_REG_LIST: u64 = ioc(
-    IOC_READ | IOC_WRITE,
-    0xb0,
-    size_of::<kvm_bindings::kvm_reg_list>(),
-);
+// Reading the vCPUs and the interrupt controllers for a snapshot.
 const KVM_GET_MP_STATE: u64 = ior(0x98, size_of::<kvm_bindings::kvm_mp_state>());
 const KVM_GET_VCPU_EVENTS: u64 = ior(0x9f, size_of::<kvm_bindings::kvm_vcpu_events>());
+#[cfg(target_arch = "aarch64")]
+const KVM_GET_ONE_REG: u64 = iow(0xab, size_of::<kvm_bindings::kvm_one_reg>());
+#[cfg(target_arch = "aarch64")]
+const KVM_GET_REG_LIST: u64 = iowr(0xb0, size_of::<kvm_bindings::kvm_reg_list>());
+#[cfg(target_arch = "aarch64")]
 const KVM_GET_DEVICE_ATTR: u64 = iow(0xe2, size_of::<kvm_bindings::kvm_device_attr>());
+#[cfg(target_arch = "aarch64")]
+const SNAPSHOT_READS: &[u64] = &[KVM_GET_ONE_REG, KVM_GET_REG_LIST, KVM_GET_DEVICE_ATTR];
+#[cfg(target_arch = "x86_64")]
+const SNAPSHOT_READS: &[u64] = &[
+    iowr(0x62, size_of::<kvm_bindings::kvm_irqchip>()),
+    ior(0x7c, size_of::<kvm_bindings::kvm_clock_data>()),
+    ior(0x81, size_of::<kvm_bindings::kvm_regs>()),
+    ior(0x83, size_of::<kvm_bindings::kvm_sregs>()),
+    iowr(0x88, size_of::<kvm_bindings::kvm_msrs>()),
+    ior(0x8e, size_of::<kvm_bindings::kvm_lapic_state>()),
+    iowr(0x91, size_of::<kvm_bindings::kvm_cpuid2>()),
+    ior(0x9f, size_of::<kvm_bindings::kvm_pit_state2>()),
+    ior(0xa1, size_of::<kvm_bindings::kvm_debugregs>()),
+    io(0xa3),
+    ior(0xa4, size_of::<kvm_bindings::kvm_xsave>()),
+    ior(0xa6, size_of::<kvm_bindings::kvm_xcrs>()),
+];
 // An unsigned long in glibc, an int in musl.
 #[allow(clippy::unnecessary_cast)]
 const FIONBIO: u64 = libc::FIONBIO as u64;
@@ -103,6 +123,12 @@ const ALLOWED: &[libc::c_long] = &[
     libc::SYS_writev,
 ];
 
+// glibc calls these on x86_64, where they exist, for poll and epoll_wait.
+#[cfg(target_arch = "x86_64")]
+const ALLOWED_LEGACY: &[libc::c_long] = &[libc::SYS_epoll_wait, libc::SYS_poll];
+#[cfg(not(target_arch = "x86_64"))]
+const ALLOWED_LEGACY: &[libc::c_long] = &[];
+
 fn rule(conditions: Vec<Cond>) -> Result<SeccompRule> {
     Ok(SeccompRule::new(conditions)?)
 }
@@ -126,22 +152,23 @@ fn filter(
 }
 
 fn vmm_allowlist(mismatch: SeccompAction) -> Result<BpfProgram> {
-    let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
-        ALLOWED.iter().map(|&call| (call, Vec::new())).collect();
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = ALLOWED
+        .iter()
+        .chain(ALLOWED_LEGACY)
+        .map(|&call| (call, Vec::new()))
+        .collect();
     rules.insert(
         libc::SYS_ioctl,
         [
             KVM_RUN,
             KVM_IRQ_LINE,
             KVM_IOEVENTFD,
-            KVM_GET_ONE_REG,
-            KVM_GET_REG_LIST,
             KVM_GET_MP_STATE,
             KVM_GET_VCPU_EVENTS,
-            KVM_GET_DEVICE_ATTR,
             FIONBIO,
         ]
         .into_iter()
+        .chain(SNAPSHOT_READS.iter().copied())
         .map(|request| equals(1, request))
         .collect::<Result<_>>()?,
     );
@@ -224,9 +251,23 @@ const NETD_DENIED: &[libc::c_long] = &[
     libc::SYS_userfaultfd,
 ];
 
+// Port I/O, segment descriptors and a.out libraries, on x86_64 only.
+#[cfg(target_arch = "x86_64")]
+const NETD_DENIED_ARCH: &[libc::c_long] = &[
+    libc::SYS_ioperm,
+    libc::SYS_iopl,
+    libc::SYS_modify_ldt,
+    libc::SYS_uselib,
+];
+#[cfg(not(target_arch = "x86_64"))]
+const NETD_DENIED_ARCH: &[libc::c_long] = &[];
+
 fn netd_kills(matched: SeccompAction) -> Result<BpfProgram> {
-    let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
-        NETD_DENIED.iter().map(|&call| (call, Vec::new())).collect();
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = NETD_DENIED
+        .iter()
+        .chain(NETD_DENIED_ARCH)
+        .map(|&call| (call, Vec::new()))
+        .collect();
     let new_user = libc::CLONE_NEWUSER as u64;
     rules.insert(
         libc::SYS_clone,
@@ -240,11 +281,21 @@ fn netd_kills(matched: SeccompAction) -> Result<BpfProgram> {
     filter(rules, SeccompAction::Allow, matched)
 }
 
+#[cfg(target_arch = "x86_64")]
+const OPENS: &[libc::c_long] = &[
+    libc::SYS_openat,
+    libc::SYS_openat2,
+    libc::SYS_open,
+    libc::SYS_creat,
+];
+#[cfg(not(target_arch = "x86_64"))]
+const OPENS: &[libc::c_long] = &[libc::SYS_openat, libc::SYS_openat2];
+
 // The roots are empty, so opening fails anyway. glibc opens files on its
 // own, such as the CPU count when malloc adds an arena, and gets an error
 // here instead of a kill.
 fn refusals(mut rules: BTreeMap<i64, Vec<SeccompRule>>) -> Result<BpfProgram> {
-    for call in [libc::SYS_openat, libc::SYS_openat2] {
+    for &call in OPENS {
         rules.insert(call, Vec::new());
     }
     filter(
@@ -260,6 +311,36 @@ fn netd_refusals() -> Result<BpfProgram> {
         Cond::new(0, Len::Dword, Op::Ne, libc::AF_INET6 as u64)?,
     ])?;
     refusals(BTreeMap::from([(libc::SYS_socket, vec![ip_only])]))
+}
+
+/// x32 system calls carry the x86_64 architecture in the filter input and
+/// their own numbers, from bit 30 up, which no rule above names. A deny
+/// list would let them through, so they are refused before the rest.
+#[cfg(target_arch = "x86_64")]
+fn refuse_x32(action: SeccompAction) -> Vec<BpfProgram> {
+    const LD_W_ABS: u16 = 0x20;
+    const JEQ_K: u16 = 0x15;
+    const JGE_K: u16 = 0x35;
+    const RET_K: u16 = 0x06;
+    const AUDIT_ARCH_X86_64: u32 = 62 | 0x8000_0000 | 0x4000_0000;
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+    let op = |code, k, jt, jf| seccompiler::sock_filter { code, jt, jf, k };
+    let refuse = u32::from(action);
+    let allow = u32::from(SeccompAction::Allow);
+    vec![vec![
+        op(LD_W_ABS, 4, 0, 0),
+        op(JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+        op(RET_K, refuse, 0, 0),
+        op(LD_W_ABS, 0, 0, 0),
+        op(JGE_K, X32_SYSCALL_BIT, 0, 1),
+        op(RET_K, refuse, 0, 0),
+        op(RET_K, allow, 0, 0),
+    ]]
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn refuse_x32(_action: SeccompAction) -> Vec<BpfProgram> {
+    Vec::new()
 }
 
 fn violation(log: bool) -> SeccompAction {
@@ -284,11 +365,13 @@ pub fn install_vmm(log: bool) -> Result<()> {
 }
 
 fn vmm_programs(log: bool) -> Result<Vec<BpfProgram>> {
-    Ok(vec![
+    let mut programs = refuse_x32(violation(log));
+    programs.extend([
         refuse_clone3()?,
         refusals(BTreeMap::new())?,
         vmm_allowlist(violation(log))?,
-    ])
+    ]);
+    Ok(programs)
 }
 
 pub fn install_netd(log: bool) -> Result<()> {
@@ -296,11 +379,13 @@ pub fn install_netd(log: bool) -> Result<()> {
 }
 
 fn netd_programs(log: bool) -> Result<Vec<BpfProgram>> {
-    Ok(vec![
+    let mut programs = refuse_x32(violation(log));
+    programs.extend([
         refuse_clone3()?,
         netd_refusals()?,
         netd_kills(violation(log))?,
-    ])
+    ]);
+    Ok(programs)
 }
 
 #[cfg(test)]
@@ -312,11 +397,28 @@ mod tests {
         assert_eq!(KVM_RUN, 0xae80);
         assert_eq!(KVM_IRQ_LINE, 0x4008_ae61);
         assert_eq!(KVM_IOEVENTFD, 0x4040_ae79);
-        assert_eq!(KVM_GET_ONE_REG, 0x4010_aeab);
-        assert_eq!(KVM_GET_REG_LIST, 0xc008_aeb0);
         assert_eq!(KVM_GET_MP_STATE, 0x8004_ae98);
         assert_eq!(KVM_GET_VCPU_EVENTS, 0x8040_ae9f);
-        assert_eq!(KVM_GET_DEVICE_ATTR, 0x4018_aee2);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(SNAPSHOT_READS, [0x4010_aeab, 0xc008_aeb0, 0x4018_aee2]);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            SNAPSHOT_READS,
+            [
+                0xc208_ae62,
+                0x8030_ae7c,
+                0x8090_ae81,
+                0x8138_ae83,
+                0xc008_ae88,
+                0x8400_ae8e,
+                0xc008_ae91,
+                0x8070_ae9f,
+                0x8080_aea1,
+                0xaea3,
+                0x9000_aea4,
+                0x8188_aea6,
+            ]
+        );
     }
 
     #[test]
@@ -364,5 +466,31 @@ mod tests {
             libc::WTERMSIG(status)
         );
         assert_eq!(libc::WEXITSTATUS(status), libc::ENOSYS);
+    }
+
+    /// A getpid with the x32 bit set ends the process, though getpid
+    /// itself is allowed.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x32_calls_end_the_process() {
+        for programs in [vmm_programs(false).unwrap(), netd_programs(false).unwrap()] {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                if apply(&programs).is_err() {
+                    unsafe { libc::_exit(100) };
+                }
+                unsafe { libc::syscall(0x4000_0000 | libc::SYS_getpid) };
+                unsafe { libc::_exit(0) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(
+                libc::WIFSIGNALED(status),
+                "exited {}",
+                libc::WEXITSTATUS(status)
+            );
+            assert_eq!(libc::WTERMSIG(status), libc::SIGSYS);
+        }
     }
 }

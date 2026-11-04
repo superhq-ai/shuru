@@ -6,11 +6,20 @@ DATA_DIR="${SHURU_DATA_DIR:-${HOME}/.local/share/shuru}"
 ROOTFS_IMG="${DATA_DIR}/rootfs.ext4"
 KERNEL_PATH="${DATA_DIR}/Image"
 INITRAMFS_PATH="${DATA_DIR}/initramfs.cpio"
-GUEST_BINARY="target/aarch64-unknown-linux-musl/release/shuru-guest"
 ROOTFS_SIZE_MB=1024
 
+# The guest is the host architecture: arm64 on macOS, the machine on Linux.
+if [[ "$(uname)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
+    DEB_ARCH="amd64"
+    GUEST_TARGET="x86_64-unknown-linux-musl"
+else
+    DEB_ARCH="arm64"
+    GUEST_TARGET="aarch64-unknown-linux-musl"
+fi
+GUEST_BINARY="target/${GUEST_TARGET}/release/shuru-guest"
+
 echo "==> Shuru rootfs preparation script"
-echo "    Debian ${DEBIAN_RELEASE} (kernel + rootfs)"
+echo "    Debian ${DEBIAN_RELEASE} ${DEB_ARCH} (kernel + rootfs)"
 echo ""
 
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -23,7 +32,7 @@ fi
 
 if [ ! -f "$GUEST_BINARY" ]; then
     echo "ERROR: Guest binary not found at ${GUEST_BINARY}"
-    echo "       Run: cargo build -p shuru-guest --target aarch64-unknown-linux-musl --release"
+    echo "       Run: cargo build -p shuru-guest --target ${GUEST_TARGET} --release"
     exit 1
 fi
 
@@ -38,7 +47,20 @@ else
     echo "==> Kernel already present."
 fi
 
-if [ ! -f "$INITRAMFS_PATH" ]; then
+# The agent is PID 1 and needs stdio before main runs. Without a console
+# the kernel can drive, as under KVM, the device nodes give it one.
+if [ ! -f "$INITRAMFS_PATH" ] && [[ "$(uname)" == "Linux" ]]; then
+    echo "==> Building minimal initramfs..."
+    command -v cpio &>/dev/null || { sudo apt-get update && sudo apt-get install -y cpio; }
+    INITRAMFS_DIR=$(mktemp -d)
+    mkdir -p "${INITRAMFS_DIR}/dev" "${INITRAMFS_DIR}/newroot"
+    sudo mknod -m 600 "${INITRAMFS_DIR}/dev/console" c 5 1
+    sudo mknod -m 666 "${INITRAMFS_DIR}/dev/null" c 1 3
+    install -m 755 "$GUEST_BINARY" "${INITRAMFS_DIR}/init"
+    (cd "$INITRAMFS_DIR" && find . | cpio -o -H newc 2>/dev/null) > "$INITRAMFS_PATH"
+    sudo rm -rf "$INITRAMFS_DIR"
+    echo "    Initramfs saved to ${INITRAMFS_PATH}"
+elif [ ! -f "$INITRAMFS_PATH" ]; then
     echo "==> Building minimal initramfs..."
 
     docker run --rm \
@@ -50,8 +72,6 @@ if [ ! -f "$INITRAMFS_PATH" ]; then
             apt-get update -qq > /dev/null 2>&1
             apt-get install -y -qq cpio > /dev/null 2>&1
             mkdir -p /initramfs/dev /initramfs/newroot
-            # The agent is PID 1 and needs stdio before main runs. Without a
-            # console the kernel can drive, as under KVM, these give it one.
             mknod -m 600 /initramfs/dev/console c 5 1
             mknod -m 666 /initramfs/dev/null c 1 3
             cp /tmp/shuru-init /initramfs/init
@@ -133,7 +153,7 @@ else
     sudo mount -o loop "$ROOTFS_IMG" "$MOUNT_DIR"
 
     echo "==> Running debootstrap (this may take a few minutes)..."
-    sudo debootstrap --arch=arm64 --variant=minbase "${DEBIAN_RELEASE}" "$MOUNT_DIR" http://deb.debian.org/debian
+    sudo debootstrap --arch="${DEB_ARCH}" --variant=minbase "${DEBIAN_RELEASE}" "$MOUNT_DIR" http://deb.debian.org/debian
 
     sudo mkdir -p "${MOUNT_DIR}/etc/dpkg/dpkg.cfg.d"
     cat <<'DPKGEOF' | sudo tee "${MOUNT_DIR}/etc/dpkg/dpkg.cfg.d/01-nodoc" > /dev/null
