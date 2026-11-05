@@ -50,7 +50,7 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 2)]
     cpus: usize,
     /// Guest memory of each new sandbox, in MiB.
-    #[arg(long, default_value_t = 2048)]
+    #[arg(long, default_value_t = 8192)]
     memory: u64,
     /// Size of the disk of each sandbox, in GiB. A smaller disk, a copy of
     /// the base or one made before the size was raised, is grown, sparse,
