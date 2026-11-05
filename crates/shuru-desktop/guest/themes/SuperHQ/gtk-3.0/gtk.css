@@ -82,9 +82,12 @@ headerbar button.titlebutton.minimize, .titlebar button.titlebutton.minimize {
 headerbar button.titlebutton.maximize, .titlebar button.titlebutton.maximize {
   background-color: #4cc777; box-shadow: inset 0 0 0 1px #3aa863, inset 0 2px 0 #74d696, 0 1px 0 #dcdce0;
 }
-headerbar:hover button.titlebutton.close, .titlebar:hover button.titlebutton.close { color: #4d0f0b; }
-headerbar:hover button.titlebutton.minimize, .titlebar:hover button.titlebutton.minimize { color: #5a4205; }
-headerbar:hover button.titlebutton.maximize, .titlebar:hover button.titlebutton.maximize { color: #0d4223; }
+headerbar:hover button.titlebutton.close, .titlebar:hover button.titlebutton.close,
+headerbar button.titlebutton.close:hover, .titlebar button.titlebutton.close:hover { color: #4d0f0b; }
+headerbar:hover button.titlebutton.minimize, .titlebar:hover button.titlebutton.minimize,
+headerbar button.titlebutton.minimize:hover, .titlebar button.titlebutton.minimize:hover { color: #5a4205; }
+headerbar:hover button.titlebutton.maximize, .titlebar:hover button.titlebutton.maximize,
+headerbar button.titlebutton.maximize:hover, .titlebar button.titlebutton.maximize:hover { color: #0d4223; }
 headerbar button.titlebutton.close:active { background-color: #c4463f; box-shadow: inset 0 0 0 1px #c4463f; }
 headerbar button.titlebutton.minimize:active { background-color: #c9a737; box-shadow: inset 0 0 0 1px #c9a737; }
 headerbar button.titlebutton.maximize:active { background-color: #3aa863; box-shadow: inset 0 0 0 1px #3aa863; }
