@@ -210,8 +210,7 @@ impl Wm {
     pub(super) fn is_ours(&self, w: Window) -> bool {
         let o = &self.ours;
         [
-            o.check, o.panel, o.rail, o.empty, o.toast, o.tooltip, o.pop, o.snap, o.cursor,
-            o.ripple,
+            o.check, o.panel, o.rail, o.empty, o.tooltip, o.pop, o.snap, o.cursor, o.ripple,
         ]
         .contains(&w)
             || o.notes.contains(&w)
@@ -1208,7 +1207,6 @@ impl Wm {
         order.extend(&self.foreign);
         order.extend(self.ours.notes);
         order.extend([
-            self.ours.toast,
             self.ours.tooltip,
             self.ours.pop,
             self.ours.ripple,
@@ -1813,7 +1811,6 @@ impl Wm {
             }
         }
         self.layout_notes()?;
-        self.update_toast()?;
         self.settle.changed();
         self.chrome()
     }

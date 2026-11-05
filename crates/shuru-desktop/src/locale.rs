@@ -12,8 +12,6 @@ pub enum Lang {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Msg {
     Applications,
-    HandBack,
-    InControl,
     Agent,
     OpenWindows,
     NoMatches,
@@ -24,7 +22,6 @@ pub enum Msg {
     Search,
     Move,
     Close,
-    Paused,
 }
 
 /// The messages locale: LC_ALL, then LC_MESSAGES, then LANG.
@@ -92,8 +89,6 @@ pub fn text(lang: Lang, m: Msg) -> &'static str {
     match lang {
         Lang::En => match m {
             Applications => "Applications",
-            HandBack => "Hand back",
-            InControl => "You are in control",
             Agent => "Agent",
             OpenWindows => "Open windows",
             NoMatches => "No matches",
@@ -104,12 +99,9 @@ pub fn text(lang: Lang, m: Msg) -> &'static str {
             Search => "Search apps and windows, or type a URL",
             Move => "Move",
             Close => "Close",
-            Paused => "The agent is paused until you hand back",
         },
         Lang::ZhHans => match m {
             Applications => "应用程序",
-            HandBack => "交还控制",
-            InControl => "由你控制",
             Agent => "智能体",
             OpenWindows => "已打开的窗口",
             NoMatches => "无匹配项",
@@ -120,7 +112,6 @@ pub fn text(lang: Lang, m: Msg) -> &'static str {
             Search => "搜索应用和窗口，或输入网址",
             Move => "移动",
             Close => "关闭",
-            Paused => "智能体已暂停，直到你交还控制",
         },
     }
 }
@@ -201,8 +192,6 @@ mod tests {
         use Msg::*;
         for m in [
             Applications,
-            HandBack,
-            InControl,
             Agent,
             OpenWindows,
             NoMatches,
@@ -213,7 +202,6 @@ mod tests {
             Search,
             Move,
             Close,
-            Paused,
         ] {
             assert_ne!(text(Lang::ZhHans, m), text(Lang::En, m));
         }
