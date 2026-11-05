@@ -7,7 +7,7 @@ use x11rb::protocol::xproto::*;
 use x11rb::{CURRENT_TIME, NONE};
 
 use super::menu::Anchor;
-use super::{Place, Target, Who, Wm, R};
+use super::{Place, Target, Wm, R};
 use crate::chrome::{self, Light, PanelHit, BAR_H, PANEL_H};
 
 const DRAG_START: i32 = 4;
@@ -47,19 +47,13 @@ pub(super) enum Drag {
         win: Window,
         light: Light,
     },
-    HandBack,
 }
 
 impl Drag {
     pub(super) fn window(&self) -> Window {
         match self {
             Drag::Move { win, .. } | Drag::Resize { win, .. } | Drag::Light { win, .. } => *win,
-            Drag::HandBack => NONE,
         }
-    }
-
-    pub(super) fn moves_window(&self) -> bool {
-        matches!(self, Drag::Move { started: true, .. })
     }
 }
 
@@ -87,7 +81,6 @@ impl Wm {
         }
         self.conn.ungrab_pointer(CURRENT_TIME)?;
         self.show_snap(None)?;
-        self.update_toast()?;
         self.restack()
     }
 
@@ -108,12 +101,7 @@ impl Wm {
                             self.open_app_menu(t, Anchor::Panel)?;
                         }
                     }
-                    Some(PanelHit::HandBack) if self.grab_pointer(self.cursors.arrow)? => {
-                        self.drag = Some(Drag::HandBack);
-                        self.panel_pressed = Some(PanelHit::HandBack);
-                        self.draw_panel()?;
-                    }
-                    _ => {}
+                    None => {}
                 }
             }
         } else if w == self.ours.rail {
@@ -408,7 +396,7 @@ impl Wm {
         if let Some(Drag::Move { started, .. }) = &mut self.drag {
             *started = true;
         }
-        self.update_toast()
+        Ok(())
     }
 
     pub(super) fn button_release(&mut self, e: &ButtonReleaseEvent) -> Result<()> {
@@ -473,16 +461,6 @@ impl Wm {
                         Light::Minimize => self.minimize(win)?,
                         Light::Maximize => self.toggle_maximized(win)?,
                     }
-                }
-            }
-            Some(Drag::HandBack) => {
-                self.end_drag()?;
-                self.panel_pressed = None;
-                let hit = self.panel_layout.hit(x as f32, y as f32);
-                if hit == Some(PanelHit::HandBack) {
-                    self.set_who(Some(Who::Agent))?;
-                } else {
-                    self.draw_panel()?;
                 }
             }
             None => {}

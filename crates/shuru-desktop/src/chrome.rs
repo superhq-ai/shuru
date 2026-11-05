@@ -1,6 +1,5 @@
 //! What the desktop draws itself: the panel, the rail, title bars, window
-//! corners, menus, the toast, the click ripple and the cursor. Pure pixels,
-//! no X.
+//! corners, menus, the click ripple and the cursor. Pure pixels, no X.
 
 use std::f32::consts::{FRAC_PI_2, PI};
 
@@ -16,7 +15,6 @@ pub const RADIUS: f32 = 12.0;
 /// The corner piece of a frame: the radius and the ring.
 pub const CORNER: u16 = 13;
 pub const RIPPLE: u16 = 44;
-pub const TOAST_H: u16 = 32;
 pub const TOOLTIP_H: u16 = 22;
 
 /// Rail items: 48 px at x 8, the first at y 40, 52 px apart.
@@ -59,7 +57,6 @@ fn dot(c: &mut Canvas, x: f32, cy: f32, d: f32, color: u32) {
 pub enum PanelHit {
     Apps,
     App,
-    HandBack,
 }
 
 pub struct PanelView<'a> {
@@ -67,7 +64,6 @@ pub struct PanelView<'a> {
     /// None, the agent (false) or a person (true).
     pub person: Option<bool>,
     pub hover: Option<PanelHit>,
-    pub pressed: Option<PanelHit>,
 }
 
 /// The spans of the panel controls.
@@ -75,7 +71,6 @@ pub struct PanelView<'a> {
 pub struct PanelLayout {
     pub apps: (f32, f32),
     pub app: Option<(f32, f32)>,
-    pub hand: Option<(f32, f32)>,
 }
 
 impl PanelLayout {
@@ -88,8 +83,6 @@ impl PanelLayout {
             Some(PanelHit::Apps)
         } else if self.app.is_some_and(inside) {
             Some(PanelHit::App)
-        } else if self.hand.is_some_and(inside) {
-            Some(PanelHit::HandBack)
         } else {
             None
         }
@@ -99,18 +92,14 @@ impl PanelLayout {
 const MARK_X: f32 = 8.0;
 const LABEL_X: f32 = 35.0;
 
-pub fn panel_layout(font: &mut Font, w: usize, view: &PanelView) -> PanelLayout {
+pub fn panel_layout(font: &mut Font, view: &PanelView) -> PanelLayout {
     let apps_w = (LABEL_X + font.width(tr(Msg::Applications), TEXT_SIZE) + 8.0).round();
     let apps = (4.0, apps_w);
     let app = view.app.map(|(name, _)| {
         let x = apps.0 + apps.1 + 4.0;
         (x, (32.0 + font.width(name, TEXT_SIZE) + 8.0).round())
     });
-    let hand = (view.person == Some(true)).then(|| {
-        let hw = (29.0 + font.width(tr(Msg::HandBack), SMALL_SIZE) + 11.0).round();
-        (w as f32 - 4.0 - hw, hw)
-    });
-    PanelLayout { apps, app, hand }
+    PanelLayout { apps, app }
 }
 
 /// The Applications control at (x, y) of its pill: the hq mark and label.
@@ -185,7 +174,7 @@ pub fn app_icon(
 pub fn panel(font: &mut Font, w: usize, view: &PanelView, layout: &PanelLayout) -> Canvas {
     let mut c = Canvas::new(w, PANEL_H as usize, theme().bg);
     let pill = |c: &mut Canvas, s: (f32, f32), hit: PanelHit| {
-        if view.hover == Some(hit) || view.pressed == Some(hit) {
+        if view.hover == Some(hit) {
             let r = Rect::new(s.0, CONTROL_Y, s.1, CONTROL_H);
             c.rounded_rect(r, 6.0, theme().hover);
             c.ring_in(r, 6.0, theme().hairline);
@@ -197,40 +186,14 @@ pub fn panel(font: &mut Font, w: usize, view: &PanelView, layout: &PanelLayout) 
         pill(&mut c, s, PanelHit::App);
         app_label(&mut c, font, s.0, CONTROL_Y, name, icon);
     }
-    let mid = mid_of(CONTROL_Y, CONTROL_H);
-    let state = |c: &mut Canvas, font: &mut Font, right: f32, label: &str, color: u32| {
-        let x = right - font.width(label, TEXT_SIZE) - 16.0;
-        dot(c, x, mid, 8.0, color);
-        font.draw(c, label, x + 16.0, mid, TEXT_SIZE, theme().text);
-    };
-    match (view.person, layout.hand) {
-        (Some(true), Some((hx, hw))) => {
-            let r = Rect::new(hx, CONTROL_Y, hw, CONTROL_H);
-            let style = if view.pressed == Some(PanelHit::HandBack) {
-                Raised::pressed(theme().hand_pressed.0, theme().hand_pressed.1)
-            } else {
-                theme().hand_back
-            };
-            c.raised(r, 6.0, style);
-            c.glyph(
-                &glyphs::HAND,
-                (hx + 7.0) as i32,
-                (CONTROL_Y + 4.0) as i32,
-                theme().hand_text,
-                1.0,
-            );
-            font.draw(
-                &mut c,
-                tr(Msg::HandBack),
-                hx + 29.0,
-                mid,
-                SMALL_SIZE,
-                theme().hand_text,
-            );
-            state(&mut c, font, hx - 20.0, tr(Msg::InControl), theme().amber);
-        }
-        (Some(false), _) => state(&mut c, font, w as f32 - 4.0, tr(Msg::Agent), theme().green),
-        _ => {}
+    // Who has control shows only for the agent: a person in control sees
+    // it on the page, and the screen shows it as amber frames.
+    if view.person == Some(false) {
+        let mid = mid_of(CONTROL_Y, CONTROL_H);
+        let label = tr(Msg::Agent);
+        let x = w as f32 - 4.0 - font.width(label, TEXT_SIZE) - 16.0;
+        dot(&mut c, x, mid, 8.0, theme().green);
+        font.draw(&mut c, label, x + 16.0, mid, TEXT_SIZE, theme().text);
     }
     c
 }
@@ -375,22 +338,6 @@ pub fn note(
     );
     let mut m = Canvas::new(c.w, c.h, 0);
     m.rounded_rect(b.inset(-1.0), 11.0, 0xffffff);
-    (c, m)
-}
-
-/// The take over toast, and its shape.
-pub fn toast(font: &mut Font) -> (Canvas, Canvas) {
-    let w = (12.0 + 8.0 + 8.0 + font.width(tr(Msg::Paused), SMALL_SIZE) + 12.0).ceil();
-    let h = TOAST_H as f32;
-    let b = Rect::new(1.0, 1.0, w, h);
-    let mut c = Canvas::new(w as usize + 2, h as usize + 2, theme().bg);
-    c.rounded_rect(b, 8.0, theme().surface);
-    c.ring_out(b, 8.0, theme().hairline_hi);
-    let mid = 1.0 + h / 2.0;
-    dot(&mut c, 13.0, mid, 8.0, theme().amber);
-    font.draw(&mut c, tr(Msg::Paused), 29.0, mid, SMALL_SIZE, theme().text);
-    let mut m = Canvas::new(c.w, c.h, 0);
-    m.rounded_rect(b.inset(-1.0), 9.0, 0xffffff);
     (c, m)
 }
 
@@ -955,20 +902,35 @@ mod tests {
             app: Some(("Chromium", None)),
             person: Some(true),
             hover: None,
-            pressed: None,
         };
-        let l = panel_layout(&mut f, 1280, &view);
+        let l = panel_layout(&mut f, &view);
         assert_eq!(l.apps.0, 4.0);
-        let (ax, _) = l.app.unwrap();
+        let (ax, aw) = l.app.unwrap();
         assert_eq!(ax, l.apps.0 + l.apps.1 + 4.0);
-        let (hx, hw) = l.hand.unwrap();
-        assert_eq!(hx + hw, 1276.0);
         assert_eq!(l.hit(10.0, 10.0), Some(PanelHit::Apps));
         assert_eq!(l.hit(ax + 2.0, 10.0), Some(PanelHit::App));
-        assert_eq!(l.hit(hx + 2.0, 10.0), Some(PanelHit::HandBack));
-        assert_eq!(l.hit(hx + 2.0, 30.0), None);
+        assert_eq!(l.hit(ax + aw + 40.0, 10.0), None);
+        assert_eq!(l.hit(ax + 2.0, 30.0), None);
         let c = panel(&mut f, 1280, &view, &l);
         assert_eq!((c.w, c.h), (1280, 32));
+    }
+
+    #[test]
+    fn the_panel_shows_no_control_for_a_person() {
+        let mut f = Font::new();
+        let mut view = PanelView {
+            app: None,
+            person: Some(true),
+            hover: None,
+        };
+        let l = panel_layout(&mut f, &view);
+        let person = panel(&mut f, 1280, &view, &l);
+        view.person = None;
+        let nobody = panel(&mut f, 1280, &view, &l);
+        assert!(person.px == nobody.px);
+        view.person = Some(false);
+        let agent = panel(&mut f, 1280, &view, &l);
+        assert!(agent.px != nobody.px);
     }
 
     #[test]

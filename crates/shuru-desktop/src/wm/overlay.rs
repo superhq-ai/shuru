@@ -1,6 +1,6 @@
 //! Our own windows: the panel, the rail, the title bars and corners of
-//! frames, the empty desktop line, the toast, the tooltip, the snap
-//! preview, the click ripple and the cursor.
+//! frames, the empty desktop line, the tooltip, the snap preview, the
+//! click ripple and the cursor.
 
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use x11rb::wrapper::ConnectionExt as _;
 use super::{within, Entry, Place, Target, Who, Wm, R};
 use crate::appearance;
 use crate::chrome::{
-    self, BarView, PanelView, RailItem, CORNER, ITEM, PANEL_H, RAIL_W, RIPPLE, TOAST_H, TOOLTIP_H,
+    self, BarView, PanelView, RailItem, CORNER, ITEM, PANEL_H, RAIL_W, RIPPLE, TOOLTIP_H,
 };
 use crate::draw::{self, theme, Canvas};
 
@@ -37,7 +37,6 @@ impl Wm {
             }
         };
         add(self.empty_shown, self.empty_rect);
-        add(self.toast_shown, self.toast_rect);
         add(self.tooltip_for.is_some(), self.tooltip_rect);
         add(self.cursor_shown, self.cursor_rect);
         add(self.ripple_until.is_some(), self.ripple_rect);
@@ -148,9 +147,6 @@ impl Wm {
             self.draw_rail()
         } else if w == o.empty {
             self.draw_empty()
-        } else if w == o.toast {
-            let (c, _) = chrome::toast(&mut self.font);
-            self.put(w, &c, 0, 0)
         } else if w == o.tooltip {
             self.draw_tooltip()
         } else if w == o.pop {
@@ -220,7 +216,6 @@ impl Wm {
             (o.rail, t.bg),
             (o.empty, t.bg),
             (o.ripple, t.bg),
-            (o.toast, t.surface),
             (o.tooltip, t.raised),
             (o.pop, t.surface),
             (o.snap, t.snap),
@@ -236,9 +231,7 @@ impl Wm {
         }
         self.conn.clear_area(false, self.root, 0, 0, 0, 0)?;
         let o = &self.ours;
-        let ours = [
-            o.panel, o.rail, o.empty, o.toast, o.tooltip, o.pop, o.snap, o.ripple,
-        ];
+        let ours = [o.panel, o.rail, o.empty, o.tooltip, o.pop, o.snap, o.ripple];
         for w in ours {
             self.redraw(w)?;
         }
@@ -289,31 +282,7 @@ impl Wm {
                 self.moved(self.empty_rect);
             }
         }
-        self.update_toast()?;
         self.restack()
-    }
-
-    pub(super) fn update_toast(&mut self) -> Result<()> {
-        let dragging = self.drag.as_ref().is_some_and(|d| d.moves_window());
-        let show = self.who == Some(Who::Person) && !dragging;
-        if show == self.toast_shown {
-            return Ok(());
-        }
-        self.toast_shown = show;
-        if !show {
-            self.conn.unmap_window(self.ours.toast)?;
-            self.moved(self.toast_rect);
-            return Ok(());
-        }
-        let (c, mask) = chrome::toast(&mut self.font);
-        let (wx, _, ww, _) = chrome::work_area(self.sw, self.sh);
-        let x = wx + (ww as i16 - c.w as i16) / 2;
-        let y = self.sh as i16 - 24 - TOAST_H as i16 - 1;
-        self.toast_rect = (x, y, c.w as u16, c.h as u16);
-        self.place_window(self.ours.toast, self.toast_rect)?;
-        self.shape(self.ours.toast, &mask)?;
-        self.conn.map_window(self.ours.toast)?;
-        self.put(self.ours.toast, &c, 0, 0)
     }
 
     fn draw_empty(&mut self) -> Result<()> {
@@ -338,9 +307,8 @@ impl Wm {
                 .map(|(n, i)| (n.as_str(), i.and_then(|i| self.entries[i].small.as_ref()))),
             person: self.who.map(|w| w == Who::Person),
             hover: self.panel_hover,
-            pressed: self.panel_pressed,
         };
-        let layout = chrome::panel_layout(&mut self.font, self.sw as usize, &view);
+        let layout = chrome::panel_layout(&mut self.font, &view);
         let c = chrome::panel(&mut self.font, self.sw as usize, &view, &layout);
         self.panel_layout = layout;
         self.put(self.ours.panel, &c, 0, 0)

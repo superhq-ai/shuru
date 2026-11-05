@@ -58,8 +58,11 @@ over is at home.
 ## The desktop
 
 - **Panel**, 32 px at the top: the Applications menu (search over apps
-  and windows, or a URL), the app in front and its menu, and who is in
-  control, with Hand back while a person has it.
+  and windows, or a URL), the app in front and its menu, and Agent while
+  the agent has control. Nothing on the screen moves control: a person
+  takes over and hands back on the page of the durable (durable RFC
+  0021), so no control is in a screenshot the agent sees or a click away
+  from it.
 - **Rail**, 64 px on the left: the configured apps and the running ones,
   dots for open windows, a fill for the app in front, a small dot for an
   app that asks for attention. A click focuses or starts; a right click,
@@ -80,8 +83,9 @@ over is at home.
   source 2) may still raise it.
 - **Keys.** Super opens the Applications menu, Alt+Tab cycles apps,
   Alt+` the windows of the app in front.
-- **Take over.** With `who` set to `person`, the panel says so, a toast
-  says the agent is paused, frames ring amber, and the click ripple stops.
+- **Take over.** With `who` set to `person`, frames ring amber and the
+  click ripple stops; the panel shows no control, and the page says who
+  has it.
 
 ## Window manager hints
 

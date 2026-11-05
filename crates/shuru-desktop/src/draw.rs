@@ -26,7 +26,7 @@ pub struct Raised {
 pub struct Theme {
     /// The desktop, the panel and the rail.
     pub bg: u32,
-    /// Menus, the toast and notifications.
+    /// Menus and notifications.
     pub surface: u32,
     /// Our title bars.
     pub winbar: u32,
@@ -49,10 +49,6 @@ pub struct Theme {
     /// The top highlight of a connected popover pill.
     pub pill_hi: u32,
     pub keycap: Raised,
-    pub hand_back: Raised,
-    pub hand_text: u32,
-    /// Fill and ring of Hand back while pressed.
-    pub hand_pressed: (u32, u32),
     /// The line under each window light.
     pub light_drop: u32,
     /// All three lights of a window that is not focused.
@@ -121,14 +117,6 @@ pub static DARK: Theme = Theme {
         hi: 0x2c2c31,
         shadow: 0x050506,
     },
-    hand_back: Raised {
-        fill: 0xf2f2f3,
-        ring: 0xc9c9cd,
-        hi: 0xffffff,
-        shadow: 0x050506,
-    },
-    hand_text: 0x0c0c0e,
-    hand_pressed: (0xdedee1, 0xc0c0c4),
     light_drop: 0x0c0c0e,
     light_idle: Raised {
         fill: 0x3a3a40,
@@ -160,14 +148,6 @@ pub static LIGHT: Theme = Theme {
         hi: 0xffffff,
         shadow: 0xd6d6db,
     },
-    hand_back: Raised {
-        fill: 0x18181b,
-        ring: 0x000000,
-        hi: 0x3a3a3f,
-        shadow: 0xc4c4ca,
-    },
-    hand_text: 0xffffff,
-    hand_pressed: (0x2c2c31, 0x000000),
     light_drop: 0xdcdce0,
     light_idle: Raised {
         fill: 0xd4d4d9,
@@ -526,7 +506,9 @@ impl Font {
         let mut buf = Buffer::new(&mut self.fonts, Metrics::new(size, size));
         buf.set_wrap(Wrap::None);
         buf.set_size(None, None);
-        let attrs = Attrs::new().family(Family::SansSerif).weight(Weight::MEDIUM);
+        let attrs = Attrs::new()
+            .family(Family::SansSerif)
+            .weight(Weight::MEDIUM);
         buf.set_text(text, &attrs, Shaping::Advanced, None);
         buf.shape_until_scroll(&mut self.fonts, false);
         let mut line = Line {
