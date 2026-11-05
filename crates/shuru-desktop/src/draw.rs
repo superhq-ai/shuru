@@ -460,13 +460,26 @@ struct Line {
 
 /// Text through cosmic-text: shaping, bidi and fallback to system fonts.
 pub struct Font {
-    fonts: FontSystem,
-    swash: SwashCache,
+    pub(crate) fonts: FontSystem,
+    pub(crate) swash: SwashCache,
     lines: HashMap<(String, u32), Line>,
     fits: HashMap<(String, u32, u32), String>,
 }
 
 impl Font {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(FONT.to_vec());
+        let family = db.faces().next().unwrap().families[0].0.clone();
+        db.set_sans_serif_family(family);
+        Self {
+            fonts: FontSystem::new_with_locale_and_db("en-US".into(), db),
+            swash: SwashCache::new(),
+            lines: HashMap::new(),
+            fits: HashMap::new(),
+        }
+    }
     pub fn new() -> Self {
         let mut db = fontdb::Database::new();
         db.load_font_data(FONT.to_vec());

@@ -85,6 +85,13 @@ async fn body<T: serde::de::DeserializeOwned>(request: Request<Incoming>) -> Res
 }
 
 #[derive(Deserialize)]
+struct TreeAction {
+    id: u64,
+    action: String,
+    value: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct NoteAction {
     key: Option<String>,
 }
@@ -134,6 +141,21 @@ async fn route(state: State, request: Request<Incoming>) -> Response<Body> {
     }
     match (method, path.as_str()) {
         (Method::GET, "/healthz") => json_reply(StatusCode::OK, json!({ "ok": true })),
+        (Method::GET, "/tree") => answer(state.wm.call(Cmd::Tree).await),
+        (Method::POST, "/tree/action") => match body::<TreeAction>(request).await {
+            Ok(b) => answer(
+                state
+                    .wm
+                    .call(|reply| Cmd::TreeAction {
+                        id: b.id,
+                        action: b.action,
+                        value: b.value,
+                        reply,
+                    })
+                    .await,
+            ),
+            Err(e) => error(StatusCode::BAD_REQUEST, e),
+        },
         (Method::GET, "/windows") => answer(state.wm.call(Cmd::Windows).await),
         (Method::POST, "/focus") => match body::<Focus>(request).await {
             Ok(b) => answer(
@@ -267,7 +289,7 @@ async fn route(state: State, request: Request<Incoming>) -> Response<Body> {
         (
             _,
             "/healthz" | "/windows" | "/focus" | "/close" | "/launch" | "/settle" | "/overlay"
-            | "/appearance" | "/notifications",
+            | "/appearance" | "/notifications" | "/tree" | "/tree/action",
         ) => error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
         _ => error(StatusCode::NOT_FOUND, format!("no route {path}")),
     }

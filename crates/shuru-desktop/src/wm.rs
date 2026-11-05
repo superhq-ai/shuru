@@ -47,6 +47,10 @@ x11rb::atom_manager! {
         _XSETTINGS_SETTINGS,
         WM_CHANGE_STATE,
         UTF8_STRING,
+        CLIPBOARD,
+        INCR,
+        TARGETS,
+        SHURU_PASTE,
         _NET_SUPPORTED,
         _NET_SUPPORTING_WM_CHECK,
         _NET_CLIENT_LIST,
@@ -113,6 +117,13 @@ type Reply = oneshot::Sender<Result<Value, (u16, String)>>;
 
 pub enum Cmd {
     Windows(Reply),
+    Tree(Reply),
+    TreeAction {
+        id: u64,
+        action: String,
+        value: Option<String>,
+        reply: Reply,
+    },
     Focus {
         id: u32,
         maximize: bool,
@@ -427,6 +438,7 @@ pub struct Wm {
     empty_shown: bool,
     empty_rect: R,
     pop: Option<menu::Pop>,
+    clipboard: String,
     drag: Option<input::Drag>,
     snap_rect: Option<R>,
     last_bar_click: Option<(Window, Timestamp)>,
@@ -552,6 +564,7 @@ pub fn start(
         empty_shown: false,
         empty_rect: (0, 0, 0, 0),
         pop: None,
+        clipboard: String::new(),
         drag: None,
         snap_rect: None,
         last_bar_click: None,
@@ -637,7 +650,10 @@ fn make_ours(conn: &RustConnection, screen: &Screen) -> Result<Ours> {
         rail: make(clicks, draw::theme().bg)?,
         empty: make(EventMask::EXPOSURE, draw::theme().bg)?,
         tooltip: make(EventMask::EXPOSURE, draw::theme().raised)?,
-        pop: make(clicks | EventMask::KEY_PRESS, draw::theme().surface)?,
+        pop: make(
+            clicks | EventMask::KEY_PRESS | EventMask::PROPERTY_CHANGE,
+            draw::theme().surface,
+        )?,
         snap: make(EventMask::EXPOSURE, draw::theme().snap)?,
         cursor: make(EventMask::EXPOSURE, 0)?,
         ripple: make(EventMask::EXPOSURE, draw::theme().bg)?,

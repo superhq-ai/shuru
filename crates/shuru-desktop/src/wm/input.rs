@@ -400,6 +400,7 @@ impl Wm {
     }
 
     pub(super) fn button_release(&mut self, e: &ButtonReleaseEvent) -> Result<()> {
+        self.pop_release();
         let Some(drag) = self.drag.take() else {
             return Ok(());
         };

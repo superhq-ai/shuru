@@ -21,6 +21,8 @@ mod locale;
 #[cfg(target_os = "linux")]
 mod server;
 #[cfg(target_os = "linux")]
+mod ui;
+#[cfg(target_os = "linux")]
 mod wm;
 
 #[cfg(target_os = "linux")]

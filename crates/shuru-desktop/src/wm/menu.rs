@@ -3,13 +3,18 @@
 //! window: the open pill and the sheet it flows into.
 
 use anyhow::Result;
+use cosmic_text::Edit;
+use serde_json::{json, Value};
 use x11rb::protocol::xproto::*;
+use x11rb::wrapper::ConnectionExt as _;
 use x11rb::CURRENT_TIME;
 
 use super::{Target, Wm, R};
-use crate::chrome::{self, Connected, PanelHit, Row, RowState, Side, ITEM, PANEL_H, SHEET_PAD};
+use crate::chrome::{self, Connected, PanelHit, Row, RowState, Side, ITEM, PANEL_H};
 use crate::draw::{Canvas, Rect};
 use crate::locale::{self, tr, Msg};
+use crate::ui::{text::Field, Tree};
+use accesskit::Role;
 
 const APPS_W: f32 = 320.0;
 const APP_W: f32 = 280.0;
@@ -74,8 +79,8 @@ pub(super) struct Pop {
     shape: Connected,
     rows: Vec<PRow>,
     query: String,
-    sel: Option<usize>,
-    hover: Option<usize>,
+    tree: Tree,
+    field: Option<Field>,
 }
 
 /// A window title without the trailing " - App" most apps add.
@@ -115,9 +120,30 @@ fn keysym_char(sym: u32) -> Option<char> {
 }
 
 impl Wm {
-    fn row_height_sum(rows: &[PRow]) -> f32 {
-        let fake: Vec<Row> = rows.iter().map(|r| Self::shape_row(r)).collect();
-        chrome::sheet_height(&fake)
+    fn menu_tree(rows: &[PRow], width: f32) -> Tree {
+        use std::hash::{Hash, Hasher};
+        let rows = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let (role, name, key) = match r {
+                    PRow::Search => (
+                        Role::TextInput,
+                        tr(Msg::Search).to_string(),
+                        "search".to_string(),
+                    ),
+                    PRow::Section(name) => (Role::Heading, name.clone(), format!("section:{name}")),
+                    PRow::Item { name, act, .. } | PRow::Action { name, act } => {
+                        (Role::MenuItem, name.clone(), format!("{act:?}"))
+                    }
+                    _ => (Role::Splitter, String::new(), format!("separator:{i}")),
+                };
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut hash);
+                (hash.finish(), role, name, Self::shape_row(r).height())
+            })
+            .collect();
+        Tree::new(rows, width)
     }
 
     /// A stand in of the right height for measuring.
@@ -344,7 +370,6 @@ impl Wm {
             }
             What::App(_, Anchor::Rail(i)) => {
                 let item = ITEM as f32;
-                let height = height.max(item + 20.0);
                 let iy = chrome::item_y(*i) as f32;
                 let pill = Rect::new(chrome::ITEM_X as f32, iy, item, item);
                 let x = chrome::RAIL_W as f32;
@@ -371,7 +396,13 @@ impl Wm {
         sel: Option<usize>,
     ) -> Result<()> {
         self.show_tooltip(None)?;
-        let height = Self::row_height_sum(&rows);
+        let width = match &what {
+            What::Apps => APPS_W,
+            What::App(_, Anchor::Panel) => APP_W.max(self.panel_layout.app.map_or(0.0, |(_, w)| w)),
+            _ => APP_W,
+        };
+        let mut tree = Self::menu_tree(&rows, width);
+        let height = tree.height.min(self.sh as f32 - SHEET_TOP - 8.0);
         let Some((pill, sheet, pill_r, side)) = self.pop_geometry(&what, height) else {
             return Ok(());
         };
@@ -388,8 +419,19 @@ impl Wm {
             side,
         };
         let had = self.pop.is_some();
-        if let Some(old) = self.pop.as_ref().map(|p| p.rect) {
+        let old_rect = self.pop.as_ref().map(|p| p.rect);
+        let field = self
+            .pop
+            .as_mut()
+            .and_then(|p| p.field.take())
+            .or_else(|| (what == What::Apps).then(|| Field::new(&mut self.font)));
+        if let Some(old) = old_rect.filter(|old| *old != rect) {
             self.moved(old);
+        }
+        tree.select(sel, shape.sheet.h);
+        if what == What::Apps {
+            tree.focused = Some(0);
+            tree.nodes[0].semantic.set_value(query.clone());
         }
         self.pop = Some(Pop {
             what,
@@ -397,20 +439,25 @@ impl Wm {
             shape,
             rows,
             query,
-            sel,
-            hover: None,
+            tree,
+            field,
         });
-        self.conn.configure_window(
-            self.ours.pop,
-            &ConfigureWindowAux::new()
-                .x(rect.0 as i32)
-                .y(rect.1 as i32)
-                .width(rect.2 as u32)
-                .height(rect.3 as u32),
-        )?;
-        let (_, mask) = chrome::connected(rect.2 as usize, rect.3 as usize, &shape);
-        self.shape(self.ours.pop, &mask)?;
-        self.conn.map_window(self.ours.pop)?;
+        if old_rect != Some(rect) {
+            self.conn.configure_window(
+                self.ours.pop,
+                &ConfigureWindowAux::new()
+                    .x(rect.0 as i32)
+                    .y(rect.1 as i32)
+                    .width(rect.2 as u32)
+                    .height(rect.3 as u32),
+            )?;
+            let (_, mask) = chrome::connected(rect.2 as usize, rect.3 as usize, &shape);
+            self.shape(self.ours.pop, &mask)?;
+        }
+        self.draw_pop()?;
+        if !had {
+            self.conn.map_window(self.ours.pop)?;
+        }
         if !had {
             self.panel_hover = None;
             self.rail_hover = None;
@@ -435,8 +482,7 @@ impl Wm {
                 GrabMode::ASYNC,
             )?;
         }
-        self.restack()?;
-        self.draw_pop()
+        self.restack()
     }
 
     pub(super) fn close_pop(&mut self) -> Result<()> {
@@ -451,7 +497,7 @@ impl Wm {
     }
 
     pub(super) fn draw_pop(&mut self) -> Result<()> {
-        let Some(p) = self.pop.take() else {
+        let Some(mut p) = self.pop.take() else {
             return Ok(());
         };
         let (w, h) = (p.rect.2 as usize, p.rect.3 as usize);
@@ -462,10 +508,12 @@ impl Wm {
             .iter()
             .enumerate()
             .map(|(i, r)| {
-                let state = if p.sel == Some(i) {
-                    RowState::Selected
-                } else if p.hover == Some(i) {
-                    RowState::Hover
+                let state = if p.tree.selected == Some(i) {
+                    if p.tree.pointer {
+                        RowState::Hover
+                    } else {
+                        RowState::Selected
+                    }
                 } else {
                     RowState::Rest
                 };
@@ -502,7 +550,24 @@ impl Wm {
                 }
             })
             .collect();
-        chrome::sheet(&mut c, &mut self.font, p.shape.sheet, &rows);
+        let bounds = p.tree.bounds(p.shape.sheet);
+        let background = c.px.clone();
+        crate::ui::widgets::sheet(&mut c, &mut self.font, p.shape.sheet, &rows, &bounds);
+        if let Some(field) = &mut p.field {
+            let b = bounds[0];
+            field.draw(
+                &mut self.font,
+                &mut c,
+                Rect::new(b.x + 32.0, b.y + 5.0, b.w - 44.0, 18.0),
+            );
+        }
+        for y in 0..h {
+            if (y as f32) < p.shape.sheet.y || y as f32 >= p.shape.sheet.y + p.shape.sheet.h {
+                for x in p.shape.sheet.x as usize..(p.shape.sheet.x + p.shape.sheet.w) as usize {
+                    c.px[y * w + x] = background[y * w + x];
+                }
+            }
+        }
         let out = self.put(self.ours.pop, &c, 0, 0);
         self.pop = Some(p);
         out
@@ -534,19 +599,7 @@ impl Wm {
 
     /// The row under a point of the menu window, one that acts or not.
     fn any_row_at(p: &Pop, x: f32, y: f32) -> Option<usize> {
-        let s = p.shape.sheet;
-        if x < s.x + SHEET_PAD || x >= s.x + s.w - SHEET_PAD {
-            return None;
-        }
-        let mut top = s.y + SHEET_PAD;
-        for (i, r) in p.rows.iter().enumerate() {
-            let h = Self::shape_row(r).height();
-            if y >= top && y < top + h {
-                return Some(i);
-            }
-            top += h;
-        }
-        None
+        p.tree.hit(p.shape.sheet, x, y)
     }
 
     /// The row under a point of the menu window.
@@ -559,6 +612,15 @@ impl Wm {
             return Ok(());
         };
         let (px, py) = ((x - p.rect.0) as f32, (y - p.rect.1) as f32);
+        if p.field.as_ref().is_some_and(|f| f.dragging) {
+            let b = p.tree.bounds(p.shape.sheet)[0];
+            self.pop.as_mut().unwrap().field.as_mut().unwrap().pointer(
+                &mut self.font,
+                px - b.x - 32.0,
+                true,
+            );
+            return self.draw_pop();
+        }
         let hover = Self::row_at(p, px, py);
         let search = Self::any_row_at(p, px, py).is_some_and(|i| matches!(p.rows[i], PRow::Search));
         let cursor = if search {
@@ -566,11 +628,12 @@ impl Wm {
         } else {
             self.cursors.arrow
         };
-        let changed = hover != p.hover;
+        let changed = hover.is_some() && (hover != p.tree.selected || !p.tree.pointer);
         self.set_grab_cursor(cursor)?;
         if changed {
             if let Some(p) = &mut self.pop {
-                p.hover = hover;
+                p.tree.select(hover, p.shape.sheet.h);
+                p.tree.pointer = true;
             }
             self.draw_pop()?;
         }
@@ -582,6 +645,16 @@ impl Wm {
             return Ok(());
         };
         let (lx, ly) = ((e.root_x - p.rect.0) as f32, (e.root_y - p.rect.1) as f32);
+        if e.detail == 1
+            && Self::any_row_at(p, lx, ly).is_some_and(|i| matches!(p.rows[i], PRow::Search))
+        {
+            let b = p.tree.bounds(p.shape.sheet)[0];
+            let p = self.pop.as_mut().unwrap();
+            let field = p.field.as_mut().unwrap();
+            field.pointer(&mut self.font, lx - b.x - 32.0, false);
+            field.dragging = true;
+            return self.draw_pop();
+        }
         let pill = p.shape.pill;
         let on_pill = lx >= pill.x && lx < pill.x + pill.w && ly >= pill.y && ly < pill.y + pill.h;
         if let Some(i) = Self::row_at(p, lx, ly) {
@@ -682,17 +755,47 @@ impl Wm {
         if self.is_super(e.detail) {
             return self.close_pop();
         }
+        if ctrl
+            && matches!(base, 0x63 | 0x78 | 0x76)
+            && self.pop.as_ref().is_some_and(|p| p.what == What::Apps)
+        {
+            if base == 0x76 {
+                let field = self.pop.as_mut().unwrap().field.as_mut().unwrap();
+                if field.paste_pending {
+                    return Ok(());
+                }
+                field.paste_pending = true;
+                self.conn.convert_selection(
+                    self.ours.pop,
+                    self.atoms.CLIPBOARD,
+                    self.atoms.UTF8_STRING,
+                    self.atoms.SHURU_PASTE,
+                    CURRENT_TIME,
+                )?;
+            } else {
+                let field = self.pop.as_mut().unwrap().field.as_mut().unwrap();
+                if let Some(text) = field.editor.copy_selection() {
+                    self.clipboard = text;
+                    self.conn.set_selection_owner(
+                        self.ours.check,
+                        self.atoms.CLIPBOARD,
+                        CURRENT_TIME,
+                    )?;
+                    if base == 0x78 {
+                        field.editor.delete_selection();
+                        self.refresh_query()?;
+                    }
+                }
+            }
+            return Ok(());
+        }
         let Some(p) = &self.pop else {
             return Ok(());
         };
-        let acts: Vec<usize> = (0..p.rows.len())
-            .filter(|&i| p.rows[i].act().is_some())
-            .collect();
-        let at = p.sel.and_then(|s| acts.iter().position(|&a| a == s));
         match base {
             0xff1b => return self.close_pop(),
             0xff0d | 0xff8d => {
-                let act = p.sel.and_then(|i| p.rows[i].act().cloned());
+                let act = p.tree.selected.and_then(|i| p.rows[i].act().cloned());
                 if act.is_some() {
                     self.close_pop()?;
                     if let Some(a) = act {
@@ -701,34 +804,220 @@ impl Wm {
                 }
                 return Ok(());
             }
-            0xff52 | 0xff54 if !acts.is_empty() => {
-                let n = acts.len();
-                let next = match (at, base == 0xff54) {
-                    (None, true) => 0,
-                    (None, false) => n - 1,
-                    (Some(i), true) => (i + 1) % n,
-                    (Some(i), false) => (i + n - 1) % n,
-                };
-                let sel = Some(acts[next]);
+            0xff52 | 0xff54 => {
                 if let Some(p) = &mut self.pop {
-                    p.sel = sel;
+                    p.tree.step(base == 0xff54, p.shape.sheet.h);
                 }
                 return self.draw_pop();
             }
             _ => {}
         }
-        if p.what != What::Apps || ctrl {
+        if p.what != What::Apps {
             return Ok(());
         }
-        let mut query = p.query.clone();
-        if base == 0xff08 {
-            if query.pop().is_none() {
-                return Ok(());
-            }
-        } else if let Some(ch) = keysym_char(sym) {
-            query.push(ch);
-        } else {
+        let Some(p) = &mut self.pop else {
             return Ok(());
+        };
+        if !p
+            .field
+            .as_mut()
+            .unwrap()
+            .key(&mut self.font, base, keysym_char(sym), shift, ctrl)
+        {
+            return Ok(());
+        }
+        self.refresh_query()
+    }
+
+    pub(super) fn pop_release(&mut self) {
+        if let Some(field) = self.pop.as_mut().and_then(|p| p.field.as_mut()) {
+            field.dragging = false;
+        }
+    }
+
+    pub(super) fn shell_tree(&self) -> Value {
+        // Other shell surfaces can join this list when they use retained nodes.
+        self.pop.as_ref().map_or_else(
+            || json!([]),
+            |p| p.tree.json(p.shape.sheet, (p.rect.0, p.rect.1)),
+        )
+    }
+
+    pub(super) fn tree_action(
+        &mut self,
+        id: u64,
+        action: &str,
+        value: Option<String>,
+    ) -> std::result::Result<Value, (u16, String)> {
+        let p = self.pop.as_mut().ok_or((404, "no open UI".into()))?;
+        if id == u64::MAX {
+            return Err((400, "unsupported action".into()));
+        }
+        let i = p
+            .tree
+            .nodes
+            .iter()
+            .position(|n| n.id.0 == id)
+            .ok_or((404, "no such node".into()))?;
+        let supported = match action {
+            "click" => accesskit::Action::Click,
+            "focus" => accesskit::Action::Focus,
+            "set_value" => accesskit::Action::SetValue,
+            _ => return Err((400, "unknown action".into())),
+        };
+        if !p.tree.nodes[i].semantic.supports_action(supported) {
+            return Err((400, "unsupported action".into()));
+        }
+        let out = match action {
+            "click" => {
+                let act = p.rows[i].act().cloned().unwrap();
+                self.close_pop().and_then(|()| self.run_act(act))
+            }
+            "focus" => {
+                p.tree.focused = Some(i);
+                if p.rows[i].act().is_some() {
+                    p.tree.select(Some(i), p.shape.sheet.h);
+                }
+                self.draw_pop()
+            }
+            _ => {
+                let value = value.ok_or((400, "value is required".into()))?;
+                let field = p.field.as_mut().unwrap();
+                field.key(&mut self.font, 0x61, None, false, true);
+                field.insert(&value);
+                self.refresh_query()
+            }
+        };
+        out.map(|()| json!({"ok":true}))
+            .map_err(|e| (500, e.to_string()))
+    }
+
+    pub(super) fn clipboard_request(&self, e: &SelectionRequestEvent) -> Result<()> {
+        let property = if e.property == x11rb::NONE {
+            e.target
+        } else {
+            e.property
+        };
+        let mut accepted = false;
+        if e.selection == self.atoms.CLIPBOARD {
+            if e.target == self.atoms.UTF8_STRING {
+                self.conn.change_property8(
+                    PropMode::REPLACE,
+                    e.requestor,
+                    property,
+                    self.atoms.UTF8_STRING,
+                    self.clipboard.as_bytes(),
+                )?;
+                accepted = true;
+            } else if e.target == self.atoms.TARGETS {
+                self.conn.change_property32(
+                    PropMode::REPLACE,
+                    e.requestor,
+                    property,
+                    AtomEnum::ATOM,
+                    &[self.atoms.TARGETS, self.atoms.UTF8_STRING],
+                )?;
+                accepted = true;
+            }
+        }
+        let event = SelectionNotifyEvent {
+            response_type: SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            time: e.time,
+            requestor: e.requestor,
+            selection: e.selection,
+            target: e.target,
+            property: if accepted { property } else { x11rb::NONE },
+        };
+        self.conn
+            .send_event(false, e.requestor, EventMask::NO_EVENT, event)?;
+        Ok(())
+    }
+
+    pub(super) fn clipboard_paste(&mut self, e: &SelectionNotifyEvent) -> Result<()> {
+        if e.requestor != self.ours.pop || e.selection != self.atoms.CLIPBOARD {
+            return Ok(());
+        }
+        let Some(field) = self
+            .pop
+            .as_mut()
+            .and_then(|p| p.field.as_mut())
+            .filter(|f| f.paste_pending)
+        else {
+            return Ok(());
+        };
+        if e.property == x11rb::NONE {
+            field.paste_pending = false;
+            return Ok(());
+        }
+        if e.property != self.atoms.SHURU_PASTE {
+            return Ok(());
+        }
+        let reply = self
+            .conn
+            .get_property(true, self.ours.pop, e.property, AtomEnum::ANY, 0, u32::MAX)?
+            .reply()?;
+        if reply.type_ == self.atoms.INCR {
+            field.paste_chunks = Some(Vec::new());
+            return Ok(());
+        }
+        field.paste_pending = false;
+        if reply.type_ == self.atoms.UTF8_STRING && reply.format == 8 {
+            if let Ok(text) = std::str::from_utf8(&reply.value) {
+                field.insert(text);
+                self.refresh_query()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn clipboard_chunk(&mut self, e: &PropertyNotifyEvent) -> Result<()> {
+        if e.state != Property::NEW_VALUE {
+            return Ok(());
+        }
+        let Some(field) = self
+            .pop
+            .as_mut()
+            .and_then(|p| p.field.as_mut())
+            .filter(|f| f.paste_chunks.is_some())
+        else {
+            return Ok(());
+        };
+        let reply = self
+            .conn
+            .get_property(true, self.ours.pop, e.atom, AtomEnum::ANY, 0, u32::MAX)?
+            .reply()?;
+        if reply.type_ != self.atoms.UTF8_STRING || reply.format != 8 {
+            field.paste_chunks = None;
+            field.paste_pending = false;
+            return Ok(());
+        }
+        if reply.value.is_empty() {
+            let bytes = field.paste_chunks.take().unwrap();
+            field.paste_pending = false;
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                field.insert(text);
+                self.refresh_query()?;
+            }
+        } else {
+            field
+                .paste_chunks
+                .as_mut()
+                .unwrap()
+                .extend_from_slice(&reply.value);
+        }
+        Ok(())
+    }
+
+    fn refresh_query(&mut self) -> Result<()> {
+        let query = self
+            .pop
+            .as_ref()
+            .and_then(|p| p.field.as_ref())
+            .map(Field::value)
+            .unwrap_or_default();
+        if self.pop.as_ref().is_some_and(|p| p.query == query) {
+            return self.draw_pop();
         }
         let rows = self.apps_rows(&query);
         let sel = Self::first_act(&rows);

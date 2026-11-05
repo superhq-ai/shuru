@@ -4,7 +4,7 @@
 use std::f32::consts::{FRAC_PI_2, PI};
 
 use crate::draw::{self, theme, Canvas, Font, Image, Raised, Rect};
-use crate::glyphs::{self, Glyph};
+use crate::glyphs;
 use crate::locale::{tr, Msg};
 
 pub const PANEL_H: u16 = 32;
@@ -25,7 +25,6 @@ pub const ITEM_PITCH: i16 = 52;
 
 const TEXT_SIZE: f32 = 13.0;
 const SMALL_SIZE: f32 = 12.0;
-const LABEL_SIZE: f32 = 11.0;
 const CONTROL_Y: f32 = 4.0;
 const CONTROL_H: f32 = 24.0;
 
@@ -601,6 +600,11 @@ impl Connected {
             arc(r + FILLET, s - FILLET, FILLET - d, PI, FRAC_PI_2);
             arc(s_r - SHEET_R, s + SHEET_R, SHEET_R + d, 1.5 * PI, 2.0 * PI);
         }
+        if s_r < r - 0.5 {
+            let neck = ((r - s_r) / 2.0).min(6.0);
+            arc(r - neck, s - neck, neck + d, 0.0, FRAC_PI_2);
+            arc(s_r + neck, s + neck, neck - d, 1.5 * PI, PI);
+        }
         arc(s_r - SHEET_R, b - SHEET_R, SHEET_R + d, 0.0, FRAC_PI_2);
         arc(s_l + SHEET_R, b - SHEET_R, SHEET_R + d, FRAC_PI_2, PI);
         pts
@@ -632,211 +636,9 @@ pub fn connected(w: usize, h: usize, shape: &Connected) -> (Canvas, Canvas) {
     (c, m)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RowState {
-    Rest,
-    Hover,
-    Selected,
-}
-
-pub enum Row<'a> {
-    Search {
-        query: &'a str,
-        placeholder: &'a str,
-    },
-    Section(&'a str),
-    /// An app, a window or a URL: 26 px with a 16 px icon.
-    Item {
-        name: &'a str,
-        icon: Option<&'a Image>,
-        icon_name: &'a str,
-        detail: Option<&'a str>,
-        current: bool,
-        minimized: bool,
-        state: RowState,
-    },
-    /// 24 px, text only.
-    Action {
-        name: &'a str,
-        hint: Option<&'a str>,
-        state: RowState,
-    },
-    Sep,
-    Footer,
-}
-
-pub const SHEET_PAD: f32 = 5.0;
-
-impl Row<'_> {
-    pub fn height(&self) -> f32 {
-        match self {
-            Row::Search { .. } => 30.0,
-            Row::Section(_) => 22.0,
-            Row::Item { .. } => 26.0,
-            Row::Action { .. } => 24.0,
-            Row::Sep => 9.0,
-            Row::Footer => 5.0 + 29.0 - SHEET_PAD,
-        }
-    }
-}
-
-/// The height of a sheet holding `rows`.
-pub fn sheet_height(rows: &[Row]) -> f32 {
-    2.0 * SHEET_PAD + rows.iter().map(Row::height).sum::<f32>()
-}
-
-/// Draws the rows into the sheet `s` of a canvas.
-pub fn sheet(c: &mut Canvas, font: &mut Font, s: Rect, rows: &[Row]) {
-    let x = s.x + SHEET_PAD;
-    let w = s.w - 2.0 * SHEET_PAD;
-    let mut y = s.y + SHEET_PAD;
-    for row in rows {
-        let h = row.height();
-        match row {
-            Row::Search { query, placeholder } => {
-                let b = Rect::new(x, y, w, 28.0);
-                c.rounded_rect(b, 6.0, theme().bg);
-                c.ring_in(b, 6.0, theme().hairline_hi);
-                c.glyph(
-                    &glyphs::SEARCH,
-                    (x + 8.0) as i32,
-                    (y + 6.0) as i32,
-                    theme().dim,
-                    1.0,
-                );
-                let mid = y + 14.0;
-                let caret = if query.is_empty() {
-                    font.draw(c, placeholder, x + 34.0, mid, TEXT_SIZE, theme().dim);
-                    x + 32.0
-                } else {
-                    let q = font.fit(query, TEXT_SIZE, w - 44.0);
-                    x + 32.0
-                        + font
-                            .draw(c, &q, x + 32.0, mid, TEXT_SIZE, theme().text)
-                            .round()
-                };
-                c.fill_rect(caret as usize, (y + 7.0) as usize, 1, 14, theme().text);
-            }
-            Row::Section(label) => {
-                font.draw(c, label, x + 8.0, y + 12.0, LABEL_SIZE, theme().dim);
-            }
-            Row::Item {
-                name,
-                icon,
-                icon_name,
-                detail,
-                current,
-                minimized,
-                state,
-            } => {
-                row_fill(c, Rect::new(x, y, w, h), *state);
-                let mid = y + h / 2.0;
-                let opacity = if *minimized { 0.5 } else { 1.0 };
-                app_icon(c, font, *icon, icon_name, x + 8.0, y + 5.0, 16, opacity);
-                let mut right = x + w - 8.0;
-                if *current {
-                    dot(c, right - 7.0, mid, 5.0, theme().text);
-                    right -= 15.0;
-                }
-                let detail = if *minimized {
-                    Some(tr(Msg::Minimized))
-                } else {
-                    *detail
-                };
-                if let Some(d) = detail {
-                    let dw = font.width(d, SMALL_SIZE);
-                    font.draw(c, d, (right - dw).round(), mid, SMALL_SIZE, theme().dim);
-                    right -= dw + 8.0;
-                }
-                let color = if *minimized {
-                    theme().dim
-                } else {
-                    theme().text
-                };
-                let n = font.fit(name, TEXT_SIZE, right - (x + 32.0));
-                font.draw(c, &n, x + 32.0, mid, TEXT_SIZE, color);
-            }
-            Row::Action { name, hint, state } => {
-                row_fill(c, Rect::new(x, y, w, h), *state);
-                let mid = y + h / 2.0;
-                let mut right = x + w - 8.0;
-                if let Some(k) = hint {
-                    let kw = font.width(k, SMALL_SIZE);
-                    font.draw(c, k, (right - kw).round(), mid, SMALL_SIZE, theme().dim);
-                    right -= kw + 8.0;
-                }
-                let n = font.fit(name, TEXT_SIZE, right - (x + 8.0));
-                font.draw(c, &n, x + 8.0, mid, TEXT_SIZE, theme().text);
-            }
-            Row::Sep => {
-                c.fill_rect(
-                    (x + 3.0) as usize,
-                    (y + 4.0) as usize,
-                    (w - 6.0) as usize,
-                    1,
-                    theme().hairline,
-                );
-            }
-            Row::Footer => footer(c, font, s, y + 5.0),
-        }
-        y += h;
-    }
-}
-
-fn row_fill(c: &mut Canvas, b: Rect, state: RowState) {
-    match state {
-        RowState::Rest => {}
-        RowState::Hover => c.rounded_rect(b, 5.0, theme().hover),
-        RowState::Selected => c.rounded_rect(b, 5.0, theme().selected),
-    }
-}
-
-/// The key hints under the Applications menu, from `y`.
-fn footer(c: &mut Canvas, font: &mut Font, s: Rect, y: f32) {
-    c.fill_rect(
-        s.x as usize + 1,
-        y as usize,
-        s.w as usize - 2,
-        1,
-        theme().hairline,
-    );
-    let mid = y + 1.0 + 14.0;
-    let key_y = mid - 9.0;
-    let mut x = s.x + 13.0;
-    let key = |c: &mut Canvas, font: &mut Font, x: &mut f32, g: Option<&Glyph>, t: &str| {
-        let w = match g {
-            Some(_) => 18.0,
-            None => (8.0 + font.width(t, LABEL_SIZE)).round(),
-        };
-        c.raised(Rect::new(*x, key_y, w, 18.0), 4.0, theme().keycap);
-        match g {
-            Some(g) => c.glyph(
-                g,
-                (*x + 1.0) as i32,
-                (key_y + 1.0) as i32,
-                theme().text,
-                1.0,
-            ),
-            None => {
-                font.draw(c, t, *x + 4.0, key_y + 9.0, LABEL_SIZE, theme().text);
-            }
-        }
-        *x += w + 5.0;
-    };
-    let label = |c: &mut Canvas, font: &mut Font, x: &mut f32, t: &str, last: bool| {
-        *x += font.draw(c, t, *x, mid, SMALL_SIZE, theme().dim);
-        if !last {
-            *x += 5.0 + 8.0 + 5.0;
-        }
-    };
-    key(c, font, &mut x, Some(&glyphs::UP), "");
-    key(c, font, &mut x, Some(&glyphs::DOWN), "");
-    label(c, font, &mut x, tr(Msg::Move), false);
-    key(c, font, &mut x, Some(&glyphs::ENTER), "");
-    label(c, font, &mut x, tr(Msg::Open), false);
-    key(c, font, &mut x, None, "Esc");
-    label(c, font, &mut x, tr(Msg::Close), true);
-}
+#[cfg(test)]
+use crate::ui::widgets::sheet_height;
+pub use crate::ui::widgets::{Row, RowState};
 
 /// A ring around a click, and its shape.
 pub fn ripple(person: bool) -> (Canvas, Canvas) {
@@ -1031,7 +833,22 @@ mod tests {
         let h = sheet_height(&rows);
         assert_eq!(h, 10.0 + 30.0 + 22.0 + 26.0 + 9.0 + 24.0 + 29.0);
         let mut c = Canvas::new(320, h as usize, theme().surface);
-        sheet(&mut c, &mut f, Rect::new(0.0, 0.0, 320.0, h), &rows);
+        let tree = crate::ui::Tree::new(
+            rows.iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    (
+                        i as u64,
+                        accesskit::Role::MenuItem,
+                        String::new(),
+                        r.height(),
+                    )
+                })
+                .collect(),
+            320.0,
+        );
+        let sheet = Rect::new(0.0, 0.0, 320.0, h);
+        crate::ui::widgets::sheet(&mut c, &mut f, sheet, &rows, &tree.bounds(sheet));
         assert!(c.px.contains(&theme().raised));
     }
 
@@ -1076,6 +893,27 @@ mod tests {
         assert_eq!(c.px[0], 0x804020);
         assert!(inside(&m, 0, 0));
         assert!(!inside(&m, 1, 0));
+    }
+
+    #[test]
+    fn a_short_rail_sheet_keeps_the_pill_and_row_visible() {
+        for side in [Side::Right, Side::RightUp] {
+            let sheet_y = if side == Side::Right { 0.0 } else { 14.0 };
+            let shape = Connected {
+                pill: Rect::new(0.0, 0.0, 48.0, 48.0),
+                sheet: Rect::new(56.0, sheet_y, 280.0, 34.0),
+                pill_r: 12.0,
+                side,
+            };
+            let (_, mask) = connected(336, 48, &shape);
+            assert!(inside(&mask, 24, 24));
+            assert!(inside(&mask, 200, sheet_y as usize + 17));
+            assert!(!inside(
+                &mask,
+                200,
+                if side == Side::Right { 47 } else { 0 }
+            ));
+        }
     }
 
     #[test]
