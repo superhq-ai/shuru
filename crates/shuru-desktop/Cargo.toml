@@ -1,6 +1,6 @@
 [package]
 name = "shuru-desktop"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "An X11 stacking window manager for a desktop an agent uses, with a panel, a rail, menus, overlays and an API on a unix socket"
 license = "Apache-2.0"
@@ -14,6 +14,9 @@ path = "src/main.rs"
 # Linux only. On other systems the binary only says so, which keeps
 # `cargo build --workspace` working there.
 [target.'cfg(target_os = "linux")'.dependencies]
+accesskit = "0.25"
+taffy = "0.15"
+tiny-skia = "0.12"
 anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }

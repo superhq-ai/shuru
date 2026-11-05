@@ -143,6 +143,11 @@ impl Wm {
                 }
             }
             Event::PropertyNotify(e)
+                if e.window == self.ours.pop && e.atom == self.atoms.SHURU_PASTE =>
+            {
+                self.clipboard_chunk(&e)?
+            }
+            Event::PropertyNotify(e)
                 if e.atom == self.atoms._GTK_FRAME_EXTENTS
                     && self.clients.contains_key(&e.window) =>
             {
@@ -183,6 +188,8 @@ impl Wm {
             Event::ButtonRelease(e) => self.button_release(&e)?,
             Event::MotionNotify(e) => self.motion(&e)?,
             Event::LeaveNotify(e) => self.leave(e.event)?,
+            Event::SelectionRequest(e) => self.clipboard_request(&e)?,
+            Event::SelectionNotify(e) => self.clipboard_paste(&e)?,
             Event::KeyPress(e) => self.key_press(&e)?,
             Event::KeyRelease(e) => self.key_release(&e)?,
             Event::MappingNotify(_) => self.grab_keys()?,
@@ -1529,6 +1536,18 @@ impl Wm {
 
     fn command(&mut self, cmd: Cmd) -> Result<()> {
         match cmd {
+            Cmd::Tree(reply) => {
+                let _ = reply.send(Ok(self.shell_tree()));
+            }
+            Cmd::TreeAction {
+                id,
+                action,
+                value,
+                reply,
+            } => {
+                let out = self.tree_action(id, &action, value);
+                let _ = reply.send(out);
+            }
             Cmd::Windows(reply) => {
                 let list: Vec<Value> = self.mru.iter().map(|&w| self.info(w)).collect();
                 let _ = reply.send(Ok(Value::Array(list)));

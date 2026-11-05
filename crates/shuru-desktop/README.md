@@ -52,6 +52,8 @@ HTTP on the unix socket, made with mode 0600. Bodies are JSON. Errors are
 | route | answers |
 |---|---|
 | `GET /healthz` | `{"ok": true}` |
+| `GET /tree` | the nodes of the open shell popup that agents see: `[{id, role, name, value, states, actions, bounds, children?}]`, empty when none is open; `role` is `menu`, `menu_item`, `search_input`, `heading` or `group`; `children` lists the ids of the seen nodes under a node; `bounds` are `{x, y, width, height}` in screen pixels; `states` are `{focused, selected, disabled, expanded}` |
+| `POST /tree/action {id, action, value?}` | acts on a shell node: `click`, `focus` or `set_value`; `set_value` requires a string `value`; answers `{ok: true}`, 404 for an absent node, 400 for an unsupported action |
 | `GET /windows` | `[{id, app, class, title, pid, focused, kind, fullscreen, state, geometry}]`, most recently focused first; `kind` is `normal`, `dialog`, `utility`, `splash`, `dock` or `popup`; `state` is `maximized`, `floating` or `minimized`; `geometry` is `{x, y, width, height}` of the window on screen |
 | `POST /focus {id, maximize?}` | the window, now focused; a main window is maximized unless `maximize` is false; 404 for an unknown id |
 | `POST /close {id}` | `{id, closing, how}`; `how` is `delete` (`WM_DELETE_WINDOW`) or `kill` for a window without it |
