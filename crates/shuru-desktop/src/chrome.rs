@@ -636,10 +636,6 @@ pub fn connected(w: usize, h: usize, shape: &Connected) -> (Canvas, Canvas) {
     (c, m)
 }
 
-#[cfg(test)]
-use crate::ui::widgets::sheet_height;
-pub use crate::ui::widgets::{Row, RowState};
-
 /// A ring around a click, and its shape.
 pub fn ripple(person: bool) -> (Canvas, Canvas) {
     let s = RIPPLE as usize;
@@ -802,54 +798,6 @@ mod tests {
         assert!(inside(&m, 24, 96));
         assert!(!inside(&m, 24, 20));
         assert!(inside(&m, 100, 20));
-    }
-
-    #[test]
-    fn sheets_fit_their_rows() {
-        let mut f = Font::new();
-        let rows = [
-            Row::Search {
-                query: "",
-                placeholder: "Search",
-            },
-            Row::Section("Applications"),
-            Row::Item {
-                name: "Terminal",
-                icon: None,
-                icon_name: "Terminal",
-                detail: Some("Shell"),
-                current: false,
-                minimized: false,
-                state: RowState::Selected,
-            },
-            Row::Sep,
-            Row::Action {
-                name: "Quit",
-                hint: None,
-                state: RowState::Hover,
-            },
-            Row::Footer,
-        ];
-        let h = sheet_height(&rows);
-        assert_eq!(h, 10.0 + 30.0 + 22.0 + 26.0 + 9.0 + 24.0 + 29.0);
-        let mut c = Canvas::new(320, h as usize, theme().surface);
-        let tree = crate::ui::Tree::new(
-            rows.iter()
-                .enumerate()
-                .map(|(i, r)| {
-                    (
-                        i as u64,
-                        accesskit::Role::MenuItem,
-                        String::new(),
-                        r.height(),
-                    )
-                })
-                .collect(),
-            320.0,
-        );
-        let sheet = Rect::new(0.0, 0.0, 320.0, h);
-        crate::ui::widgets::sheet(&mut c, &mut f, sheet, &rows, &tree.bounds(sheet));
-        assert!(c.px.contains(&theme().raised));
     }
 
     #[test]

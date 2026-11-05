@@ -10,14 +10,19 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::CURRENT_TIME;
 
 use super::{Target, Wm, R};
-use crate::chrome::{self, Connected, PanelHit, Row, RowState, Side, ITEM, PANEL_H};
-use crate::draw::{Canvas, Rect};
+use crate::chrome::{self, Connected, PanelHit, Side, ITEM, PANEL_H};
+use crate::draw::{Canvas, Font, Rect};
+use crate::glyphs;
 use crate::locale::{self, tr, Msg};
-use crate::ui::{text::Field, Tree};
+use crate::ui::text::Field;
+use crate::ui::widgets::{Content, Ink, Paint, LABEL_SIZE, SMALL_SIZE, TEXT_SIZE};
+use crate::ui::{style, Builder, Node, Style, Tree};
 use accesskit::Role;
 
 const APPS_W: f32 = 320.0;
 const APP_W: f32 = 280.0;
+const APP_MAX_W: f32 = 420.0;
+const SHEET_PAD: f32 = 5.0;
 const SHEET_TOP: f32 = 36.0;
 const PILL_Y: f32 = 4.0;
 const MAX_WINDOWS: usize = 8;
@@ -119,59 +124,225 @@ fn keysym_char(sym: u32) -> Option<char> {
     }
 }
 
-impl Wm {
-    fn menu_tree(rows: &[PRow], width: f32) -> Tree {
-        use std::hash::{Hash, Hasher};
-        let rows = rows
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let (role, name, key) = match r {
-                    PRow::Search => (
-                        Role::TextInput,
-                        tr(Msg::Search).to_string(),
-                        "search".to_string(),
-                    ),
-                    PRow::Section(name) => (Role::Heading, name.clone(), format!("section:{name}")),
-                    PRow::Item { name, act, .. } | PRow::Action { name, act } => {
-                        (Role::MenuItem, name.clone(), format!("{act:?}"))
-                    }
-                    _ => (Role::Splitter, String::new(), format!("separator:{i}")),
-                };
-                let mut hash = std::collections::hash_map::DefaultHasher::new();
-                key.hash(&mut hash);
-                (hash.finish(), role, name, Self::shape_row(r).height())
-            })
-            .collect();
-        Tree::new(rows, width)
-    }
+/// A stable id for a node agents see, from what it is.
+fn node_id(key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hash);
+    hash.finish()
+}
 
-    /// A stand in of the right height for measuring.
-    fn shape_row(r: &PRow) -> Row<'static> {
-        let state = RowState::Rest;
+/// The tree of a menu: a sheet of rows that sizes to them within the
+/// widths of `sheet`. `icon_name` names the app of an entry.
+fn menu_tree(
+    font: &mut Font,
+    sheet: Style,
+    id: &str,
+    name: &str,
+    rows: &[PRow],
+    icon_name: &dyn Fn(Option<usize>, &str) -> String,
+) -> Tree {
+    let text = |text: &str, size: f32, ink: Ink| Content::Text {
+        text: text.to_string(),
+        size,
+        ink,
+    };
+    let sheet = sheet
+        .column()
+        .pad(SHEET_PAD, SHEET_PAD, SHEET_PAD, SHEET_PAD);
+    let mut b =
+        Builder::new(Node::new(Content::Box, sheet).semantic(node_id(id), Role::Menu, name));
+    for r in rows {
         match r {
-            PRow::Search => Row::Search {
-                query: "",
-                placeholder: "",
-            },
-            PRow::Section(_) => Row::Section(""),
-            PRow::Item { .. } => Row::Item {
-                name: "",
-                icon: None,
-                icon_name: "",
-                detail: None,
-                current: false,
-                minimized: false,
-                state,
-            },
-            PRow::Action { .. } => Row::Action {
-                name: "",
-                hint: None,
-                state,
-            },
-            PRow::Sep => Row::Sep,
-            PRow::Footer => Row::Footer,
+            PRow::Search => {
+                let row = b.row(Node::new(Content::Box, style().height(30.0)));
+                let well = b.add(
+                    row,
+                    Node::new(
+                        Content::Well,
+                        style()
+                            .row()
+                            .center()
+                            .grow()
+                            .height(28.0)
+                            .pad(0.0, 12.0, 0.0, 8.0),
+                    ),
+                );
+                b.add(
+                    well,
+                    Node::new(Content::Glyph(&glyphs::SEARCH, Ink::Dim), style()),
+                );
+                b.add(
+                    well,
+                    Node::new(
+                        Content::Field {
+                            placeholder: tr(Msg::Search).to_string(),
+                        },
+                        style().grow().height(18.0).margin(0.0, 0.0, 0.0, 8.0),
+                    )
+                    .semantic(
+                        node_id("search"),
+                        Role::SearchInput,
+                        tr(Msg::Search),
+                    ),
+                );
+            }
+            PRow::Section(label) => {
+                let row = b.row(
+                    Node::new(
+                        Content::Box,
+                        style().row().center().height(22.0).pad(2.0, 0.0, 0.0, 8.0),
+                    )
+                    .semantic(
+                        node_id(&format!("section:{label}")),
+                        Role::Heading,
+                        label,
+                    ),
+                );
+                b.add(
+                    row,
+                    Node::new(text(label, LABEL_SIZE, Ink::Dim), style().grow()),
+                );
+            }
+            PRow::Item {
+                name,
+                entry,
+                detail,
+                current,
+                minimized,
+                act,
+            } => {
+                let row = b.row(
+                    Node::new(
+                        Content::Choice,
+                        style().row().center().height(26.0).pad(0.0, 8.0, 0.0, 8.0),
+                    )
+                    .semantic(
+                        node_id(&format!("{act:?}")),
+                        Role::MenuItem,
+                        name,
+                    ),
+                );
+                let opacity = if *minimized { 0.5 } else { 1.0 };
+                b.add(
+                    row,
+                    Node::new(
+                        Content::AppIcon {
+                            entry: *entry,
+                            name: icon_name(*entry, name),
+                            opacity,
+                        },
+                        style(),
+                    ),
+                );
+                let ink = if *minimized { Ink::Dim } else { Ink::Text };
+                let gap = style().margin(0.0, 0.0, 0.0, 8.0);
+                b.add(
+                    row,
+                    Node::new(text(name, TEXT_SIZE, ink), gap.clone().grow()),
+                );
+                let detail = if *minimized {
+                    Some(tr(Msg::Minimized))
+                } else {
+                    detail.as_deref()
+                };
+                if let Some(d) = detail {
+                    b.add(row, Node::new(text(d, SMALL_SIZE, Ink::Dim), gap.clone()));
+                }
+                if *current {
+                    b.add(
+                        row,
+                        Node::new(Content::Dot, style().margin(0.0, 2.0, 0.0, 8.0)),
+                    );
+                }
+            }
+            PRow::Action { name, act } => {
+                let row = b.row(
+                    Node::new(
+                        Content::Choice,
+                        style().row().center().height(24.0).pad(0.0, 8.0, 0.0, 8.0),
+                    )
+                    .semantic(
+                        node_id(&format!("{act:?}")),
+                        Role::MenuItem,
+                        name,
+                    ),
+                );
+                b.add(
+                    row,
+                    Node::new(text(name, TEXT_SIZE, Ink::Text), style().grow()),
+                );
+            }
+            PRow::Sep => {
+                let row = b.row(Node::new(
+                    Content::Box,
+                    style().column().height(9.0).pad(4.0, 3.0, 0.0, 3.0),
+                ));
+                b.add(row, Node::new(Content::Rule, style().height(1.0)));
+            }
+            PRow::Footer => {
+                // The hairline runs from edge to edge of the sheet.
+                let row = b.row(Node::new(
+                    Content::Box,
+                    style()
+                        .column()
+                        .height(29.0)
+                        .pad(5.0, 0.0, 0.0, 0.0)
+                        .margin(0.0, 1.0 - SHEET_PAD, 0.0, 1.0 - SHEET_PAD),
+                ));
+                b.add(row, Node::new(Content::Rule, style().height(1.0)));
+                let keys = b.add(
+                    row,
+                    Node::new(
+                        Content::Box,
+                        style()
+                            .row()
+                            .center()
+                            .height(18.0)
+                            .margin(5.0, 0.0, 0.0, 0.0)
+                            .pad(0.0, 0.0, 0.0, 12.0),
+                    ),
+                );
+                let key = style().margin(0.0, 5.0, 0.0, 0.0);
+                let label = style().margin(0.0, 18.0, 0.0, 0.0);
+                let hints: [(Content, Style); 7] = [
+                    (Content::Key(Some(&glyphs::UP), ""), key.clone()),
+                    (Content::Key(Some(&glyphs::DOWN), ""), key.clone()),
+                    (text(tr(Msg::Move), SMALL_SIZE, Ink::Dim), label.clone()),
+                    (Content::Key(Some(&glyphs::ENTER), ""), key.clone()),
+                    (text(tr(Msg::Open), SMALL_SIZE, Ink::Dim), label),
+                    (Content::Key(None, "Esc"), key),
+                    (text(tr(Msg::Close), SMALL_SIZE, Ink::Dim), style()),
+                ];
+                for (content, style) in hints {
+                    b.add(keys, Node::new(content, style));
+                }
+            }
         }
+    }
+    b.finish(font)
+}
+
+impl Wm {
+    /// The tree of a menu of this desktop.
+    fn pop_tree(&mut self, what: &What, rows: &[PRow]) -> Tree {
+        let (sheet, name) = match what {
+            What::Apps => (style().width(APPS_W), tr(Msg::Applications).to_string()),
+            What::App(t, anchor) => {
+                let least = match anchor {
+                    Anchor::Panel => APP_W.max(self.panel_layout.app.map_or(0.0, |(_, w)| w)),
+                    Anchor::Rail(_) => APP_W,
+                };
+                let sheet = style().min_width(least).max_width(APP_MAX_W.max(least));
+                (sheet, self.target_name(t))
+            }
+        };
+        let entries = &self.entries;
+        let icon_name = |entry: Option<usize>, name: &str| {
+            entry.map_or(name.to_string(), |e| entries[e].app.name.clone())
+        };
+        let id = format!("menu:{what:?}");
+        menu_tree(&mut self.font, sheet, &id, &name, rows, &icon_name)
     }
 
     fn window_row(&self, w: Window, current: bool) -> PRow {
@@ -348,13 +519,18 @@ impl Wm {
     }
 
     /// The pill and sheet of a menu on the screen.
-    fn pop_geometry(&self, what: &What, height: f32) -> Option<(Rect, Rect, f32, Side)> {
+    fn pop_geometry(
+        &self,
+        what: &What,
+        width: f32,
+        height: f32,
+    ) -> Option<(Rect, Rect, f32, Side)> {
         match what {
             What::Apps => {
                 let (x, w) = self.panel_layout.apps;
                 Some((
                     Rect::new(x, PILL_Y, w, 24.0),
-                    Rect::new(x, SHEET_TOP, APPS_W, height),
+                    Rect::new(x, SHEET_TOP, width, height),
                     6.0,
                     Side::Below,
                 ))
@@ -363,7 +539,7 @@ impl Wm {
                 let (x, w) = self.panel_layout.app?;
                 Some((
                     Rect::new(x, PILL_Y, w, 24.0),
-                    Rect::new(x, SHEET_TOP, APP_W.max(w), height),
+                    Rect::new(x, SHEET_TOP, width, height),
                     6.0,
                     Side::Below,
                 ))
@@ -375,11 +551,11 @@ impl Wm {
                 let x = chrome::RAIL_W as f32;
                 let bottom = self.sh as f32 - 8.0;
                 if iy + height <= bottom || iy + item - height < SHEET_TOP + 4.0 {
-                    Some((pill, Rect::new(x, iy, APP_W, height), 12.0, Side::Right))
+                    Some((pill, Rect::new(x, iy, width, height), 12.0, Side::Right))
                 } else {
                     Some((
                         pill,
-                        Rect::new(x, iy + item - height, APP_W, height),
+                        Rect::new(x, iy + item - height, width, height),
                         12.0,
                         Side::RightUp,
                     ))
@@ -396,14 +572,10 @@ impl Wm {
         sel: Option<usize>,
     ) -> Result<()> {
         self.show_tooltip(None)?;
-        let width = match &what {
-            What::Apps => APPS_W,
-            What::App(_, Anchor::Panel) => APP_W.max(self.panel_layout.app.map_or(0.0, |(_, w)| w)),
-            _ => APP_W,
-        };
-        let mut tree = Self::menu_tree(&rows, width);
-        let height = tree.height.min(self.sh as f32 - SHEET_TOP - 8.0);
-        let Some((pill, sheet, pill_r, side)) = self.pop_geometry(&what, height) else {
+        let mut tree = self.pop_tree(&what, &rows);
+        let (width, full) = tree.size();
+        let height = full.min(self.sh as f32 - SHEET_TOP - 8.0);
+        let Some((pill, sheet, pill_r, side)) = self.pop_geometry(&what, width, height) else {
             return Ok(());
         };
         let x0 = pill.x.min(sheet.x);
@@ -431,7 +603,7 @@ impl Wm {
         tree.select(sel, shape.sheet.h);
         if what == What::Apps {
             tree.focused = Some(0);
-            tree.nodes[0].semantic.set_value(query.clone());
+            tree.set_value(0, &query);
         }
         self.pop = Some(Pop {
             what,
@@ -503,71 +675,14 @@ impl Wm {
         let (w, h) = (p.rect.2 as usize, p.rect.3 as usize);
         let (mut c, _) = chrome::connected(w, h, &p.shape);
         self.pop_pill(&mut c, &p);
-        let rows: Vec<Row> = p
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let state = if p.tree.selected == Some(i) {
-                    if p.tree.pointer {
-                        RowState::Hover
-                    } else {
-                        RowState::Selected
-                    }
-                } else {
-                    RowState::Rest
-                };
-                match r {
-                    PRow::Search => Row::Search {
-                        query: &p.query,
-                        placeholder: tr(Msg::Search),
-                    },
-                    PRow::Section(s) => Row::Section(s),
-                    PRow::Item {
-                        name,
-                        entry,
-                        detail,
-                        current,
-                        minimized,
-                        ..
-                    } => Row::Item {
-                        name,
-                        icon: entry.and_then(|e| self.entries[e].small.as_ref()),
-                        icon_name: entry
-                            .map_or(name.as_str(), |e| self.entries[e].app.name.as_str()),
-                        detail: detail.as_deref(),
-                        current: *current,
-                        minimized: *minimized,
-                        state,
-                    },
-                    PRow::Action { name, .. } => Row::Action {
-                        name,
-                        hint: None,
-                        state,
-                    },
-                    PRow::Sep => Row::Sep,
-                    PRow::Footer => Row::Footer,
-                }
-            })
-            .collect();
-        let bounds = p.tree.bounds(p.shape.sheet);
-        let background = c.px.clone();
-        crate::ui::widgets::sheet(&mut c, &mut self.font, p.shape.sheet, &rows, &bounds);
-        if let Some(field) = &mut p.field {
-            let b = bounds[0];
-            field.draw(
-                &mut self.font,
-                &mut c,
-                Rect::new(b.x + 32.0, b.y + 5.0, b.w - 44.0, 18.0),
-            );
-        }
-        for y in 0..h {
-            if (y as f32) < p.shape.sheet.y || y as f32 >= p.shape.sheet.y + p.shape.sheet.h {
-                for x in p.shape.sheet.x as usize..(p.shape.sheet.x + p.shape.sheet.w) as usize {
-                    c.px[y * w + x] = background[y * w + x];
-                }
-            }
-        }
+        let entries = &self.entries;
+        let icons = |e: usize| entries[e].small.as_ref();
+        let mut paint = Paint {
+            font: &mut self.font,
+            icons: &icons,
+            field: p.field.as_mut(),
+        };
+        p.tree.paint(&mut c, &mut paint, p.shape.sheet);
         let out = self.put(self.ours.pop, &c, 0, 0);
         self.pop = Some(p);
         out
@@ -613,10 +728,11 @@ impl Wm {
         };
         let (px, py) = ((x - p.rect.0) as f32, (y - p.rect.1) as f32);
         if p.field.as_ref().is_some_and(|f| f.dragging) {
-            let b = p.tree.bounds(p.shape.sheet)[0];
+            let s = p.shape.sheet;
+            let fx = p.tree.field_bounds((s.x, s.y)).map_or(0.0, |b| b.x);
             self.pop.as_mut().unwrap().field.as_mut().unwrap().pointer(
                 &mut self.font,
-                px - b.x - 32.0,
+                px - fx,
                 true,
             );
             return self.draw_pop();
@@ -648,10 +764,11 @@ impl Wm {
         if e.detail == 1
             && Self::any_row_at(p, lx, ly).is_some_and(|i| matches!(p.rows[i], PRow::Search))
         {
-            let b = p.tree.bounds(p.shape.sheet)[0];
+            let s = p.shape.sheet;
+            let fx = p.tree.field_bounds((s.x, s.y)).map_or(0.0, |b| b.x);
             let p = self.pop.as_mut().unwrap();
             let field = p.field.as_mut().unwrap();
-            field.pointer(&mut self.font, lx - b.x - 32.0, false);
+            field.pointer(&mut self.font, lx - fx, false);
             field.dragging = true;
             return self.draw_pop();
         }
@@ -850,40 +967,39 @@ impl Wm {
         value: Option<String>,
     ) -> std::result::Result<Value, (u16, String)> {
         let p = self.pop.as_mut().ok_or((404, "no open UI".into()))?;
-        if id == u64::MAX {
-            return Err((400, "unsupported action".into()));
-        }
-        let i = p
-            .tree
-            .nodes
-            .iter()
-            .position(|n| n.id.0 == id)
-            .ok_or((404, "no such node".into()))?;
-        let supported = match action {
+        let wanted = match action {
             "click" => accesskit::Action::Click,
             "focus" => accesskit::Action::Focus,
             "set_value" => accesskit::Action::SetValue,
             _ => return Err((400, "unknown action".into())),
         };
-        if !p.tree.nodes[i].semantic.supports_action(supported) {
+        if id == p.tree.root_id() {
             return Err((400, "unsupported action".into()));
         }
-        let out = match action {
-            "click" => {
-                let act = p.rows[i].act().cloned().unwrap();
+        let row = p.tree.row_of(id).ok_or((404, "no such node".into()))?;
+        if !p.tree.supports(row, wanted) {
+            return Err((400, "unsupported action".into()));
+        }
+        let out = match wanted {
+            accesskit::Action::Click => {
+                let act = p.rows[row]
+                    .act()
+                    .cloned()
+                    .ok_or((400, "unsupported action".into()))?;
                 self.close_pop().and_then(|()| self.run_act(act))
             }
-            "focus" => {
-                p.tree.focused = Some(i);
-                if p.rows[i].act().is_some() {
-                    p.tree.select(Some(i), p.shape.sheet.h);
+            accesskit::Action::Focus => {
+                p.tree.focused = Some(row);
+                if p.rows[row].act().is_some() {
+                    p.tree.pointer = false;
+                    p.tree.select(Some(row), p.shape.sheet.h);
                 }
                 self.draw_pop()
             }
             _ => {
                 let value = value.ok_or((400, "value is required".into()))?;
-                let field = p.field.as_mut().unwrap();
-                field.key(&mut self.font, 0x61, None, false, true);
+                let field = p.field.as_mut().ok_or((400, "unsupported action".into()))?;
+                field.select_all(&mut self.font);
                 field.insert(&value);
                 self.refresh_query()
             }
@@ -1028,6 +1144,103 @@ impl Wm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sheet(width: f32) -> Style {
+        style().width(width)
+    }
+
+    fn launcher() -> Vec<PRow> {
+        vec![
+            PRow::Search,
+            PRow::Section("Applications".into()),
+            PRow::Item {
+                name: "Terminal".into(),
+                entry: None,
+                detail: Some("Shell".into()),
+                current: true,
+                minimized: false,
+                act: Act::Launch(0),
+            },
+            PRow::Sep,
+            PRow::Action {
+                name: "Quit".into(),
+                act: Act::Launch(1),
+            },
+            PRow::Footer,
+        ]
+    }
+
+    #[test]
+    fn a_sheet_fits_its_rows_and_paints_them() {
+        let mut font = Font::for_test();
+        let names = |_: Option<usize>, n: &str| n.to_string();
+        let mut tree = menu_tree(
+            &mut font,
+            sheet(APPS_W),
+            "apps",
+            "Apps",
+            &launcher(),
+            &names,
+        );
+        assert_eq!(
+            tree.size(),
+            (APPS_W, 10.0 + 30.0 + 22.0 + 26.0 + 9.0 + 24.0 + 29.0)
+        );
+        let field = tree.field_bounds((0.0, 0.0)).unwrap();
+        assert_eq!(
+            field,
+            Rect::new(
+                SHEET_PAD + 32.0,
+                SHEET_PAD + 5.0,
+                APPS_W - 2.0 * SHEET_PAD - 44.0,
+                18.0
+            )
+        );
+        tree.select(Some(2), 200.0);
+        let (w, h) = tree.size();
+        let mut c = Canvas::new(w as usize, h as usize, crate::draw::theme().surface);
+        let icons = |_: usize| None;
+        let mut paint = Paint {
+            font: &mut font,
+            icons: &icons,
+            field: None,
+        };
+        tree.paint(&mut c, &mut paint, Rect::new(0.0, 0.0, w, h));
+        assert!(c.px.contains(&crate::draw::theme().selected));
+        assert!(c.px.contains(&crate::draw::theme().raised));
+    }
+
+    #[test]
+    fn a_one_item_menu_is_one_row_tall() {
+        let mut font = Font::for_test();
+        let names = |_: Option<usize>, n: &str| n.to_string();
+        let rows = [PRow::Action {
+            name: "Quit".into(),
+            act: Act::Launch(0),
+        }];
+        let s = style().min_width(APP_W).max_width(APP_MAX_W);
+        let tree = menu_tree(&mut font, s, "app", "Files", &rows, &names);
+        assert_eq!(tree.size(), (APP_W, 24.0 + 2.0 * SHEET_PAD));
+    }
+
+    #[test]
+    fn an_app_menu_widens_for_a_long_action() {
+        let mut font = Font::for_test();
+        let names = |_: Option<usize>, n: &str| n.to_string();
+        let name = "Open a new private window in the background";
+        let rows = [PRow::Action {
+            name: name.into(),
+            act: Act::Launch(0),
+        }];
+        let s = style().min_width(APP_W).max_width(APP_MAX_W);
+        let tree = menu_tree(&mut font, s, "app", "Files", &rows, &names);
+        let want = (font.width(name, TEXT_SIZE) + 16.0 + 2.0 * SHEET_PAD).clamp(APP_W, APP_MAX_W);
+        assert!(
+            (tree.size().0 - want).abs() < 0.01,
+            "{} vs {want}",
+            tree.size().0
+        );
+    }
 
     #[test]
     fn a_window_name_drops_the_app_suffix() {

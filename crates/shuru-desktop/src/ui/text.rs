@@ -49,6 +49,13 @@ impl Field {
             .insert_string(&text.replace(['\n', '\r'], " "), None);
     }
 
+    pub fn select_all(&mut self, font: &mut Font) {
+        self.editor
+            .set_selection(Selection::Normal(Cursor::new(0, 0)));
+        self.editor
+            .action(&mut font.fonts, Action::Motion(Motion::BufferEnd));
+    }
+
     pub fn key(
         &mut self,
         font: &mut Font,
@@ -68,10 +75,7 @@ impl Field {
             _ => None,
         };
         if ctrl && base == 0x61 {
-            self.editor
-                .set_selection(Selection::Normal(Cursor::new(0, 0)));
-            self.editor
-                .action(&mut font.fonts, Action::Motion(Motion::BufferEnd));
+            self.select_all(font);
         } else if let Some(motion) = motion {
             if shift {
                 if self.editor.selection() == Selection::None {

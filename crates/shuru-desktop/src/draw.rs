@@ -217,6 +217,8 @@ pub struct Canvas {
     pub w: usize,
     pub h: usize,
     pub px: Vec<u32>,
+    /// Pixels outside `(x0, y0, x1, y1)` are left as they are.
+    pub clip: Option<(usize, usize, usize, usize)>,
 }
 
 pub fn mix(under: u32, over: u32, a: f32) -> u32 {
@@ -258,11 +260,18 @@ impl Canvas {
             w,
             h,
             px: vec![bg; w * h],
+            clip: None,
         }
     }
 
     pub fn blend(&mut self, x: usize, y: usize, color: u32, a: f32) {
         if a <= 0.0 || x >= self.w || y >= self.h {
+            return;
+        }
+        if self
+            .clip
+            .is_some_and(|(x0, y0, x1, y1)| x < x0 || y < y0 || x >= x1 || y >= y1)
+        {
             return;
         }
         let p = &mut self.px[y * self.w + x];
@@ -289,9 +298,13 @@ impl Canvas {
     }
 
     pub fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32) {
-        for j in y.min(self.h)..(y + h).min(self.h) {
+        let (x0, y0, x1, y1) = self.clip.unwrap_or((0, 0, self.w, self.h));
+        let (l, r) = (x.max(x0).min(x1).min(self.w), (x + w).min(x1).min(self.w));
+        for j in y.max(y0)..(y + h).min(y1).min(self.h) {
             let row = j * self.w;
-            self.px[row + x.min(self.w)..row + (x + w).min(self.w)].fill(color);
+            if l < r {
+                self.px[row + l..row + r].fill(color);
+            }
         }
     }
 
