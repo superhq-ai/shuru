@@ -64,6 +64,8 @@ HTTP on the unix socket, made with mode 0600. Bodies are JSON. Errors are
 | `POST /overlay {who?, ripple?}` | `who` is `agent`, `person` or null; `ripple` is `{x, y}`; answers `{who}` |
 | `GET /appearance` | `{"appearance": "light"}` or `dark` |
 | `PUT /appearance {appearance}` | sets it, saves it and switches live; answers the same |
+| `GET /wallpaper` | `{"wallpaper": "default"}`, `none` or the name of the picture |
+| `PUT /wallpaper {wallpaper}` | sets it, saves it and paints it live; 400 for a name that is neither a choice nor a file, which leaves the setting alone |
 | `GET /notifications` | the last 50, newest first: `[{id, app, summary, body, time, open, banner, actions: [{key, label}]}]`; `open` is in the notification center and not closed, `banner` is on screen |
 | `POST /notifications/{id}/action {key?}` | runs an action of an open notification (`default` when no key), which closes it; 404 for a closed or unknown one, or a key it does not have |
 
@@ -117,6 +119,33 @@ The X cursor is hidden with XFixes and drawn in an overlay window of our
 own from the current cursor image, so it shows in any capture of the
 screen. A click ripple shows at each click while a person is not in
 control, and at `ripple` points of `/overlay`.
+
+## Wallpaper
+
+The picture behind the windows. The setting is the file
+`$XDG_CONFIG_HOME/superhq/wallpaper` (`~/.config/superhq/wallpaper`),
+holding `default`, `none` or the bare name of a picture. It is watched
+like the appearance, so `PUT /wallpaper`, Settings and
+`echo none > ~/.config/superhq/wallpaper` all work.
+
+- `default` and `none` paint the flat color of the appearance (`none`
+  says so on purpose; today they paint the same).
+- A name is looked up as `NAME.png`, `.jpg`, `.jpeg` or `.webp` in the
+  `backgrounds` directory of each XDG data dir: `/usr/share/backgrounds`
+  and `/usr/local/share/backgrounds` of the guest, then the user's own
+  `~/.local/share/backgrounds`. A path with a `/` in it is taken as it
+  is, so a person can point at any file.
+- A picture is covered into the screen: its proportions are kept, the
+  part that does not fit is cut from both sides, and it is scaled by
+  area, so it is neither stretched nor aliased. A picture is read again
+  when the screen size changes.
+- A name the shell cannot show is refused with 400 and the setting is
+  left as it was, so a typo does not replace a chosen wallpaper.
+
+Only PNG files are read. A guest that ships JPEG or SVG pictures renders
+them to PNG when its image is built. `shuru-desktop` reads the file once,
+at start and when the setting changes, and keeps the screen in memory, so
+a wallpaper costs nothing while the desktop runs.
 
 ## Appearance
 
@@ -236,7 +265,8 @@ being pinned to the rail. It publishes its own AT-SPI application with
 the same bridge; its nodes do not join the desktop socket tree.
 
 - General: Appearance, Light or Dark, saved in the appearance file.
-  Language, English (US) or 简体中文, saved in the language file. Both
+  Wallpaper, one segment per choice, saved in the wallpaper file.
+  Language, English (US) or 简体中文, saved in the language file. All
   apply live to the shell and to Settings.
 - Default apps: Browser lists the installed browsers and sets HTTP,
   HTTPS, HTML and XHTML to the one chosen in

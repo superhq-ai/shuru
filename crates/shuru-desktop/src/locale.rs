@@ -74,6 +74,10 @@ pub enum Msg {
     DoNotDisturbNote,
     ClearAll,
     NoNotifications,
+    Wallpaper,
+    WallpaperDefault,
+    WallpaperNone,
+    WallpaperNote,
 }
 
 pub fn file() -> PathBuf {
@@ -256,6 +260,13 @@ pub fn text(lang: Lang, m: Msg) -> &'static str {
             DoNotDisturbNote => "New notifications go to the notification center without a banner",
             ClearAll => "Clear all",
             NoNotifications => "No notifications",
+            Wallpaper => "Wallpaper",
+            WallpaperDefault => "Default",
+            WallpaperNone => "None",
+            WallpaperNote => {
+                "A picture from /usr/share/backgrounds, or from \
+                ~/.local/share/backgrounds"
+            }
         },
         Lang::ZhHans => match m {
             Applications => "应用程序",
@@ -292,6 +303,13 @@ pub fn text(lang: Lang, m: Msg) -> &'static str {
             DoNotDisturbNote => "新通知将直接进入通知中心，不弹出横幅",
             ClearAll => "全部清除",
             NoNotifications => "没有通知",
+            Wallpaper => "壁纸",
+            WallpaperDefault => "默认",
+            WallpaperNone => "无",
+            WallpaperNote => {
+                "图片取自 /usr/share/backgrounds 或 \
+                ~/.local/share/backgrounds"
+            }
         },
     }
 }

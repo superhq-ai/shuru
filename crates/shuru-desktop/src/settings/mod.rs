@@ -12,6 +12,7 @@ use crate::draw::Font;
 use crate::locale::{tr, Lang, Msg, LANGS};
 use crate::ui::kit::{Choice, Form, Segmented, Select, Switch};
 use crate::ui::Tree;
+use crate::wallpaper;
 
 #[cfg(target_os = "linux")]
 pub fn run(display: &str) -> Result<()> {
@@ -26,6 +27,9 @@ const GENERAL_CARD: u64 = 11;
 pub const APPEARANCE: u64 = 12;
 pub const LIGHT: u64 = 13;
 pub const DARK: u64 = 14;
+pub const WALLPAPER: u64 = 15;
+/// The first wallpaper of the shell; the others follow.
+pub const WALLPAPERS: u64 = 16;
 pub const LANGUAGE: u64 = 22;
 /// The first language; the others follow in the order of `LANGS`.
 pub const LANGUAGES: u64 = 23;
@@ -50,6 +54,7 @@ pub struct Preferences {
     defaults: Defaults,
     apps: Vec<App>,
     pub dark: bool,
+    pub wallpaper: wallpaper::Choice,
     pub lang: Lang,
     /// Do not disturb.
     pub quiet: bool,
@@ -66,6 +71,7 @@ impl Preferences {
             defaults: Defaults::from_env(),
             apps: crate::apps::catalog(),
             dark: crate::appearance::read(),
+            wallpaper: wallpaper::read(),
             lang: crate::locale::lang(),
             quiet: crate::dnd::read(),
             os: os_name(&std::fs::read_to_string("/etc/os-release").unwrap_or_default()),
@@ -104,6 +110,11 @@ impl Preferences {
             LIGHT | DARK => {
                 crate::appearance::write(id == DARK)?;
                 self.dark = id == DARK;
+            }
+            _ if id >= WALLPAPERS && id < WALLPAPERS + wallpaper::CHOICES.len() as u64 => {
+                let choice = wallpaper::Choice::of(wallpaper::CHOICES[(id - WALLPAPERS) as usize]);
+                wallpaper::write(choice)?;
+                self.wallpaper = choice;
             }
             DO_NOT_DISTURB => {
                 crate::dnd::write(!self.quiet)?;
@@ -167,6 +178,34 @@ impl Preferences {
             .enumerate()
             .map(|(i, l)| Choice::new(LANGUAGES + i as u64, l.endonym()).in_lang(l.tag()))
             .collect();
+        let papers: Vec<Choice> = wallpaper::CHOICES
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                Choice::new(
+                    WALLPAPERS + i as u64,
+                    match *name {
+                        "default" => tr(Msg::WallpaperDefault),
+                        "none" => tr(Msg::WallpaperNone),
+                        other => other,
+                    },
+                )
+            })
+            .collect();
+        form.segmented(
+            &mut s,
+            Segmented {
+                id: WALLPAPER,
+                label: tr(Msg::Wallpaper),
+                choices: &papers,
+                chosen: WALLPAPERS
+                    + wallpaper::CHOICES
+                        .iter()
+                        .position(|n| *n == self.wallpaper.name())
+                        .unwrap_or(0) as u64,
+                description: Some(tr(Msg::WallpaperNote)),
+            },
+        );
         form.segmented(
             &mut s,
             Segmented {

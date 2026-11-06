@@ -62,13 +62,14 @@ pub fn write(dark: bool) -> std::io::Result<()> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Changes {
     pub appearance: bool,
+    pub wallpaper: bool,
     pub language: bool,
     pub do_not_disturb: bool,
 }
 
 impl Changes {
     pub fn any(self) -> bool {
-        self.appearance || self.language || self.do_not_disturb
+        self.appearance || self.wallpaper || self.language || self.do_not_disturb
     }
 }
 
@@ -120,6 +121,7 @@ impl Watch {
                 let name = name.split(|&b| b == 0).next().unwrap_or_default();
                 match name {
                     b"appearance" => hit.appearance = true,
+                    b"wallpaper" => hit.wallpaper = true,
                     b"language" => hit.language = true,
                     b"do-not-disturb" => hit.do_not_disturb = true,
                     _ => {}
@@ -259,6 +261,9 @@ mod tests {
         std::fs::write(path.join(".language.tmp"), "zh_CN.UTF-8\n").unwrap();
         std::fs::rename(path.join(".language.tmp"), path.join("language")).unwrap();
         assert!(watch.drain().language);
+        std::fs::write(path.join(".wallpaper.tmp"), "wall1\n").unwrap();
+        std::fs::rename(path.join(".wallpaper.tmp"), path.join("wallpaper")).unwrap();
+        assert!(watch.drain().wallpaper);
         std::fs::write(path.join("do-not-disturb"), "on\n").unwrap();
         assert!(watch.drain().do_not_disturb);
         std::fs::remove_dir_all(path).unwrap();

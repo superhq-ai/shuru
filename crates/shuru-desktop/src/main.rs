@@ -31,6 +31,8 @@ mod settings;
 #[cfg(target_os = "linux")]
 mod ui;
 #[cfg(target_os = "linux")]
+mod wallpaper;
+#[cfg(target_os = "linux")]
 mod wm;
 
 #[cfg(target_os = "linux")]

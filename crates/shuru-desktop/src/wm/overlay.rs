@@ -16,6 +16,7 @@ use crate::chrome::{
     self, BarView, PanelView, RailItem, CORNER, ITEM, PANEL_H, RAIL_W, RIPPLE, TOOLTIP_H,
 };
 use crate::draw::{self, theme, Canvas, Font};
+use crate::wallpaper;
 
 impl Wm {
     pub(super) fn moved(&mut self, old: R) {
@@ -241,7 +242,7 @@ impl Wm {
                 &ChangeWindowAttributesAux::new().background_pixel(px),
             )?;
         }
-        self.conn.clear_area(false, self.root, 0, 0, 0, 0)?;
+        self.draw_wall()?;
         self.repaint_shell()?;
         self.publish_appearance()?;
         self.bus_send(crate::bus::Event::Appearance(dark));
@@ -262,6 +263,48 @@ impl Wm {
         self.repaint_shell()?;
         self.settle.changed();
         Ok(())
+    }
+
+    /// Reads the saved wallpaper and loads the picture it names. The
+    /// picture is kept in a canvas of the screen it was read for, so a
+    /// change of the screen size reads it again.
+    pub(super) fn set_wallpaper(&mut self, choice: wallpaper::Choice) -> Result<()> {
+        self.wallpaper = Some(choice);
+        self.wall = None;
+        if let Some(img) = choice.image() {
+            let (w, h) = (self.sw as usize, self.sh as usize);
+            let scaled = draw::resample(&img, w, h);
+            let mut canvas = Canvas::new(w, h, draw::theme().bg);
+            canvas.image(&scaled, 0, 0, 1.0);
+            self.wall = Some(canvas);
+        }
+        self.draw_wall()?;
+        self.settle.changed();
+        Ok(())
+    }
+
+    /// The wallpaper setting, as the API and the Settings client read it.
+    pub(super) fn wallpaper_name(&self) -> &'static str {
+        self.wallpaper.unwrap_or(wallpaper::Choice::Default).name()
+    }
+
+    /// Paints the desktop behind everything: the flat color of the
+    /// appearance, or the picture of the wallpaper over it.
+    pub(super) fn draw_wall(&mut self) -> Result<()> {
+        self.conn.clear_area(false, self.root, 0, 0, 0, 0)?;
+        let (sw, sh) = (self.sw as usize, self.sh as usize);
+        // A picture read for another screen is not painted; the resize
+        // reads it again.
+        if self.wall.as_ref().is_none_or(|c| (c.w, c.h) != (sw, sh)) {
+            return Ok(());
+        }
+        // The borrow of the picture ends before the connection is used,
+        // so the window manager can be borrowed mutably by `put`.
+        let win = self.root;
+        let wall = self.wall.take().expect("checked above");
+        let out = self.put(win, &wall, 0, 0);
+        self.wall = Some(wall);
+        out
     }
 
     /// Redraws our windows and the frames of clients.
