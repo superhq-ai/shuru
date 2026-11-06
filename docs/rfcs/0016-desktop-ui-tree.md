@@ -64,7 +64,9 @@ with `id`, `role`, `name`, `value`, `states`, `actions` and `bounds`, and
 `children`, the ids of the nearest seen nodes under it. Presentational
 nodes (labels inside a row, icons, key caps) are left out, so the menu
 lists its items and the search input. Bounds are screen pixels, after
-scrolling. States are focused, selected, disabled and expanded. The panel and rail remain in the list while no popup is open.
+scrolling. States are focused, selected, disabled, expanded and checked
+(a checked radio or switch). The panel and rail remain in the list while
+no popup is open.
 
 `POST /tree/action` takes `{id, action, value?}`. The actions are `click`,
 `focus` and `set_value`. Unsupported actions return 400 and absent nodes
@@ -84,13 +86,90 @@ curves can result from the new painter.
 Title bars retain their own trees, with named buttons for Close, Minimize
 and Maximize or Restore. Pointer release and semantic clicks use the same
 window actions. Bars of minimized and fullscreen windows leave the shell
-collection. Settings uses the same tree as a normal managed X11 client,
-launched by `shuru-desktop --settings`. It has appearance and language
-choices, MIME defaults, notification capabilities and an About section.
-Its own process publishes its retained tree through the shared AT-SPI
-module. Preferences use XDG configuration files; language takes effect on
-the next desktop session, while appearance follows the existing watch. The shell tree list has a single collection
-point where those surfaces can join the popup nodes.
+collection. The shell tree list has a single collection point where those
+surfaces join the popup nodes.
+
+Content that only one surface draws is a `Draw` implementation owned by
+that surface (`Content::Custom`), so the shell faces live in `chrome` and
+the form controls in the kit, and `widgets.rs` keeps the shared leaves:
+text, wrapped text, glyphs, icons, key caps, rules and the text field.
+
+## Kit
+
+`src/ui/kit` holds the form controls Settings and later windows build
+from, one file per component: the card and row surfaces, headings, a
+status line, an information row, a segmented control (a radio group), a
+select with an inline list box, and a switch. A `Form` builds a window of
+sections from them. Each component lays out, paints and describes itself
+in one place, and keeps one accessibility contract:
+
+- A control has a role, a name and its state: checked radios and switches
+  carry `Toggled`, an open select `expanded`, the chosen option
+  `selected`, a control that cannot act `disabled`.
+- Tab and Shift+Tab walk the controls in reading order, arrows move and
+  check within a radio group, Enter and Space activate, Escape closes an
+  open list. Page Up, Page Down, Home and End scroll.
+- The focused control shows a ring at 3:1 against its surface, only for
+  the keyboard. Text meets WCAG AA (4.5:1) on its surface in both
+  appearances, checked by tests from the theme colors.
+- Help under a control is also its description. A section is a group
+  named by its level 2 heading; the window title is level 1.
+- A status line is a live region: polite, assertive for an error.
+- A form taller than its window shows a scrollbar. The pointer drags its
+  thumb or pages on its track, and it is an accesskit scroll bar with a
+  value that assistive tools read and set.
+- Text in another language, such as the name of a language in itself,
+  carries its language tag.
+
+## Settings
+
+Settings uses the kit as a normal managed X11 client, launched by
+`shuru-desktop --settings`, and publishes its own retained tree through
+the shared AT-SPI module. It has four sections: General (appearance and
+language), Default apps (browser and terminal), Notifications (do not
+disturb) and About. Every setting is a file in `~/.config/superhq` or an
+XDG file, written by a rename, and both Settings and the window manager
+watch the directory with inotify, so a change from either, the API or a
+shell applies live in both.
+
+Language is the file `language`, holding `en_US.UTF-8` or `zh_CN.UTF-8`.
+The desktop seeds it from `LC_ALL`, `LC_MESSAGES` or `LANG` when there is
+none, and from then on the file wins: the runtime picks the first
+language and the person changes it inside the guest. A change switches
+the panel, rail, title bars, menus and Settings at once; apps that are
+open keep theirs until they start again.
+
+The default browser is the handler of `x-scheme-handler/http` in
+`mimeapps.list`; choosing one sets HTTP, HTTPS, HTML and XHTML in the
+user file and keeps every other line. The default terminal is the first
+entry of `xdg-terminals.list`, as `xdg-terminal-exec` reads it. Desktop
+entries with `Terminal=true` run in it, with its `X-TerminalArgExec` or
+`-e`, and in xterm when no terminal is set. Addresses typed in the
+launcher open in the default browser.
+
+## Notification center
+
+A bell at the right end of the panel opens the notification center, a
+sheet aligned to the right edge of its pill. The bell shows an amber dot
+when a notification came since the center was last open, and a slash
+while do not disturb is on.
+
+The center lists the notifications that are not closed, newest first:
+the app icon and name, the summary and the body on one line, the actions
+of the notification under it, a dismiss button per notification, and
+Clear all. A do not disturb switch sits at the top. A click on a
+notification runs its default action when it has one and dismisses it
+either way; Delete and BackSpace dismiss the one under the keyboard.
+Dismissing, clearing and the switch keep the sheet open and rebuild it.
+
+A banner that times out leaves its notification in the center, open to
+its actions; its client hears `NotificationClosed` only when it is
+dismissed, cleared, closed by the client or pushed out of the last 50.
+Do not disturb is the file `do-not-disturb`, `on` or `off`; while it is
+on, new notifications go to the center without a banner. The rows are
+menu items, the switch a checkable menu item and the dismiss buttons are
+named after their notification, so the center reads the same on AT-SPI
+and in `GET /tree`.
 
 AT-SPI publishing lets the shell join GTK apps and Chromium
 in one accessibility tree. accesskit_atspi_common, which maps an
@@ -114,3 +193,12 @@ scrolled selection stays inside its view. Navigation tests skip non-actionable r
 Editor tests use the bundled Inter font without reading system fonts and
 cover word motion, selection replacement and word deletion. JSON tests
 check roles, values, actions, states and screen coordinates.
+
+Kit tests cover the radio group and its keys, a closed, open and empty
+select, help as description, language tags, heading levels, status
+liveness, the scrollbar and its dragging, and a focus ring for the
+keyboard only in both themes. Settings tests cover each default, a failed
+save, the reading order and the form in Chinese. Center tests cover the
+dismiss button apart from its row, the switch semantics, keyboard order
+and the empty center. Contrast tests check text, focus rings and thumbs
+in both themes.

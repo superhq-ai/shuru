@@ -13,6 +13,10 @@ mod bus;
 #[cfg(target_os = "linux")]
 mod chrome;
 #[cfg(target_os = "linux")]
+mod defaults;
+#[cfg(target_os = "linux")]
+mod dnd;
+#[cfg(target_os = "linux")]
 mod draw;
 #[cfg(target_os = "linux")]
 mod glyphs;
@@ -81,6 +85,7 @@ mod linux {
             return crate::settings::run(&args.display);
         }
         let socket = args.socket.context("--socket is required")?;
+        crate::locale::seed();
         let mut apps = Vec::new();
         for spec in &args.apps {
             match crate::apps::load(spec) {

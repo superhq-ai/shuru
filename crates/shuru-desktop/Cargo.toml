@@ -1,6 +1,6 @@
 [package]
 name = "shuru-desktop"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "An X11 stacking window manager for a desktop an agent uses, with a panel, a rail, menus, overlays and an API on a unix socket"
 license = "Apache-2.0"

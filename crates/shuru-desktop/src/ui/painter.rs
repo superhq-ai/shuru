@@ -1,7 +1,7 @@
 //! Shapes rasterised by tiny-skia over only the pixels they touch, then
 //! blended into a canvas, so a clip on the canvas holds for them too.
 
-use tiny_skia::{FillRule, Mask, Path, PathBuilder, Transform};
+use tiny_skia::{FillRule, LineCap, LineJoin, Mask, Path, PathBuilder, Stroke, Transform};
 
 use crate::draw::{Canvas, Raised, Rect, NONE};
 
@@ -95,6 +95,45 @@ pub fn ring(c: &mut Canvas, b: Rect, r: f32, color: u32) {
     });
 }
 
+/// A polyline `w` wide with round joins and caps, such as a chevron.
+pub fn stroke(c: &mut Canvas, pts: &[(f32, f32)], w: f32, color: u32) {
+    let (Some(first), true) = (pts.first(), pts.len() > 1) else {
+        return;
+    };
+    let (mut x0, mut y0, mut x1, mut y1) = (first.0, first.1, first.0, first.1);
+    for &(x, y) in pts {
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+    }
+    let Some(area) = Area::around(Rect::new(
+        x0 - w,
+        y0 - w,
+        x1 - x0 + 2.0 * w,
+        y1 - y0 + 2.0 * w,
+    )) else {
+        return;
+    };
+    let mut p = PathBuilder::new();
+    p.move_to(first.0, first.1);
+    for &(x, y) in &pts[1..] {
+        p.line_to(x, y);
+    }
+    let style = Stroke {
+        width: w,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..Stroke::default()
+    };
+    let (Some(line), Some(mut mask)) = (
+        p.finish().and_then(|p| p.stroke(&style, 1.0)),
+        Mask::new(area.w, area.h),
+    ) else {
+        return;
+    };
+    let shift = Transform::from_translate(-area.x as f32, -area.y as f32);
+    mask.fill_path(&line, FillRule::Winding, true, shift);
+    area.blend(c, color, |i| alpha(&mask, i));
+}
+
 /// A control of the raised family, as `Canvas::raised` draws it.
 pub fn raised(c: &mut Canvas, b: Rect, r: f32, s: Raised) {
     let Some(area) = Area::around(Rect::new(b.x, b.y, b.w, b.h + 2.0)) else {
@@ -129,6 +168,14 @@ mod tests {
         rounded(&mut c, Rect::new(5.0, 5.0, 30.0, 30.0), 6.0, 0xffffff);
         assert_eq!(c.px[10 * 40 + 20], 0xffffff);
         assert_eq!(c.px[30 * 40 + 20], 0);
+    }
+
+    #[test]
+    fn a_stroke_covers_its_line_only() {
+        let mut c = Canvas::new(20, 20, 0);
+        stroke(&mut c, &[(4.0, 10.0), (16.0, 10.0)], 2.0, 0xffffff);
+        assert_eq!(c.px[10 * 20 + 10], 0xffffff);
+        assert_eq!(c.px[2 * 20 + 10], 0);
     }
 
     #[test]

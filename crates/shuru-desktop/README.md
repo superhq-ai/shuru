@@ -17,7 +17,8 @@ image installs next to it; see `guest/README.md`.
 ## The desktop
 
 - A 32 px panel at the top: the Applications menu, the app in front with
-  its menu, and who is in control.
+  its menu, who is in control, and at the right end the bell of the
+  notification center.
 - A 64 px rail on the left with the apps of `--apps` and the running ones.
   A click brings an app to the front or starts it; a click on the app in
   front, or a right click on any, opens its menu: New Window and the
@@ -40,8 +41,8 @@ image installs next to it; see `guest/README.md`.
 - A fullscreen window covers the panel and the rail and goes back to its
   place after.
 - An empty desktop says No windows open.
-- Notifications show as cards at the top right of the work area, up to
-  three, newest on top (see below).
+- Notifications show as banners at the top right of the work area, up to
+  three, newest on top, and stay in the notification center (see below).
 - No animations. Overlays and menus show at once.
 
 ## API
@@ -52,7 +53,7 @@ HTTP on the unix socket, made with mode 0600. Bodies are JSON. Errors are
 | route | answers |
 |---|---|
 | `GET /healthz` | `{"ok": true}` |
-| `GET /tree` | the nodes of the panel, rail, title bars and open shell popup that agents see: `[{id, role, name, value, states, actions, bounds, children?}]`; `role` is `menu`, `menu_item`, `search_input`, `heading`, `button`, `toolbar`, `title_bar`, `label` or `group`; `children` lists the ids of the seen nodes under a node; `bounds` are `{x, y, width, height}` in screen pixels; `states` are `{focused, selected, disabled, expanded}` |
+| `GET /tree` | the nodes of the panel, rail, title bars and open shell popup that agents see: `[{id, role, name, value, states, actions, bounds, children?}]`; `role` is `menu`, `menu_item`, `menu_item_check_box`, `search_input`, `heading`, `button`, `toolbar`, `title_bar`, `label` or `group`; `children` lists the ids of the seen nodes under a node; `bounds` are `{x, y, width, height}` in screen pixels; `states` are `{focused, selected, disabled, expanded, checked}` |
 | `POST /tree/action {id, action, value?}` | acts on a shell node: `click`, `focus` or `set_value`; `set_value` requires a string `value`; answers `{ok: true}`, 404 for an absent node, 400 for an unsupported action |
 | `GET /windows` | `[{id, app, class, title, pid, focused, kind, fullscreen, state, geometry}]`, most recently focused first; `kind` is `normal`, `dialog`, `utility`, `splash`, `dock` or `popup`; `state` is `maximized`, `floating` or `minimized`; `geometry` is `{x, y, width, height}` of the window on screen |
 | `POST /focus {id, maximize?}` | the window, now focused; a main window is maximized unless `maximize` is false; 404 for an unknown id |
@@ -63,7 +64,7 @@ HTTP on the unix socket, made with mode 0600. Bodies are JSON. Errors are
 | `POST /overlay {who?, ripple?}` | `who` is `agent`, `person` or null; `ripple` is `{x, y}`; answers `{who}` |
 | `GET /appearance` | `{"appearance": "light"}` or `dark` |
 | `PUT /appearance {appearance}` | sets it, saves it and switches live; answers the same |
-| `GET /notifications` | the last 50, newest first: `[{id, app, summary, body, time, open, actions: [{key, label}]}]` |
+| `GET /notifications` | the last 50, newest first: `[{id, app, summary, body, time, open, banner, actions: [{key, label}]}]`; `open` is in the notification center and not closed, `banner` is on screen |
 | `POST /notifications/{id}/action {key?}` | runs an action of an open notification (`default` when no key), which closes it; 404 for a closed or unknown one, or a key it does not have |
 
 `app` in `/launch` is a `.desktop` id, its `Name` or the program it runs,
@@ -150,13 +151,30 @@ notifications). It implements `GetCapabilities` (`body`, `actions`),
 `Notify` with `replaces_id`, `CloseNotification`, `GetServerInformation`,
 and sends `NotificationClosed` and `ActionInvoked`.
 
-A card is 340 px wide at the top right of the work area: the app icon (by
-the `desktop-entry` hint, the app name or `app_icon`), the summary, the
-body in up to two lines and a close button. Up to three show at once,
+A banner is 340 px wide at the top right of the work area: the app icon
+(by the `desktop-entry` hint, the app name or `app_icon`), the summary,
+the body in up to two lines and a close button. Up to three show at once,
 newest on top. `expire_timeout` is honored, 5 s by default, 0 for never.
 A click runs the `default` action when there is one and dismisses the
-card; the close button only dismisses. The agent reads them with
-`GET /notifications` and acts with `POST /notifications/{id}/action`.
+notification; the close button only dismisses.
+
+A banner that times out leaves its notification in the notification
+center, which the bell at the right end of the panel opens. It lists the
+notifications not yet closed, newest first, with their actions, a dismiss
+button each and Clear all; Delete or BackSpace dismisses the one under
+the keyboard. The bell shows an amber dot when one came since the center
+was last open. A client hears `NotificationClosed` when its notification
+is dismissed or cleared, or falls out of the last 50, not when its banner
+times out, so its actions keep working from the center.
+
+Do not disturb is the file `$XDG_CONFIG_HOME/superhq/do-not-disturb`,
+`on` or `off` (off when missing), watched like the appearance and set
+from the center or Settings. While it is on, new notifications go to the
+center without a banner, and the bell is struck through.
+
+The agent reads them with `GET /notifications` and acts with
+`POST /notifications/{id}/action`, and sees the center in `GET /tree`
+while it is open.
 
 ## Text and languages
 
@@ -174,10 +192,15 @@ the pointer once a second (warps make no input events) and measures no
 CPU time over 30 s.
 
 The shell speaks English (en_US, the default) and Simplified Chinese. The
-locale comes from the saved Settings language, then `LC_ALL`, then `LC_MESSAGES`, then `LANG`; `zh_CN`,
-`zh_SG` and `zh_Hans` are Simplified Chinese and everything else is
-English. App names and actions come from `.desktop` files by the Desktop
-Entry rules (`Name[zh_CN]`, then `Name[zh]`, then `Name`).
+language is the file `$XDG_CONFIG_HOME/superhq/language`, holding
+`en_US.UTF-8` or `zh_CN.UTF-8`. When there is none, the desktop writes
+it at start from `LC_ALL`, then `LC_MESSAGES`, then `LANG` (`zh_CN`,
+`zh_SG` and `zh_Hans` are Simplified Chinese, everything else English),
+so the runtime picks the first language and the file wins after. The
+desktop watches it: a change switches the panel, rail, title bars, menus
+and Settings at once, and apps started after it get the language in
+their environment. App names and actions come from `.desktop` files by
+the Desktop Entry rules (`Name[zh_CN]`, then `Name[zh]`, then `Name`).
 
 ## Fonts
 
@@ -206,30 +229,30 @@ already does. The Chromium desktop entry already includes
 ## Settings
 
 `shuru-desktop --settings --display :1` opens SuperHQ Settings as a normal
-X11 client, using the shell theme, font, Raised controls and retained tree.
-Install `guest/applications/settings.desktop` and its icons with the other
-guest files. Settings then appears in Applications without being pinned to
-the rail. It publishes its own AT-SPI application with the same bridge;
-its nodes do not join the desktop socket tree.
+X11 client, built from the form controls of `src/ui/kit` on the retained
+tree. Install `guest/applications/settings.desktop` and its icons with
+the other guest files. Settings then appears in Applications without
+being pinned to the rail. It publishes its own AT-SPI application with
+the same bridge; its nodes do not join the desktop socket tree.
 
-- Appearance saves `light` or `dark` in the watched appearance file and
-  applies live.
-- Language saves `en_US.UTF-8` or `zh_CN.UTF-8` in
-  `$XDG_CONFIG_HOME/superhq/language`. Restart the desktop session to reload
-  the shell string table. The saved language takes priority over the
-  environment; without it the existing locale environment rules apply.
-- Default apps reads XDG `mimeapps.list` files in precedence order. Activate
-  a row to cycle through installed browsers or terminals. Browser saves
-  HTTP, HTTPS and HTML defaults. Terminal saves `x-scheme-handler/terminal`.
-  User choices go to `$XDG_CONFIG_HOME/mimeapps.list`, preserving other
-  defaults and association sections. Without `XDG_CONFIG_HOME`, the path
-  starts at `~/.config`.
-- Notifications describes the current server: three visible cards, a
-  default expiry of five seconds, a history of fifty and app actions.
-  The server has no preference switches.
-- About shows SuperHQ, the desktop version and the guest OS name from
+- General: Appearance, Light or Dark, saved in the appearance file.
+  Language, English (US) or 简体中文, saved in the language file. Both
+  apply live to the shell and to Settings.
+- Default apps: Browser lists the installed browsers and sets HTTP,
+  HTTPS, HTML and XHTML to the one chosen in
+  `$XDG_CONFIG_HOME/mimeapps.list`, keeping every other line. Terminal
+  lists the installed terminals and puts the one chosen first in
+  `$XDG_CONFIG_HOME/xdg-terminals.list`. Apps with `Terminal=true` run in
+  it (with its `X-TerminalArgExec`, or `-e`), and in xterm when no
+  terminal is set. Without `XDG_CONFIG_HOME`, the paths start at
+  `~/.config`.
+- Notifications: Do not disturb, saved in the do-not-disturb file.
+- About: the desktop version and the guest OS name from
   `/etc/os-release`. The guest OS remains Debian.
 
-Tab, Shift+Tab and the arrow keys move through controls; Enter or Space
-activates one. Wheel scrolling and keyboard selection reveal content in a
-short window. Changes appear immediately, with no reveal animations.
+A failed save shows as an error at the top, which screen readers read at
+once. Tab and Shift+Tab move through the controls, the arrow keys move
+within a choice, Enter or Space activates, Escape closes an open list,
+and Page Up, Page Down, Home and End scroll. A window shorter than the
+form shows a scrollbar to drag. The focus ring shows only for the
+keyboard. Changes appear immediately, with no reveal animations.

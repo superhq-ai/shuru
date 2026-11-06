@@ -87,13 +87,15 @@ sed -i -e 's/^# *en_US.UTF-8/en_US.UTF-8/' -e 's/^# *zh_CN.UTF-8/zh_CN.UTF-8/' /
 locale-gen
 ```
 
-The runtime sets `LANG` in the environment of the desktop service,
-`en_US.UTF-8` unless the user picked another language, and
-`shuru-desktop` passes its environment to every app it launches. So with
-`LANG=zh_CN.UTF-8` the shell, the `.desktop` names and Chromium (with
-`chromium-l10n`) are in Chinese. Dates and numbers follow the locale
-(en_US by default). The shell reads `LC_ALL`, then `LC_MESSAGES`, then
-`LANG`.
+The language lives in `~/.config/superhq/language`, `en_US.UTF-8` or
+`zh_CN.UTF-8`. The runtime only seeds it: it sets `LANG` in the
+environment of the desktop service, and when the file is missing
+`shuru-desktop` writes it from `LC_ALL`, then `LC_MESSAGES`, then `LANG`.
+After that the file wins, and the person changes it in Settings. The
+desktop launches every app with `LANG` and `LC_ALL` set to it, so with
+`zh_CN.UTF-8` the shell, the `.desktop` names and Chromium (with
+`chromium-l10n`) are in Chinese. Apps already open switch the next time
+they start. Dates and numbers follow the same locale.
 
 ## Cursors
 
@@ -128,6 +130,25 @@ The guest ships two apps, Chromium and the terminal. `mimeapps.list`
 opens PDF, HTML, images, plain text, Markdown and directories in
 Chromium, so `xdg-open` works for each of them. An image that adds an
 editor or a file manager points the types at its ids.
+
+Settings writes the choices of the person to the user files:
+`~/.config/mimeapps.list` for the browser (HTTP, HTTPS, HTML and XHTML)
+and `~/.config/xdg-terminals.list` for the terminal, as
+`xdg-terminal-exec` reads it. Apps with `Terminal=true` run in that
+terminal, and in xterm when there is none. An image that adds a terminal
+gives its entry `X-TerminalArgExec` when it runs a command with anything
+other than `-e`.
+
+## Settings files
+
+`shuru-desktop` and Settings watch `~/.config/superhq` and apply a change
+to any of these at once:
+
+| file | holds |
+|---|---|
+| `appearance` | `light` or `dark`; light when missing |
+| `language` | `en_US.UTF-8` or `zh_CN.UTF-8`; seeded from the environment |
+| `do-not-disturb` | `on` or `off`; off when missing. While on, notifications skip the banner and go to the notification center |
 
 ## Icons
 

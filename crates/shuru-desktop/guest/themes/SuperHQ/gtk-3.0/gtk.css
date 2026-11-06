@@ -73,6 +73,20 @@ headerbar button.titlebutton, .titlebar button.titlebutton {
   border-radius: 6px; color: transparent; -gtk-icon-transform: scale(0.75);
 }
 headerbar button.titlebutton image, .titlebar button.titlebutton image { margin: -2px; }
+/* Adwaita paints a background image on a hovered or pressed button, over
+   any fill: clear it in every state so the lights keep their colors. */
+headerbar button.titlebutton:hover, headerbar button.titlebutton:active,
+headerbar button.titlebutton:checked, headerbar button.titlebutton:backdrop,
+headerbar button.titlebutton:backdrop:hover,
+.titlebar button.titlebutton:hover, .titlebar button.titlebutton:active,
+.titlebar button.titlebutton:checked, .titlebar button.titlebutton:backdrop,
+.titlebar button.titlebutton:backdrop:hover {
+  background-image: none; border: none; outline: none;
+  text-shadow: none; -gtk-icon-shadow: none;
+}
+headerbar button.titlebutton.close:hover, .titlebar button.titlebutton.close:hover { background-color: #e2574f; }
+headerbar button.titlebutton.minimize:hover, .titlebar button.titlebutton.minimize:hover { background-color: #e8c547; }
+headerbar button.titlebutton.maximize:hover, .titlebar button.titlebutton.maximize:hover { background-color: #4cc777; }
 headerbar button.titlebutton.close, .titlebar button.titlebutton.close {
   background-color: #e2574f; box-shadow: inset 0 0 0 1px #c4463f, inset 0 2px 0 #ec7a73, 0 1px 0 #dcdce0;
 }
@@ -88,9 +102,9 @@ headerbar:hover button.titlebutton.minimize, .titlebar:hover button.titlebutton.
 headerbar button.titlebutton.minimize:hover, .titlebar button.titlebutton.minimize:hover { color: #5a4205; }
 headerbar:hover button.titlebutton.maximize, .titlebar:hover button.titlebutton.maximize,
 headerbar button.titlebutton.maximize:hover, .titlebar button.titlebutton.maximize:hover { color: #0d4223; }
-headerbar button.titlebutton.close:active { background-color: #c4463f; box-shadow: inset 0 0 0 1px #c4463f; }
-headerbar button.titlebutton.minimize:active { background-color: #c9a737; box-shadow: inset 0 0 0 1px #c9a737; }
-headerbar button.titlebutton.maximize:active { background-color: #3aa863; box-shadow: inset 0 0 0 1px #3aa863; }
+headerbar button.titlebutton.close:active, .titlebar button.titlebutton.close:active { background-color: #c4463f; box-shadow: inset 0 0 0 1px #c4463f; }
+headerbar button.titlebutton.minimize:active, .titlebar button.titlebutton.minimize:active { background-color: #c9a737; box-shadow: inset 0 0 0 1px #c9a737; }
+headerbar button.titlebutton.maximize:active, .titlebar button.titlebutton.maximize:active { background-color: #3aa863; box-shadow: inset 0 0 0 1px #3aa863; }
 headerbar button.titlebutton:backdrop, .titlebar button.titlebutton:backdrop,
 headerbar:backdrop button.titlebutton, .titlebar:backdrop button.titlebutton {
   background-color: #d4d4d9; color: transparent;

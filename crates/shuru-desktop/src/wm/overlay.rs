@@ -15,7 +15,7 @@ use crate::appearance;
 use crate::chrome::{
     self, BarView, PanelView, RailItem, CORNER, ITEM, PANEL_H, RAIL_W, RIPPLE, TOOLTIP_H,
 };
-use crate::draw::{self, theme, Canvas};
+use crate::draw::{self, theme, Canvas, Font};
 
 impl Wm {
     pub(super) fn moved(&mut self, old: R) {
@@ -242,6 +242,30 @@ impl Wm {
             )?;
         }
         self.conn.clear_area(false, self.root, 0, 0, 0, 0)?;
+        self.repaint_shell()?;
+        self.publish_appearance()?;
+        self.bus_send(crate::bus::Event::Appearance(dark));
+        self.settle.changed();
+        Ok(())
+    }
+
+    /// Switches the shell to the saved language: the names of apps, then
+    /// every surface. Apps that run keep theirs until they start again.
+    pub(super) fn set_language(&mut self) -> Result<()> {
+        self.close_pop()?;
+        self.font = Font::new();
+        for e in &mut self.entries {
+            if let Ok(app) = crate::apps::load(&e.app.id) {
+                e.app = app;
+            }
+        }
+        self.repaint_shell()?;
+        self.settle.changed();
+        Ok(())
+    }
+
+    /// Redraws our windows and the frames of clients.
+    fn repaint_shell(&mut self) -> Result<()> {
         let o = &self.ours;
         let ours = [o.panel, o.rail, o.empty, o.tooltip, o.pop, o.snap, o.ripple];
         for w in ours {
@@ -256,11 +280,7 @@ impl Wm {
         for w in framed {
             self.ring(w)?;
         }
-        self.layout_notes()?;
-        self.publish_appearance()?;
-        self.bus_send(crate::bus::Event::Appearance(dark));
-        self.settle.changed();
-        Ok(())
+        self.layout_notes()
     }
 
     /// Hands the appearance to running GTK apps by XSETTINGS, and to the
@@ -319,12 +339,17 @@ impl Wm {
                 .map(|(n, i)| (n.as_str(), i.and_then(|i| self.entries[i].small.as_ref()))),
             person: self.who.map(|w| w == Who::Person),
             hover: self.panel_hover,
+            bell: chrome::Bell {
+                unseen: self.notes.unseen && self.notes.listed().next().is_some(),
+                quiet: self.notes.quiet,
+            },
         };
-        let layout = chrome::panel_layout(&mut self.font, &view);
+        let layout = chrome::panel_layout(&mut self.font, self.sw as usize, &view);
         let mut tree = chrome::panel_tree(&mut self.font, self.sw as usize, &view, &layout);
         if let Some(p) = &self.pop {
             tree.set_expanded(chrome::APPLICATIONS_ID, p.is_apps());
             tree.set_expanded(chrome::FRONT_APP_ID, p.is_panel_app());
+            tree.set_expanded(chrome::NOTIFICATIONS_ID, p.is_notes());
         }
         let mut c = Canvas::new(self.sw as usize, PANEL_H as usize, theme().bg);
         let icons = |_| view.app.and_then(|(_, icon)| icon);

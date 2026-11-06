@@ -58,7 +58,21 @@ pub fn write(dark: bool) -> std::io::Result<()> {
     std::fs::rename(tmp, file())
 }
 
-/// An inotify watch on the directory of the setting.
+/// Which settings a batch of watch events touched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Changes {
+    pub appearance: bool,
+    pub language: bool,
+    pub do_not_disturb: bool,
+}
+
+impl Changes {
+    pub fn any(self) -> bool {
+        self.appearance || self.language || self.do_not_disturb
+    }
+}
+
+/// An inotify watch on the directory of the settings.
 pub struct Watch {
     fd: OwnedFd,
 }
@@ -87,10 +101,10 @@ impl Watch {
         self.fd.as_raw_fd()
     }
 
-    /// Reads the pending events; answers whether any was about the file.
-    pub fn drain(&self) -> bool {
+    /// Reads the pending events; answers which settings they touched.
+    pub fn drain(&self) -> Changes {
         let mut buf = [0u8; 4096];
-        let mut hit = false;
+        let mut hit = Changes::default();
         loop {
             let n = unsafe { libc::read(self.fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n <= 0 {
@@ -104,8 +118,11 @@ impl Watch {
                 };
                 let name = &buf[at + head..at + head + ev.len as usize];
                 let name = name.split(|&b| b == 0).next().unwrap_or_default();
-                if name == b"appearance" {
-                    hit = true;
+                match name {
+                    b"appearance" => hit.appearance = true,
+                    b"language" => hit.language = true,
+                    b"do-not-disturb" => hit.do_not_disturb = true,
+                    _ => {}
                 }
                 at += head + ev.len as usize;
             }
@@ -228,11 +245,22 @@ mod tests {
             std::env::temp_dir().join(format!("shuru-appearance-watch-{}", std::process::id()));
         let watch = Watch::in_dir(&path).unwrap();
         std::fs::write(path.join("other"), "ignored").unwrap();
-        assert!(!watch.drain());
+        assert!(!watch.drain().any());
         std::fs::write(path.join(".appearance.tmp"), "dark\n").unwrap();
         std::fs::rename(path.join(".appearance.tmp"), path.join("appearance")).unwrap();
-        assert!(watch.drain());
-        assert!(!watch.drain());
+        assert_eq!(
+            watch.drain(),
+            Changes {
+                appearance: true,
+                ..Changes::default()
+            }
+        );
+        assert!(!watch.drain().any());
+        std::fs::write(path.join(".language.tmp"), "zh_CN.UTF-8\n").unwrap();
+        std::fs::rename(path.join(".language.tmp"), path.join("language")).unwrap();
+        assert!(watch.drain().language);
+        std::fs::write(path.join("do-not-disturb"), "on\n").unwrap();
+        assert!(watch.drain().do_not_disturb);
         std::fs::remove_dir_all(path).unwrap();
     }
 

@@ -2,7 +2,8 @@
 //! content, and described to agents through accesskit. One tree drives
 //! layout, hit testing, keyboard selection, paint and `GET /tree`.
 
-mod painter;
+pub mod kit;
+pub(crate) mod painter;
 pub mod text;
 pub mod widgets;
 
@@ -39,13 +40,19 @@ impl Node {
     /// A node agents see, with the actions its role supports.
     pub fn semantic(mut self, id: u64, role: Role, name: &str) -> Self {
         let mut s = accesskit::Node::new(role);
-        s.set_label(name);
+        // Static text is named by its value on the accessibility bus.
         if role == Role::Label {
             s.set_value(name);
+        } else {
+            s.set_label(name);
         }
         match role {
-            Role::Button | Role::RadioButton | Role::Switch => s.add_action(Action::Click),
-            Role::MenuItem => {
+            Role::Button
+            | Role::RadioButton
+            | Role::Switch
+            | Role::ComboBox
+            | Role::ListBoxOption => s.add_action(Action::Click),
+            Role::MenuItem | Role::MenuItemCheckBox => {
                 s.add_action(Action::Click);
                 s.add_action(Action::Focus);
             }
@@ -193,6 +200,7 @@ impl Style {
 pub struct Builder {
     nodes: Vec<Node>,
     rows: Vec<usize>,
+    form: bool,
 }
 
 impl Builder {
@@ -200,6 +208,7 @@ impl Builder {
         Self {
             nodes: vec![root],
             rows: Vec::new(),
+            form: false,
         }
     }
 
@@ -214,9 +223,21 @@ impl Builder {
 
     /// A child of the root that the caller addresses by its row number.
     pub fn row(&mut self, node: Node) -> usize {
-        let i = self.add(Self::ROOT, node);
+        self.row_in(Self::ROOT, node)
+    }
+
+    /// A row anywhere under the root, such as in a card: rows are what the
+    /// keyboard walks, in the order they are added.
+    pub fn row_in(&mut self, parent: usize, node: Node) -> usize {
+        let i = self.add(parent, node);
         self.rows.push(i);
         i
+    }
+
+    /// Draws a ring round the row the keyboard is on, and a scrollbar
+    /// when the content is taller than its view.
+    pub fn form(&mut self) {
+        self.form = true;
     }
 
     pub fn finish(self, font: &mut Font) -> Tree {
@@ -228,6 +249,9 @@ impl Builder {
             focused: None,
             pointer: false,
             scroll: 0.0,
+            form: self.form,
+            hovered: None,
+            thumb: Thumb::Rest,
         };
         tree.layout(font);
         tree
@@ -246,7 +270,36 @@ pub struct Tree {
     /// Whether the pointer made the selection.
     pub pointer: bool,
     pub scroll: f32,
+    /// Set by [`Builder::form`].
+    form: bool,
+    /// The actionable node under the pointer, for controls with parts.
+    pub hovered: Option<u64>,
+    pub thumb: Thumb,
 }
+
+/// The state of the scrollbar thumb.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Thumb {
+    Rest,
+    Hover,
+    /// Held, at this distance from its top.
+    Held(f32),
+}
+
+/// What a press on the scrollbar hit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BarHit {
+    /// The thumb, at this distance from its top.
+    Thumb(f32),
+    /// The track below the thumb when true, above it when false.
+    Track(bool),
+}
+
+const BAR_W: f32 = 6.0;
+const BAR_INSET: f32 = 3.0;
+const MIN_THUMB: f32 = 24.0;
+/// Of a form, the room kept above and below a row scrolled into view.
+const FORM_PAD: f32 = 24.0;
 
 impl Tree {
     fn layout(&mut self, font: &mut Font) {
@@ -268,8 +321,12 @@ impl Tree {
                     inputs,
                     style,
                     |_, _| 0.0,
-                    |known, _| {
-                        let (w, h) = nodes[i].content.measure(font);
+                    |known, available| {
+                        let max = known.width.or(match available.width {
+                            taffy::AvailableSpace::Definite(w) => Some(w),
+                            _ => None,
+                        });
+                        let (w, h) = nodes[i].content.measure(font, max);
                         Size {
                             width: known.width.unwrap_or(w),
                             height: known.height.unwrap_or(h),
@@ -362,21 +419,19 @@ impl Tree {
         })
     }
 
-    fn actionable(&self, row: usize) -> bool {
-        self.nodes[self.rows[row]]
-            .semantic
-            .as_ref()
-            .is_some_and(|s| s.supports_action(Action::Click) && !s.is_disabled())
+    /// Whether the row, or a control in it such as a radio, acts.
+    pub fn actionable(&self, row: usize) -> bool {
+        self.under(self.rows[row])
+            .any(|i| self.acts(i, Action::Click))
     }
 
     /// Selects a row and scrolls it into a view `height` tall.
     pub fn select(&mut self, row: Option<usize>, height: f32) {
         self.selected = row;
-        for r in 0..self.rows.len() {
+        // In a form the keyboard row is the focus; selected means chosen.
+        for r in (0..self.rows.len()).filter(|_| !self.form) {
             if let Some(s) = self.nodes[self.rows[r]].semantic.as_mut() {
-                if s.role() != Role::RadioButton {
-                    s.set_selected(row == Some(r));
-                }
+                s.set_selected(row == Some(r));
             }
         }
         if self.focused.is_none_or(|f| !self.is_text(f)) {
@@ -384,7 +439,11 @@ impl Tree {
         }
         if let Some(r) = row {
             let b = self.bounds[self.rows[r]];
-            let pad = self.bounds[0].h - self.content_bottom();
+            let pad = if self.form {
+                FORM_PAD
+            } else {
+                self.bounds[0].h - self.content_bottom()
+            };
             let most = (self.bounds[0].h - height).max(0.0);
             self.scroll = self
                 .scroll
@@ -472,19 +531,57 @@ impl Tree {
             })
             .into_iter()
             .collect();
+        let hovered = self.hovered.and_then(|id| self.index_of(id));
         let mut stack = vec![(0, Mark::Rest)];
         while let Some((i, inherited)) = stack.pop() {
-            let mark = marks
-                .iter()
-                .find(|(n, _)| *n == i)
-                .map_or(inherited, |m| m.1);
+            let mark = if hovered == Some(i) {
+                Mark::Hover
+            } else {
+                marks
+                    .iter()
+                    .find(|(n, _)| *n == i)
+                    .map_or(inherited, |m| m.1)
+            };
             let b = self.at(i, (view.x, view.y));
             if i == 0 || (b.y < view.y + view.h && b.y + b.h > view.y) {
                 self.nodes[i].content.paint(c, p, b, mark);
-                stack.extend(self.nodes[i].children.iter().rev().map(|&k| (k, mark)));
+                let pass = if self.form && i != 0 && self.rows.contains(&i) {
+                    Mark::Rest
+                } else {
+                    mark
+                };
+                stack.extend(self.nodes[i].children.iter().rev().map(|&k| (k, pass)));
             }
         }
+        if self.form {
+            self.paint_focus(c, view);
+            self.paint_bar(c, view);
+        }
         c.clip = clip;
+    }
+
+    /// A 2 px ring outside the node the keyboard focus is on.
+    fn paint_focus(&self, c: &mut Canvas, view: Rect) {
+        let Some(row) = self.focused.filter(|_| !self.pointer) else {
+            return;
+        };
+        let b = self.at(self.focus_node(row), (view.x, view.y));
+        let k = &crate::draw::theme().controls;
+        painter::ring(c, b.inset(-3.0), 9.0, k.focus);
+        painter::ring(c, b.inset(-2.0), 8.0, k.focus);
+    }
+
+    fn paint_bar(&self, c: &mut Canvas, view: Rect) {
+        let Some((_, thumb)) = self.bar(view) else {
+            return;
+        };
+        let k = &crate::draw::theme().controls;
+        let color = if self.thumb == Thumb::Rest {
+            k.thumb
+        } else {
+            k.thumb_active
+        };
+        painter::rounded(c, thumb, BAR_W / 2.0, color);
     }
 
     /// The semantic nodes in screen coordinates for a platform publisher.
@@ -497,9 +594,46 @@ impl Tree {
         self.accesskit_node(0, view, origin, &mut nodes);
         let focus = self
             .focused
-            .and_then(|r| self.text_node(r).or(Some(self.rows[r])))
-            .map_or(self.nodes[0].id, |i| self.nodes[i].id);
+            .map_or(self.nodes[0].id, |r| self.nodes[self.focus_node(r)].id);
+        if let Some((track, _)) = self.bar(view) {
+            let root = self.nodes[0].id;
+            let id = NodeId(self.scrollbar_id());
+            let max = self.scroll_max(view.h) as f64;
+            let mut bar = accesskit::Node::new(Role::ScrollBar);
+            bar.set_orientation(accesskit::Orientation::Vertical);
+            bar.set_numeric_value(self.scroll as f64);
+            bar.set_min_numeric_value(0.0);
+            bar.set_max_numeric_value(max);
+            bar.set_numeric_value_step(48.0);
+            bar.set_numeric_value_jump(view.h as f64);
+            bar.add_action(Action::SetValue);
+            bar.set_controls(vec![root]);
+            let (x, y) = (
+                track.x as f64 + origin.0 as f64,
+                track.y as f64 + origin.1 as f64,
+            );
+            bar.set_bounds(accesskit::Rect::new(
+                x,
+                y,
+                x + track.w as f64,
+                y + track.h as f64,
+            ));
+            if let Some((_, r)) = nodes.iter_mut().find(|(n, _)| *n == root) {
+                r.set_scroll_y(self.scroll as f64);
+                r.set_scroll_y_min(0.0);
+                r.set_scroll_y_max(max);
+                r.add_action(Action::ScrollDown);
+                r.add_action(Action::ScrollUp);
+                r.push_child(id);
+            }
+            nodes.push((id, bar));
+        }
         (nodes, focus)
+    }
+
+    /// The id of the scrollbar a form adds to its semantics.
+    pub fn scrollbar_id(&self) -> u64 {
+        self.nodes[0].id.0 | 1 << 62
     }
 
     fn accesskit_node(
@@ -546,7 +680,7 @@ impl Tree {
         let (ox, oy) = (origin.0 as f32, origin.1 as f32);
         let focused = self
             .focused
-            .is_some_and(|r| self.rows[r] == i || self.text_node(r) == Some(i));
+            .is_some_and(|r| self.rows[r] == i || self.focus_node(r) == i);
         let actions: Vec<&str> = [
             (Action::Click, "click"),
             (Action::Focus, "focus"),
@@ -559,13 +693,14 @@ impl Tree {
         let mut node = json!({
             "id": self.nodes[i].id.0,
             "role": role_name(s.role()),
-            "name": s.label().unwrap_or(""),
+            "name": s.label().or(s.value().filter(|_| s.role() == Role::Label)).unwrap_or(""),
             "value": s.value(),
             "states": {
                 "focused": focused,
                 "selected": s.is_selected().unwrap_or(false),
                 "disabled": s.is_disabled(),
                 "expanded": s.is_expanded().unwrap_or(false),
+                "checked": s.toggled() == Some(accesskit::Toggled::True),
             },
             "actions": actions,
             "bounds": {"x": ox + b.x, "y": oy + b.y, "width": b.w, "height": b.h},
@@ -577,12 +712,121 @@ impl Tree {
         vec![self.nodes[i].id.0]
     }
 
-    /// The row of a node id agents named.
+    /// The row of a node id agents named: the row itself or a node in it.
     pub fn row_of(&self, id: u64) -> Option<usize> {
-        (0..self.rows.len()).find(|&r| {
-            self.nodes[self.rows[r]].id.0 == id
-                || self.text_node(r).is_some_and(|i| self.nodes[i].id.0 == id)
+        (0..self.rows.len()).find(|&r| self.under(self.rows[r]).any(|i| self.nodes[i].id.0 == id))
+    }
+
+    /// A node and the nodes under it.
+    fn under(&self, top: usize) -> impl Iterator<Item = usize> + '_ {
+        let mut stack = vec![top];
+        std::iter::from_fn(move || {
+            let i = stack.pop()?;
+            stack.extend(self.nodes[i].children.iter().rev());
+            Some(i)
         })
+    }
+
+    fn index_of(&self, id: u64) -> Option<usize> {
+        self.nodes.iter().position(|n| n.id.0 == id)
+    }
+
+    #[cfg(test)]
+    pub fn semantic(&self, id: u64) -> Option<&accesskit::Node> {
+        self.nodes[self.index_of(id)?].semantic.as_ref()
+    }
+
+    /// The node of a row the keyboard focus is on: its text input, else
+    /// its checked radio button, else the row.
+    fn focus_node(&self, row: usize) -> usize {
+        self.text_node(row)
+            .or_else(|| {
+                self.under(self.rows[row]).find(|&i| {
+                    self.nodes[i].semantic.as_ref().is_some_and(|s| {
+                        s.role() == Role::RadioButton
+                            && s.toggled() == Some(accesskit::Toggled::True)
+                    })
+                })
+            })
+            .unwrap_or(self.rows[row])
+    }
+
+    /// Of the radio group a row holds, the radio after or before the
+    /// checked one, wrapping; for arrow keys, which move and check.
+    pub fn radio_step(&self, row: usize, forward: bool) -> Option<u64> {
+        let radios: Vec<usize> = self
+            .under(self.rows[row])
+            .filter(|&i| {
+                self.nodes[i]
+                    .semantic
+                    .as_ref()
+                    .is_some_and(|s| s.role() == Role::RadioButton && !s.is_disabled())
+            })
+            .collect();
+        if radios.is_empty() {
+            return None;
+        }
+        let at = radios.iter().position(|&i| {
+            self.nodes[i].semantic.as_ref().and_then(|s| s.toggled())
+                == Some(accesskit::Toggled::True)
+        });
+        let n = radios.len();
+        let next = match (at, forward) {
+            (Some(i), true) => (i + 1) % n,
+            (Some(i), false) => (i + n - 1) % n,
+            (None, _) => 0,
+        };
+        Some(self.nodes[radios[next]].id.0)
+    }
+
+    /// How far the content can scroll in a view `height` tall.
+    pub fn scroll_max(&self, height: f32) -> f32 {
+        (self.bounds[0].h - height).max(0.0)
+    }
+
+    pub fn scroll_to(&mut self, y: f32, height: f32) {
+        self.scroll = y.clamp(0.0, self.scroll_max(height));
+    }
+
+    /// The track and the thumb of the scrollbar of a form in `view`.
+    fn bar(&self, view: Rect) -> Option<(Rect, Rect)> {
+        let max = self.scroll_max(view.h);
+        if !self.form || max <= 0.0 {
+            return None;
+        }
+        let track = Rect::new(
+            view.x + view.w - BAR_W - BAR_INSET,
+            view.y + BAR_INSET,
+            BAR_W,
+            view.h - 2.0 * BAR_INSET,
+        );
+        let h = (track.h * view.h / self.bounds[0].h).clamp(MIN_THUMB.min(track.h), track.h);
+        let y = track.y + (track.h - h) * self.scroll / max;
+        Some((track, Rect::new(track.x, y, BAR_W, h)))
+    }
+
+    /// What a point hits on the scrollbar, if anything. The target is a
+    /// little wider than the bar.
+    pub fn bar_hit(&self, view: Rect, x: f32, y: f32) -> Option<BarHit> {
+        let (track, thumb) = self.bar(view)?;
+        if x < track.x - 6.0 || x > view.x + view.w || y < view.y || y >= view.y + view.h {
+            return None;
+        }
+        Some(if y >= thumb.y && y < thumb.y + thumb.h {
+            BarHit::Thumb(y - thumb.y)
+        } else {
+            BarHit::Track(y > thumb.y)
+        })
+    }
+
+    /// Scrolls so the thumb, held `grab` below its top, follows `y`.
+    pub fn drag_thumb(&mut self, view: Rect, y: f32, grab: f32) {
+        let Some((track, thumb)) = self.bar(view) else {
+            return;
+        };
+        let room = (track.h - thumb.h).max(1.0);
+        let at = (y - grab - track.y).clamp(0.0, room);
+        self.scroll_to(at / room * self.scroll_max(view.h), view.h);
     }
 
     /// Whether the node of a row, or the input in it, supports an action.
@@ -590,18 +834,32 @@ impl Tree {
         [Some(self.rows[row]), self.text_node(row)]
             .into_iter()
             .flatten()
-            .any(|i| {
-                self.nodes[i]
-                    .semantic
-                    .as_ref()
-                    .is_some_and(|s| !s.is_disabled() && s.supports_action(action))
-            })
+            .any(|i| self.acts(i, action))
+    }
+
+    /// Whether the node with this id is enabled and supports an action.
+    pub fn node_supports(&self, id: u64, action: Action) -> bool {
+        self.index_of(id).is_some_and(|i| self.acts(i, action))
+    }
+
+    fn acts(&self, i: usize, action: Action) -> bool {
+        self.nodes[i]
+            .semantic
+            .as_ref()
+            .is_some_and(|s| !s.is_disabled() && s.supports_action(action))
     }
 }
 
 fn role_name(role: Role) -> &'static str {
     match role {
         Role::RadioButton => "radio_button",
+        Role::RadioGroup => "radio_group",
+        Role::ComboBox => "combo_box",
+        Role::ListBox => "list_box",
+        Role::ListBoxOption => "list_box_option",
+        Role::Window => "window",
+        Role::Status => "status",
+        Role::ScrollBar => "scroll_bar",
         Role::Switch => "switch",
         Role::TitleBar => "title_bar",
         Role::Button => "button",
@@ -609,6 +867,7 @@ fn role_name(role: Role) -> &'static str {
         Role::Label => "label",
         Role::Menu => "menu",
         Role::MenuItem => "menu_item",
+        Role::MenuItemCheckBox => "menu_item_check_box",
         Role::TextInput => "text_input",
         Role::SearchInput => "search_input",
         Role::Heading => "heading",

@@ -53,6 +53,27 @@ pub struct Theme {
     pub light_drop: u32,
     /// All three lights of a window that is not focused.
     pub light_idle: Raised,
+    pub controls: Controls,
+}
+
+/// The colors of the form controls in `ui::kit`.
+pub struct Controls {
+    /// Behind the rows of a section.
+    pub card: u32,
+    pub card_ring: u32,
+    /// A row or segment under the pointer, lighter than the card in dark.
+    pub hover: u32,
+    /// The well of a segmented control.
+    pub track: u32,
+    /// The chosen segment.
+    pub on: u32,
+    pub on_ring: u32,
+    /// The keyboard focus ring, at least 3:1 on the card and the window.
+    pub focus: u32,
+    pub thumb: u32,
+    /// The thumb under the pointer or held.
+    pub thumb_active: u32,
+    pub error: u32,
 }
 
 /// A window light of a focused window, the same in both appearances.
@@ -124,6 +145,18 @@ pub static DARK: Theme = Theme {
         hi: 0x46464c,
         shadow: 0x0c0c0e,
     },
+    controls: Controls {
+        card: 0x141416,
+        card_ring: 0x26262b,
+        hover: 0x1f1f23,
+        track: 0x0c0c0e,
+        on: 0x2c2c31,
+        on_ring: 0x3a3a40,
+        focus: 0xa8a8ae,
+        thumb: 0x6b6b72,
+        thumb_active: 0x9d9da2,
+        error: 0xff8a80,
+    },
 };
 
 pub static LIGHT: Theme = Theme {
@@ -154,6 +187,18 @@ pub static LIGHT: Theme = Theme {
         ring: 0xc4c4ca,
         hi: 0xe2e2e6,
         shadow: 0xdcdce0,
+    },
+    controls: Controls {
+        card: 0xfbfbfc,
+        card_ring: 0xdadade,
+        hover: 0xf0f0f2,
+        track: 0xe6e6ea,
+        on: 0xffffff,
+        on_ring: 0xc2c2c9,
+        focus: 0x45454c,
+        thumb: 0x80808a,
+        thumb_active: 0x5c5c63,
+        error: 0xb42318,
     },
 };
 
@@ -776,9 +821,15 @@ mod contrast_tests {
         0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
     }
 
+    fn contrast(x: u32, y: u32) -> f64 {
+        let (a, b) = (luminance(x), luminance(y));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
     #[test]
-    fn settings_text_meets_aa_on_each_control_surface() {
+    fn text_meets_aa_on_each_surface() {
         for theme in [&LIGHT, &DARK] {
+            let k = &theme.controls;
             for ink in [theme.text, theme.dim] {
                 for surface in [
                     theme.bg,
@@ -787,12 +838,41 @@ mod contrast_tests {
                     theme.hover,
                     theme.selected,
                     theme.winbar,
+                    k.card,
+                    k.hover,
+                    k.track,
+                    k.on,
                 ] {
-                    let (a, b) = (luminance(ink), luminance(surface));
-                    let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
-                    assert!(contrast >= 4.5, "{ink:06x} on {surface:06x}: {contrast}");
+                    let c = contrast(ink, surface);
+                    assert!(c >= 4.5, "{ink:06x} on {surface:06x}: {c}");
                 }
             }
+            for surface in [theme.bg, k.card, k.hover] {
+                let c = contrast(k.error, surface);
+                assert!(c >= 4.5, "error {:06x} on {surface:06x}: {c}", k.error);
+            }
         }
+    }
+
+    #[test]
+    fn focus_rings_and_thumbs_meet_the_non_text_minimum() {
+        for theme in [&LIGHT, &DARK] {
+            let k = &theme.controls;
+            for surface in [theme.bg, k.card, k.hover, k.track] {
+                let c = contrast(k.focus, surface);
+                assert!(c >= 3.0, "focus {:06x} on {surface:06x}: {c}", k.focus);
+            }
+            for thumb in [k.thumb, k.thumb_active] {
+                let c = contrast(thumb, theme.bg);
+                assert!(c >= 3.0, "thumb {thumb:06x}: {c}");
+            }
+        }
+    }
+
+    #[test]
+    fn dark_hover_is_lighter_than_the_card() {
+        let k = &DARK.controls;
+        assert!(luminance(k.hover) > luminance(k.card));
+        assert!(luminance(k.on) > luminance(k.track));
     }
 }
