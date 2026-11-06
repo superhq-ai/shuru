@@ -35,6 +35,7 @@ use crate::apps::App;
 use crate::bus;
 use crate::chrome::{self, Light, PanelHit, PanelLayout, RAIL_W, RIPPLE};
 use crate::draw::{self, Font, Image};
+use crate::wallpaper;
 
 x11rb::atom_manager! {
     pub Atoms: AtomsCookie {
@@ -149,6 +150,8 @@ pub enum Cmd {
     },
     /// Reads the appearance, or sets it to dark or light first.
     Appearance(Option<bool>, Reply),
+    /// Reads the wallpaper, or sets it to a named picture first.
+    Wallpaper(Option<String>, Reply),
     Notify(Box<bus::Note>, Reply),
     CloseNote(u32, Reply),
     Notifications(Reply),
@@ -473,6 +476,9 @@ pub struct Wm {
     keys: input::Keys,
     /// The appearance setting, watched.
     watch: Option<appearance::Watch>,
+    /// The wallpaper setting and the picture it names, read once.
+    wallpaper: Option<wallpaper::Choice>,
+    wall: Option<draw::Canvas>,
     xsettings_serial: u32,
     notes: notes::Notes,
     last_accessibility: Option<accesskit::TreeUpdate>,
@@ -600,6 +606,8 @@ pub fn start(
         switching: None,
         keys: input::Keys::default(),
         watch: appearance::Watch::new(),
+        wallpaper: None,
+        wall: None,
         xsettings_serial: 0,
         notes: notes::Notes::new(crate::dnd::read()),
         bus: Some(bus),
@@ -961,6 +969,7 @@ impl Wm {
         self.conn
             .send_event(false, root, EventMask::STRUCTURE_NOTIFY, ev)?;
         self.publish_appearance()?;
+        self.set_wallpaper(wallpaper::read())?;
         self.chrome()?;
         self.conn.flush()?;
         Ok(())

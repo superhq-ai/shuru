@@ -102,6 +102,11 @@ struct Appearance {
 }
 
 #[derive(Deserialize)]
+struct Wallpaper {
+    wallpaper: String,
+}
+
+#[derive(Deserialize)]
 struct Id {
     id: u32,
 }
@@ -210,6 +215,16 @@ async fn route(state: State, request: Request<Incoming>) -> Response<Body> {
             }
             Err(e) => error(StatusCode::BAD_REQUEST, e),
         },
+        (Method::GET, "/wallpaper") => answer(state.wm.call(|r| Cmd::Wallpaper(None, r)).await),
+        (Method::PUT, "/wallpaper") => match body::<Wallpaper>(request).await {
+            Ok(b) => answer(
+                state
+                    .wm
+                    .call(|r| Cmd::Wallpaper(Some(b.wallpaper), r))
+                    .await,
+            ),
+            Err(e) => error(StatusCode::BAD_REQUEST, e),
+        },
         (Method::GET, "/notifications") => answer(state.wm.call(Cmd::Notifications).await),
         (Method::POST, p) if p.starts_with("/notifications/") && p.ends_with("/action") => {
             let id = p
@@ -289,7 +304,7 @@ async fn route(state: State, request: Request<Incoming>) -> Response<Body> {
         (
             _,
             "/healthz" | "/windows" | "/focus" | "/close" | "/launch" | "/settle" | "/overlay"
-            | "/appearance" | "/notifications" | "/tree" | "/tree/action",
+            | "/appearance" | "/wallpaper" | "/notifications" | "/tree" | "/tree/action",
         ) => error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
         _ => error(StatusCode::NOT_FOUND, format!("no route {path}")),
     }

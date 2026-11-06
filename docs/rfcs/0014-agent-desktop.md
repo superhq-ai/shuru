@@ -152,6 +152,29 @@ GTK theme.
 
 `GET /appearance` and `PUT /appearance` read and set it.
 
+## Wallpaper
+
+The picture behind the windows, beside the appearance. The setting is the
+file `$XDG_CONFIG_HOME/superhq/wallpaper`, holding `default`, `none` or
+the bare name of a picture, watched with inotify like the appearance.
+
+A name is looked up as `NAME.png`, `.jpg`, `.jpeg` or `.webp` in the
+`backgrounds` directory of each XDG data dir, so a guest's own pictures
+come from `/usr/share/backgrounds`, and a person can add one under
+`~/.local/share/backgrounds`; a name with a `/` is a path and is taken as
+it is. The picture is covered into the screen, keeping its proportions and
+cutting what does not fit from both sides, scaled by area so it is not
+aliased, and is read again when the screen size changes. A name the shell
+cannot show is refused with 400 and the setting is left alone.
+
+It is read once, at start and when the setting changes, and kept in
+memory, so it costs nothing while the desktop runs, and it is drawn in
+the root window, under the panel, the rail, the frames and the overlays,
+so a maximized window covers the work area and not the wallpaper.
+
+`GET /wallpaper` and `PUT /wallpaper` read and set it, and the
+appearance section of Settings offers it as a segmented control.
+
 ## Notifications
 
 The window manager owns `org.freedesktop.Notifications` on the session
@@ -217,6 +240,7 @@ HTTP on a Unix socket (`/run/shuru-desktop.sock`, mode 0600), JSON.
 | `GET /settle?quiet_ms=300&max_ms=5000` | answers once the screen has not changed for `quiet_ms`, from the damage events of the display |
 | `GET /overlay`, `POST /overlay {who, ripple?}` | who is in control; a ripple at a point |
 | `GET /appearance`, `PUT /appearance {appearance}` | light or dark |
+| `GET /wallpaper`, `PUT /wallpaper {wallpaper}` | the picture, or `default` or `none` |
 | `GET /notifications` | the recent notifications, open or closed |
 | `POST /notifications/{id}/action {key?}` | runs an action, `default` by default |
 

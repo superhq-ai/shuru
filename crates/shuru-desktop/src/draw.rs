@@ -277,6 +277,7 @@ impl Rect {
     }
 }
 
+#[derive(Clone)]
 pub struct Canvas {
     pub w: usize,
     pub h: usize,
@@ -460,6 +461,108 @@ pub struct Image {
     pub w: usize,
     pub h: usize,
     pub px: Vec<u32>,
+}
+
+impl Image {
+    /// The size a PNG says it has, without decoding its pixels.
+    pub fn size_of(path: &std::path::Path) -> Option<(usize, usize)> {
+        let mut dec = png::Decoder::new(std::fs::File::open(path).ok()?);
+        dec.set_transformations(png::Transformations::normalize_to_color8());
+        let reader = dec.read_info().ok()?;
+        let (w, h) = (reader.info().width as usize, reader.info().height as usize);
+        (w > 0 && h > 0).then_some((w, h))
+    }
+
+    /// A PNG read from a file and scaled to `w` by `h` pixels, the size
+    /// it is shown at. The picture is drawn in the proportions it has:
+    /// the size asked for is the frame it covers, and the reader keeps
+    /// what fits, so a wallpaper is never stretched.
+    pub fn load(path: &std::path::Path, w: usize, h: usize) -> Option<Image> {
+        let file = std::fs::File::open(path).ok()?;
+        let mut dec = png::Decoder::new(file);
+        // The palette is normalized away, so every pixel is 8 bit RGBA.
+        dec.set_transformations(png::Transformations::normalize_to_color8());
+        let mut reader = dec.read_info().ok()?;
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).ok()?;
+        let (iw, ih) = (info.width as usize, info.height as usize);
+        if iw == 0 || ih == 0 {
+            return None;
+        }
+        let n = info.color_type.samples();
+        let px: Vec<u32> = buf[..info.buffer_size()]
+            .chunks_exact(n)
+            .map(|p| {
+                let (r, g, b, a) = match n {
+                    4 => (p[0], p[1], p[2], p[3]),
+                    3 => (p[0], p[1], p[2], 255),
+                    2 => (p[0], p[0], p[0], p[1]),
+                    _ => (p[0], p[0], p[0], 255),
+                };
+                (a as u32) << 24 | (r as u32) << 16 | (g as u32) << 8 | b as u32
+            })
+            .collect();
+        Some(resample(&Image { w: iw, h: ih, px }, w, h))
+    }
+}
+
+/// The picture read into the `w` by `h` box it covers, keeping its
+/// proportions as a wall is kept by a cover crop: the part that does not
+/// fit is cut from both sides, and the image is scaled by area, so it is
+/// not aliased.
+pub fn resample(src: &Image, w: usize, h: usize) -> Image {
+    let (w, h) = (w.max(1), h.max(1));
+    if src.w == w && src.h == h {
+        return src.clone();
+    }
+    // The scale that covers the box: the larger of the two ratios. One
+    // pixel of the box is `1 / scale` pixels of the source, and the
+    // window the box shows is centered on the source.
+    let scale = (w as f64 / src.w as f64).max(h as f64 / src.h as f64);
+    let (cx, cy) = (
+        (src.w as f64 - w as f64 / scale) / 2.0,
+        (src.h as f64 - h as f64 / scale) / 2.0,
+    );
+    let step = 1.0 / scale;
+    let mut px = Vec::with_capacity(w * h);
+    for y in 0..h {
+        let (y0, y1) = (cy + y as f64 * step, cy + (y as f64 + 1.0) * step);
+        for x in 0..w {
+            let (x0, x1) = (cx + x as f64 * step, cx + (x as f64 + 1.0) * step);
+            let mut acc = [0.0f32; 4];
+            let mut area = 0.0;
+            for sy in y0.floor() as usize..(y1.ceil() as usize).min(src.h) {
+                let wy = (y1.min(sy as f64 + 1.0) - y0.max(sy as f64)).max(0.0);
+                for sx in x0.floor() as usize..(x1.ceil() as usize).min(src.w) {
+                    let wx = (x1.min(sx as f64 + 1.0) - x0.max(sx as f64)).max(0.0);
+                    let p = src.px[sy * src.w + sx];
+                    let a = (p >> 24) as f32 / 255.0;
+                    // Weighted by alpha, so a transparent pixel does not
+                    // darken the color under it.
+                    let weight = (wy * wx) as f32 * a;
+                    acc[0] += (p >> 16 & 0xff) as f32 * weight;
+                    acc[1] += (p >> 8 & 0xff) as f32 * weight;
+                    acc[2] += (p & 0xff) as f32 * weight;
+                    acc[3] += weight * 255.0;
+                    area += (wy * wx) as f32;
+                }
+            }
+            let (r, g, b, a) = if acc[3] > 0.0 {
+                let alpha = acc[3] / 255.0;
+                (
+                    acc[0] / alpha,
+                    acc[1] / alpha,
+                    acc[2] / alpha,
+                    acc[3] / area.max(1.0),
+                )
+            } else {
+                (0.0, 0.0, 0.0, 0.0)
+            };
+            let clamp = |v: f32| v.clamp(0.0, 255.0) as u32;
+            px.push(clamp(a) << 24 | clamp(r) << 16 | clamp(g) << 8 | clamp(b));
+        }
+    }
+    Image { w, h, px }
 }
 
 /// How much of each pixel of a `w` by `h` grid a closed outline covers,
@@ -742,6 +845,69 @@ impl Font {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn solid(w: usize, h: usize, color: u32) -> Image {
+        Image {
+            w,
+            h,
+            px: vec![color; w * h],
+        }
+    }
+
+    #[test]
+    fn a_picture_of_a_solid_color_stays_that_color() {
+        let src = solid(8, 8, 0xff204080);
+        let out = resample(&src, 4, 4);
+        assert_eq!((out.w, out.h), (4, 4));
+        for p in &out.px {
+            assert_eq!(*p, 0xff204080);
+        }
+    }
+
+    #[test]
+    fn a_wider_picture_is_cropped_from_both_sides() {
+        // Blue at the far left and right, red in the middle, in a
+        // picture that is much wider than the box: a cover crop keeps
+        // the middle and drops both blue edges.
+        let mut src = solid(12, 3, 0xffff0000);
+        for y in 0..3 {
+            for x in [0usize, 1, 10, 11] {
+                src.px[y * 12 + x] = 0xff0000ff;
+            }
+        }
+        let out = resample(&src, 2, 2);
+        assert_eq!((out.w, out.h), (2, 2));
+        for p in &out.px {
+            assert_eq!(*p, 0xffff0000, "an edge band survived: {p:08x}");
+        }
+    }
+
+    #[test]
+    fn a_picture_is_never_stretched() {
+        // A tall picture in a square box keeps its proportions: the
+        // columns at the sides of the answer are the sides of the source.
+        let mut src = solid(2, 8, 0xffff0000);
+        for y in 0..8 {
+            for x in 0..2 {
+                src.px[y * 2 + x] = if y < 4 { 0xffff0000 } else { 0xff0000ff };
+            }
+        }
+        let out = resample(&src, 4, 4);
+        // The middle rows of the source fill the box, so the top of the
+        // answer is red and the bottom blue, with no seam of mix at the
+        // top or the bottom edge.
+        assert!(out.px[0] >> 16 & 0xff > 200);
+        assert!(out.px[3 * 4 + 3] & 0xff > 200);
+    }
+
+    #[test]
+    fn the_size_asked_for_is_the_size_answered() {
+        for (w, h) in [(1, 1), (3, 7), (64, 16), (16, 64)] {
+            let out = resample(&solid(5, 5, 0xff00ff00), w, h);
+            assert_eq!((out.w, out.h), (w, h));
+            assert_eq!(out.px.len(), w * h);
+        }
+    }
 
     #[test]
     fn rounded_rect_covers_the_middle_not_the_corner() {

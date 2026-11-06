@@ -46,6 +46,7 @@ fn preferences(dir: &Path) -> Preferences {
             app("files", "Files", "Utility"),
         ],
         dark: false,
+        wallpaper: crate::wallpaper::Choice::Default,
         lang: Lang::En,
         quiet: false,
         os: os_name("ID=debian\nPRETTY_NAME=\"Debian GNU/Linux 13 (trixie)\"\n"),
@@ -150,14 +151,45 @@ fn every_control_is_reachable_in_reading_order() {
     let p = preferences(&dir.0);
     let mut t = tree(&p);
     let mut seen = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..6 {
         t.step(true, 400.0);
         seen.push(t.selected_id().unwrap());
     }
     assert_eq!(
         seen,
-        [APPEARANCE, LANGUAGE, BROWSER, TERMINAL, DO_NOT_DISTURB]
+        [
+            APPEARANCE,
+            WALLPAPER,
+            LANGUAGE,
+            BROWSER,
+            TERMINAL,
+            DO_NOT_DISTURB
+        ]
     );
+}
+
+#[test]
+fn choosing_a_wallpaper_saves_it_and_keeps_the_other_choices() {
+    let dir = Directory::new("wallpaper");
+    let mut p = preferences(&dir.0);
+    assert_eq!(p.wallpaper, crate::wallpaper::Choice::Default);
+    // The third choice of the shell, whatever it is named.
+    assert_eq!(click(&mut p, WALLPAPERS + 2), None);
+    assert_eq!(p.wallpaper.name(), crate::wallpaper::CHOICES[2]);
+    assert_ne!(p.wallpaper, crate::wallpaper::Choice::Default);
+    // The row is a segmented control with a segment per choice, and the
+    // chosen one shows as selected.
+    let t = tree(&p);
+    let s = t.semantic(WALLPAPER).unwrap();
+    assert_eq!(s.label(), Some("Wallpaper"));
+    assert!(s.description().is_some_and(|d| d.contains("backgrounds")));
+    let choice = t.semantic(WALLPAPERS + 2).unwrap();
+    assert_eq!(choice.role(), Role::RadioButton);
+    assert_eq!(choice.toggled(), Some(Toggled::True));
+    assert_eq!(choice.label(), Some(crate::wallpaper::CHOICES[2]));
+    // None is a choice of its own: no picture, not the flat default.
+    assert_eq!(click(&mut p, WALLPAPERS + 1), None);
+    assert_eq!(p.wallpaper, crate::wallpaper::Choice::None);
 }
 
 #[test]

@@ -23,6 +23,7 @@ use crate::apps::{self, App};
 use crate::chrome::{self, Corner, BAR_H, CORNER};
 use crate::draw;
 use crate::draw::theme;
+use crate::wallpaper;
 
 const CURSOR_POLL: Duration = Duration::from_millis(100);
 const CURSOR_IDLE: Duration = Duration::from_secs(2);
@@ -102,6 +103,9 @@ impl Wm {
             };
             if changes.appearance {
                 self.set_appearance(appearance::read())?;
+            }
+            if changes.wallpaper {
+                self.set_wallpaper(wallpaper::read())?;
             }
             if changes.language && crate::locale::reload() {
                 self.set_language()?;
@@ -1649,6 +1653,24 @@ impl Wm {
                     json!({ "appearance": appearance::name(draw::is_dark()) }),
                 ));
             }
+            Cmd::Wallpaper(set, reply) => {
+                if let Some(name) = set {
+                    // A name that is neither a choice of the shell nor a
+                    // file is refused, so a typo does not replace the
+                    // wallpaper a person chose with the default.
+                    if !wallpaper::Choice::known(&name) {
+                        let _ = reply.send(Err((400, format!("no wallpaper {name}"))));
+                        return Ok(());
+                    }
+                    let choice = wallpaper::Choice::of(&name);
+                    if let Err(e) = wallpaper::write(choice) {
+                        let _ = reply.send(Err((500, format!("writing the wallpaper: {e}"))));
+                        return Ok(());
+                    }
+                    self.set_wallpaper(choice)?;
+                }
+                let _ = reply.send(Ok(json!({ "wallpaper": self.wallpaper_name() })));
+            }
             Cmd::Notify(note, reply) => {
                 let id = self.notify(*note)?;
                 let _ = reply.send(Ok(json!({ "id": id })));
@@ -1812,6 +1834,10 @@ impl Wm {
         self.sh = h;
         self.close_pop()?;
         self.fit_screen()?;
+        // The picture is read for the screen it is shown on, so a new
+        // size reads it again.
+        let choice = self.wallpaper.unwrap_or(wallpaper::Choice::Default);
+        self.set_wallpaper(choice)?;
         let (wx, wy, ww, wh) = chrome::work_area(w, h);
         let wins: Vec<Window> = self.clients.keys().copied().collect();
         for win in wins {
