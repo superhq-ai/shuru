@@ -54,6 +54,13 @@ impl Wm {
                     busy = true;
                 }
             }
+            let update = self.accessibility_tree();
+            if self.last_accessibility.as_ref() != Some(&update) {
+                if let Some(bus) = &self.bus {
+                    let _ = bus.send(crate::bus::Event::Tree(Box::new(update.clone())));
+                }
+                self.last_accessibility = Some(update);
+            }
             self.conn.flush()?;
             let timeout = self.next_deadline().map_or(-1, |d| {
                 d.saturating_duration_since(Instant::now())
@@ -1063,6 +1070,7 @@ impl Wm {
 
     fn unmanage(&mut self, w: Window, destroyed: bool) -> Result<()> {
         self.foreign.retain(|&x| x != w);
+        self.bar_trees.remove(&w);
         let Some(c) = self.clients.remove(&w) else {
             return Ok(());
         };
@@ -1671,6 +1679,8 @@ impl Wm {
         let mut child = Command::new(&argv[0])
             .args(&argv[1..])
             .env("DISPLAY", &self.display)
+            .env("LANG", crate::locale::messages_locale())
+            .env("LC_ALL", crate::locale::messages_locale())
             .env("QT_ACCESSIBILITY", "1")
             .env("GNOME_ACCESSIBILITY", "1")
             .stdin(Stdio::null())

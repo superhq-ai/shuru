@@ -40,7 +40,11 @@ impl Node {
     pub fn semantic(mut self, id: u64, role: Role, name: &str) -> Self {
         let mut s = accesskit::Node::new(role);
         s.set_label(name);
+        if role == Role::Label {
+            s.set_value(name);
+        }
         match role {
+            Role::Button | Role::RadioButton | Role::Switch => s.add_action(Action::Click),
             Role::MenuItem => {
                 s.add_action(Action::Click);
                 s.add_action(Action::Focus);
@@ -61,6 +65,7 @@ impl Node {
 /// from taffy styles, which are not `Send`, and turned into one for layout.
 #[derive(Clone, Debug, Default)]
 pub struct Style {
+    position: Option<(f32, f32)>,
     column: bool,
     center: bool,
     grow: bool,
@@ -77,6 +82,11 @@ pub fn style() -> Style {
 }
 
 impl Style {
+    pub fn at(mut self, x: f32, y: f32) -> Self {
+        self.position = Some((x, y));
+        self
+    }
+
     pub fn row(mut self) -> Self {
         self.column = false;
         self
@@ -127,6 +137,17 @@ impl Style {
         let [t, r, b, l] = self.pad;
         let [mt, mr, mb, ml] = self.margin;
         taffy::Style {
+            position: if self.position.is_some() {
+                taffy::Position::Absolute
+            } else {
+                taffy::Position::Relative
+            },
+            inset: taffy::Rect {
+                left: edge(self.position.map(|p| p.0)),
+                top: edge(self.position.map(|p| p.1)),
+                right: LengthPercentageAuto::auto(),
+                bottom: LengthPercentageAuto::auto(),
+            },
             flex_direction: if self.column {
                 FlexDirection::Column
             } else {
@@ -278,6 +299,10 @@ impl Tree {
         self.nodes[0].id.0
     }
 
+    pub fn selected_id(&self) -> Option<u64> {
+        self.selected.map(|row| self.nodes[self.rows[row]].id.0)
+    }
+
     fn at(&self, i: usize, origin: (f32, f32)) -> Rect {
         let b = self.bounds[i];
         let scrolls = i != 0;
@@ -295,6 +320,35 @@ impl Tree {
         (0..self.nodes.len())
             .find(|&i| matches!(self.nodes[i].content, Content::Field { .. }))
             .map(|i| self.at(i, origin))
+    }
+
+    /// The deepest actionable node under a point inside the view.
+    pub fn hit_node(&self, view: Rect, x: f32, y: f32) -> Option<u64> {
+        if x < view.x || x >= view.x + view.w || y < view.y || y >= view.y + view.h {
+            return None;
+        }
+        (0..self.nodes.len()).rev().find_map(|i| {
+            let s = self.nodes[i].semantic.as_ref()?;
+            let b = self.at(i, (view.x, view.y));
+            (s.supports_action(Action::Click)
+                && !s.is_disabled()
+                && x >= b.x
+                && x < b.x + b.w
+                && y >= b.y
+                && y < b.y + b.h)
+                .then_some(self.nodes[i].id.0)
+        })
+    }
+
+    pub fn set_expanded(&mut self, id: u64, expanded: bool) {
+        if let Some(s) = self
+            .nodes
+            .iter_mut()
+            .find(|n| n.id.0 == id)
+            .and_then(|n| n.semantic.as_mut())
+        {
+            s.set_expanded(expanded);
+        }
     }
 
     /// The row under a point, within the `view` the root shows through.
@@ -320,7 +374,9 @@ impl Tree {
         self.selected = row;
         for r in 0..self.rows.len() {
             if let Some(s) = self.nodes[self.rows[r]].semantic.as_mut() {
-                s.set_selected(row == Some(r));
+                if s.role() != Role::RadioButton {
+                    s.set_selected(row == Some(r));
+                }
             }
         }
         if self.focused.is_none_or(|f| !self.is_text(f)) {
@@ -431,6 +487,44 @@ impl Tree {
         c.clip = clip;
     }
 
+    /// The semantic nodes in screen coordinates for a platform publisher.
+    pub fn accesskit(
+        &self,
+        view: Rect,
+        origin: (i16, i16),
+    ) -> (Vec<(NodeId, accesskit::Node)>, NodeId) {
+        let mut nodes = Vec::new();
+        self.accesskit_node(0, view, origin, &mut nodes);
+        let focus = self
+            .focused
+            .and_then(|r| self.text_node(r).or(Some(self.rows[r])))
+            .map_or(self.nodes[0].id, |i| self.nodes[i].id);
+        (nodes, focus)
+    }
+
+    fn accesskit_node(
+        &self,
+        i: usize,
+        view: Rect,
+        origin: (i16, i16),
+        out: &mut Vec<(NodeId, accesskit::Node)>,
+    ) -> Vec<NodeId> {
+        let mut children = Vec::new();
+        for &child in &self.nodes[i].children {
+            children.extend(self.accesskit_node(child, view, origin, out));
+        }
+        let Some(mut node) = self.nodes[i].semantic.clone() else {
+            return children;
+        };
+        let b = self.at(i, (view.x, view.y));
+        let x = b.x as f64 + origin.0 as f64;
+        let y = b.y as f64 + origin.1 as f64;
+        node.set_bounds(accesskit::Rect::new(x, y, x + b.w as f64, y + b.h as f64));
+        node.set_children(children);
+        out.push((self.nodes[i].id, node));
+        vec![self.nodes[i].id]
+    }
+
     /// The nodes agents see, as `GET /tree` answers them, with the root
     /// shown through `view` and the window at `origin` on the screen.
     pub fn json(&self, view: Rect, origin: (i16, i16)) -> Value {
@@ -500,13 +594,19 @@ impl Tree {
                 self.nodes[i]
                     .semantic
                     .as_ref()
-                    .is_some_and(|s| s.supports_action(action))
+                    .is_some_and(|s| !s.is_disabled() && s.supports_action(action))
             })
     }
 }
 
 fn role_name(role: Role) -> &'static str {
     match role {
+        Role::RadioButton => "radio_button",
+        Role::Switch => "switch",
+        Role::TitleBar => "title_bar",
+        Role::Button => "button",
+        Role::Toolbar => "toolbar",
+        Role::Label => "label",
         Role::Menu => "menu",
         Role::MenuItem => "menu_item",
         Role::TextInput => "text_input",

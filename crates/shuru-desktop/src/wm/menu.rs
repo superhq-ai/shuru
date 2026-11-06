@@ -88,6 +88,35 @@ pub(super) struct Pop {
     field: Option<Field>,
 }
 
+#[derive(Debug, PartialEq)]
+enum ShellClick {
+    Panel(PanelHit),
+    Rail(usize),
+}
+
+fn shell_click(id: u64, has_front: bool, targets: &[Target]) -> Option<ShellClick> {
+    match id {
+        chrome::APPLICATIONS_ID => Some(ShellClick::Panel(PanelHit::Apps)),
+        chrome::FRONT_APP_ID if has_front => Some(ShellClick::Panel(PanelHit::App)),
+        _ => targets
+            .iter()
+            .position(|t| Wm::rail_node_id(t) == id)
+            .map(ShellClick::Rail),
+    }
+}
+
+impl Pop {
+    pub(super) fn is_apps(&self) -> bool {
+        self.what == What::Apps
+    }
+    pub(super) fn is_panel_app(&self) -> bool {
+        matches!(self.what, What::App(_, Anchor::Panel))
+    }
+    pub(super) fn is_rail_app(&self, target: &Target) -> bool {
+        matches!(&self.what, What::App(t, _) if t == target)
+    }
+}
+
 /// A window title without the trailing " - App" most apps add.
 fn window_name(title: &str, app: &str) -> String {
     let short = [" - ", " \u{2014} ", " \u{2013} "]
@@ -362,6 +391,17 @@ impl Wm {
         self.entries.iter().position(|e| e.app.is_browser())
     }
 
+    fn launcher_targets(&self) -> Vec<Target> {
+        let mut targets = self.rail_targets();
+        if let Some(i) = self.entries.iter().position(|e| e.app.id == "settings") {
+            let target = Target::App(i);
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        targets
+    }
+
     fn apps_rows(&self, query: &str) -> Vec<PRow> {
         let q = query.trim().to_lowercase();
         let mut rows = vec![PRow::Search];
@@ -378,7 +418,7 @@ impl Wm {
             }
         }
         let apps: Vec<PRow> = self
-            .rail_targets()
+            .launcher_targets()
             .into_iter()
             .filter_map(|t| match t {
                 Target::App(i) => Some(i),
@@ -627,6 +667,8 @@ impl Wm {
             self.shape(self.ours.pop, &mask)?;
         }
         self.draw_pop()?;
+        self.draw_panel()?;
+        self.draw_rail()?;
         if !had {
             self.conn.map_window(self.ours.pop)?;
         }
@@ -665,6 +707,8 @@ impl Wm {
         self.conn.ungrab_keyboard(CURRENT_TIME)?;
         self.conn.unmap_window(self.ours.pop)?;
         self.moved(p.rect);
+        self.draw_panel()?;
+        self.draw_rail()?;
         Ok(())
     }
 
@@ -797,26 +841,15 @@ impl Wm {
         }
         let (x, y) = (e.root_x, e.root_y);
         if y < PANEL_H as i16 && e.detail == 1 {
-            match self.panel_layout.hit(x as f32, y as f32) {
-                Some(PanelHit::Apps) => self.open_apps_menu()?,
-                Some(PanelHit::App) => {
-                    if let Some(t) = self.front_target() {
-                        self.open_app_menu(t, Anchor::Panel)?;
-                    }
-                }
-                _ => {}
+            if let Some(hit) = self.panel_hit(x as f32, y as f32) {
+                self.panel_click(hit)?;
             }
         } else if x < chrome::RAIL_W as i16 {
-            if let Some(i) = chrome::rail_hit(self.rail_targets.len(), x as f32, y as f32) {
-                let t = self.rail_targets[i].clone();
-                match e.detail {
-                    1 if self.in_front(&t) => self.open_app_menu(t, Anchor::Panel)?,
-                    1 => self.activate(&t)?,
-                    3 => self.open_app_menu(t, Anchor::Rail(i))?,
-                    _ => {}
-                }
+            if let Some(i) = self.rail_hit(x as f32, y as f32) {
+                self.rail_click(i, e.detail)?;
             }
         }
+
         Ok(())
     }
 
@@ -952,12 +985,164 @@ impl Wm {
         }
     }
 
+    pub(super) fn accessibility_tree(&self) -> accesskit::TreeUpdate {
+        let mut nodes = Vec::new();
+        let mut children = Vec::new();
+        let mut focus = accesskit::NodeId(1);
+        for (tree, view, origin, focused) in self.shell_surfaces() {
+            let (mut surface, selected) = tree.accesskit(view, origin);
+            children.push(accesskit::NodeId(tree.root_id()));
+            nodes.append(&mut surface);
+            if focused {
+                focus = selected;
+            }
+        }
+        let mut root = accesskit::Node::new(Role::Window);
+        root.set_label("SuperHQ desktop");
+        root.set_bounds(accesskit::Rect::new(
+            0.0,
+            0.0,
+            self.sw as f64,
+            self.sh as f64,
+        ));
+        root.set_children(children);
+        nodes.push((accesskit::NodeId(1), root));
+        crate::atspi::text_runs(&mut nodes);
+        if let Some(field) = self.pop.as_ref().and_then(|p| p.field.as_ref()) {
+            let (anchor, focus) = field.selection_indices();
+            for (_, node) in &mut nodes {
+                if node.role() == Role::SearchInput {
+                    if let Some(&run) = node.children().first() {
+                        node.set_text_selection(accesskit::TextSelection {
+                            anchor: accesskit::TextPosition {
+                                node: run,
+                                character_index: anchor,
+                            },
+                            focus: accesskit::TextPosition {
+                                node: run,
+                                character_index: focus,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        accesskit::TreeUpdate {
+            nodes,
+            tree: Some(accesskit::TreeInfo::new(accesskit::NodeId(1))),
+            tree_id: accesskit::TreeId::ROOT,
+            focus,
+        }
+    }
+
+    fn shell_surfaces(&self) -> Vec<(&Tree, Rect, (i16, i16), bool)> {
+        let mut surfaces = Vec::new();
+        if let Some(t) = &self.panel_tree {
+            surfaces.push((
+                t,
+                Rect::new(0.0, 0.0, self.sw as f32, PANEL_H as f32),
+                (0, 0),
+                false,
+            ));
+        }
+        if let Some(t) = &self.rail_tree {
+            surfaces.push((
+                t,
+                Rect::new(0.0, 0.0, chrome::RAIL_W as f32, self.rail_h as f32),
+                (0, PANEL_H as i16),
+                false,
+            ));
+        }
+        for win in &self.stack {
+            if let (Some(tree), Some(c)) = (
+                self.bar_trees.get(win),
+                self.clients
+                    .get(win)
+                    .filter(|c| c.framed && !c.fullscreen && !c.minimized && c.bar_h() > 0),
+            ) {
+                let (w, h) = tree.size();
+                surfaces.push((
+                    tree,
+                    Rect::new(0.0, 0.0, w, h),
+                    (c.card.0 - 1, c.card.1 - 1),
+                    false,
+                ));
+            }
+        }
+        if let Some(p) = &self.pop {
+            surfaces.push((&p.tree, p.shape.sheet, (p.rect.0, p.rect.1), true));
+        }
+        surfaces
+    }
+
     pub(super) fn shell_tree(&self) -> Value {
-        // Other shell surfaces can join this list when they use retained nodes.
-        self.pop.as_ref().map_or_else(
-            || json!([]),
-            |p| p.tree.json(p.shape.sheet, (p.rect.0, p.rect.1)),
+        Value::Array(
+            self.shell_surfaces()
+                .into_iter()
+                .flat_map(|(tree, view, origin, _)| {
+                    tree.json(view, origin)
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .collect(),
         )
+    }
+
+    pub(super) fn rail_node_id(target: &Target) -> u64 {
+        node_id(&format!("rail:{target:?}"))
+    }
+
+    pub(super) fn panel_hit(&self, x: f32, y: f32) -> Option<PanelHit> {
+        let id = self.panel_tree.as_ref()?.hit_node(
+            Rect::new(0.0, 0.0, self.sw as f32, PANEL_H as f32),
+            x,
+            y,
+        )?;
+        match id {
+            chrome::APPLICATIONS_ID => Some(PanelHit::Apps),
+            chrome::FRONT_APP_ID => Some(PanelHit::App),
+            _ => None,
+        }
+    }
+
+    pub(super) fn rail_hit(&self, x: f32, screen_y: f32) -> Option<usize> {
+        let id = self.rail_tree.as_ref()?.hit_node(
+            Rect::new(
+                0.0,
+                PANEL_H as f32,
+                chrome::RAIL_W as f32,
+                self.rail_h as f32,
+            ),
+            x,
+            screen_y,
+        )?;
+        self.rail_targets
+            .iter()
+            .position(|t| Self::rail_node_id(t) == id)
+    }
+
+    pub(super) fn panel_click(&mut self, hit: PanelHit) -> Result<()> {
+        match hit {
+            PanelHit::Apps => self.open_apps_menu(),
+            PanelHit::App => {
+                if let Some(t) = self.front_target() {
+                    self.open_app_menu(t, Anchor::Panel)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn rail_click(&mut self, i: usize, button: u8) -> Result<()> {
+        self.show_tooltip(None)?;
+        let t = self.rail_targets[i].clone();
+        match button {
+            1 if self.in_front(&t) => self.open_app_menu(t, Anchor::Panel),
+            1 => self.activate(&t),
+            3 => self.open_app_menu(t, Anchor::Rail(i)),
+            _ => Ok(()),
+        }
     }
 
     pub(super) fn tree_action(
@@ -966,6 +1151,47 @@ impl Wm {
         action: &str,
         value: Option<String>,
     ) -> std::result::Result<Value, (u16, String)> {
+        if self.clients.iter().any(|(&win, c)| {
+            chrome::title_node_id(win, None) == id
+                && c.framed
+                && !c.fullscreen
+                && !c.minimized
+                && c.bar_h() > 0
+        }) {
+            return Err((400, "unsupported action".into()));
+        }
+        let title = self.clients.iter().find_map(|(&win, c)| {
+            if !c.framed || c.fullscreen || c.minimized || c.bar_h() == 0 {
+                return None;
+            }
+            let close_only = c.parent.is_some() || c.kind != super::Kind::Normal;
+            chrome::title_light(win, close_only, id).map(|light| (win, light))
+        });
+        if let Some((win, light)) = title {
+            if action != "click" {
+                return Err((400, "unsupported action".into()));
+            }
+            return self
+                .focus(win)
+                .and_then(|()| self.light_click(win, light))
+                .map(|()| json!({"ok":true}))
+                .map_err(|e| (500, e.to_string()));
+        }
+        if let Some(click) = shell_click(id, self.panel_layout.app.is_some(), &self.rail_targets) {
+            if action != "click" {
+                return Err((400, "unsupported action".into()));
+            }
+            let out = self.close_pop().and_then(|()| match click {
+                ShellClick::Panel(hit) => self.panel_click(hit),
+                ShellClick::Rail(i) => self.rail_click(i, 1),
+            });
+            return out
+                .map(|()| json!({"ok": true}))
+                .map_err(|e| (500, e.to_string()));
+        }
+        if [chrome::PANEL_ID, chrome::RAIL_ID, 13].contains(&id) {
+            return Err((400, "unsupported action".into()));
+        }
         let p = self.pop.as_mut().ok_or((404, "no open UI".into()))?;
         let wanted = match action {
             "click" => accesskit::Action::Click,
@@ -1168,6 +1394,31 @@ mod tests {
             },
             PRow::Footer,
         ]
+    }
+
+    #[test]
+    fn shell_clicks_route_by_stable_identity() {
+        let terminal = Target::Key("terminal".into());
+        let browser = Target::App(0);
+        let id = Wm::rail_node_id(&terminal);
+        assert_eq!(
+            shell_click(chrome::APPLICATIONS_ID, false, &[]),
+            Some(ShellClick::Panel(PanelHit::Apps))
+        );
+        assert_eq!(shell_click(chrome::FRONT_APP_ID, false, &[]), None);
+        assert_eq!(
+            shell_click(chrome::FRONT_APP_ID, true, &[]),
+            Some(ShellClick::Panel(PanelHit::App))
+        );
+        assert_eq!(
+            shell_click(id, false, &[terminal.clone(), browser.clone()]),
+            Some(ShellClick::Rail(0))
+        );
+        assert_eq!(
+            shell_click(id, false, &[browser, terminal]),
+            Some(ShellClick::Rail(1))
+        );
+        assert_eq!(shell_click(id, false, &[]), None);
     }
 
     #[test]

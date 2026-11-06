@@ -428,6 +428,9 @@ pub struct Wm {
     /// Override redirect windows of apps that are mapped.
     foreign: Vec<Window>,
     who: Option<Who>,
+    bar_trees: HashMap<Window, crate::ui::Tree>,
+    panel_tree: Option<crate::ui::Tree>,
+    rail_tree: Option<crate::ui::Tree>,
     panel_layout: PanelLayout,
     panel_hover: Option<PanelHit>,
     rail_targets: Vec<Target>,
@@ -472,6 +475,7 @@ pub struct Wm {
     watch: Option<appearance::Watch>,
     xsettings_serial: u32,
     notes: notes::Notes,
+    last_accessibility: Option<accesskit::TreeUpdate>,
     bus: Option<tokio::sync::mpsc::UnboundedSender<bus::Event>>,
 }
 
@@ -529,7 +533,12 @@ pub fn start(
     draw::set_dark(appearance::read());
     let ours = make_ours(&conn, &screen)?;
     let cursors = make_cursors(&conn, screen_num)?;
-    let entries = apps.into_iter().map(|app| Entry::new(app, true)).collect();
+    let mut entries: Vec<_> = apps.into_iter().map(|app| Entry::new(app, true)).collect();
+    if !entries.iter().any(|e| e.app.id == "settings") {
+        if let Ok(app) = crate::apps::load("settings") {
+            entries.push(Entry::new(app, false));
+        }
+    }
     let mut wm = Wm {
         conn,
         display: display.to_string(),
@@ -554,6 +563,9 @@ pub fn start(
         focused: None,
         foreign: Vec::new(),
         who: None,
+        bar_trees: HashMap::new(),
+        panel_tree: None,
+        rail_tree: None,
         panel_layout: PanelLayout::default(),
         panel_hover: None,
         rail_targets: Vec::new(),
@@ -591,6 +603,7 @@ pub fn start(
         xsettings_serial: 0,
         notes: notes::Notes::default(),
         bus: Some(bus),
+        last_accessibility: None,
     };
     wm.setup()?;
     std::thread::Builder::new()

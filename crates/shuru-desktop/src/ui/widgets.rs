@@ -34,6 +34,38 @@ pub enum Mark {
 }
 
 pub enum Content {
+    RaisedChoice,
+    Switch {
+        on: bool,
+    },
+    TitleSurface {
+        ring: u32,
+    },
+    WindowLight {
+        light: crate::chrome::Light,
+        lit: bool,
+        hover: bool,
+        pressed: bool,
+        maximized: bool,
+    },
+    CenteredText {
+        text: String,
+        size: f32,
+        ink: Ink,
+    },
+    PanelControl {
+        name: Option<String>,
+        hover: bool,
+    },
+    Agent,
+    RailTile {
+        name: String,
+        entry: usize,
+        windows: usize,
+        front: bool,
+        attention: bool,
+        hover: bool,
+    },
     /// Layout only.
     Box,
     /// A row the pointer and the keyboard select.
@@ -74,6 +106,12 @@ impl Content {
     /// The natural size of a leaf, for layout.
     pub fn measure(&self, font: &mut Font) -> (f32, f32) {
         match self {
+            Content::Switch { .. } => (32.0, 18.0),
+            Content::RaisedChoice => (0.0, 0.0),
+            Content::TitleSurface { .. }
+            | Content::WindowLight { .. }
+            | Content::CenteredText { .. } => (0.0, 0.0),
+            Content::PanelControl { .. } | Content::Agent | Content::RailTile { .. } => (0.0, 0.0),
             Content::Text { text, size, .. } => (font.width(text, *size), *size),
             Content::Glyph(g, _) => (g.w as f32, g.h as f32),
             Content::AppIcon { .. } => (16.0, 16.0),
@@ -88,6 +126,135 @@ impl Content {
     pub fn paint(&self, c: &mut Canvas, p: &mut Paint, b: Rect, mark: Mark) {
         let mid = b.y + b.h / 2.0;
         match self {
+            Content::RaisedChoice => {
+                let fill = match mark {
+                    Mark::Rest => theme().raised,
+                    Mark::Hover => theme().hover,
+                    Mark::Selected => theme().selected,
+                };
+                painter::raised(
+                    c,
+                    b,
+                    6.0,
+                    crate::draw::Raised {
+                        fill,
+                        ring: theme().hairline_hi,
+                        hi: fill,
+                        shadow: theme().light_drop,
+                    },
+                );
+            }
+            Content::Switch { on } => {
+                painter::rounded(c, b, 9.0, if *on { theme().text } else { theme().dim });
+                let x = b.x + if *on { b.w - 16.0 } else { 2.0 };
+                painter::rounded(c, Rect::new(x, b.y + 2.0, 14.0, 14.0), 7.0, theme().surface);
+            }
+            Content::TitleSurface { ring } => {
+                let card = Rect::new(b.x + 1.0, b.y + 1.0, b.w - 2.0, 4.0 * crate::chrome::RADIUS);
+                c.rounded_rect(card.inset(-1.0), crate::chrome::RADIUS + 1.0, *ring);
+                c.rounded_rect(card, crate::chrome::RADIUS, theme().winbar);
+                for x in [b.x as usize, (b.x + b.w - 1.0) as usize] {
+                    c.fill_rect(
+                        x,
+                        (b.y + crate::chrome::RADIUS) as usize,
+                        1,
+                        (b.h - crate::chrome::RADIUS) as usize,
+                        *ring,
+                    );
+                }
+            }
+            Content::WindowLight {
+                light,
+                lit,
+                hover,
+                pressed,
+                maximized,
+            } => {
+                use crate::chrome::Light;
+                use crate::{draw, glyphs};
+                let lamp = match light {
+                    Light::Close => draw::CLOSE,
+                    Light::Minimize => draw::MINIMIZE,
+                    Light::Maximize => draw::MAXIMIZE,
+                };
+                let style = if *pressed {
+                    draw::Raised::pressed(lamp.ring, lamp.ring)
+                } else if *lit {
+                    lamp.raised(theme().light_drop)
+                } else {
+                    theme().light_idle
+                };
+                c.raised(b, b.w / 2.0, style);
+                if *hover {
+                    let g = match light {
+                        Light::Close => &glyphs::LIGHT_CLOSE,
+                        Light::Minimize => &glyphs::LIGHT_MIN,
+                        Light::Maximize if *maximized => &glyphs::LIGHT_RESTORE,
+                        Light::Maximize => &glyphs::LIGHT_MAX,
+                    };
+                    c.glyph(g, b.x as i32, b.y as i32, lamp.glyph, 1.0);
+                }
+            }
+            Content::CenteredText { text, size, ink } => {
+                let text = p.font.fit(text, *size, b.w);
+                let width = p.font.width(&text, *size);
+                p.font.draw(
+                    c,
+                    &text,
+                    (b.x + (b.w - width) / 2.0).round(),
+                    mid,
+                    *size,
+                    ink.color(),
+                );
+            }
+            Content::PanelControl { name, hover } => {
+                if *hover {
+                    c.rounded_rect(b, 6.0, theme().hover);
+                    c.ring_in(b, 6.0, theme().hairline);
+                }
+                match name {
+                    Some(name) => crate::chrome::app_label(c, p.font, b.x, b.y, name, (p.icons)(0)),
+                    None => crate::chrome::apps_label(c, p.font, b.x, b.y),
+                }
+            }
+            Content::Agent => {
+                c.rounded_rect(Rect::new(b.x, mid - 4.0, 8.0, 8.0), 4.0, theme().green);
+                p.font.draw(
+                    c,
+                    crate::locale::tr(crate::locale::Msg::Agent),
+                    b.x + 16.0,
+                    mid,
+                    TEXT_SIZE,
+                    theme().text,
+                );
+            }
+            Content::RailTile {
+                name,
+                entry,
+                windows,
+                front,
+                attention,
+                hover,
+            } => {
+                if *front {
+                    c.rounded_rect(b, 12.0, theme().rail_active);
+                } else if *hover {
+                    c.rounded_rect(b, 12.0, theme().hover);
+                }
+                crate::chrome::rail_icon(
+                    c,
+                    p.font,
+                    &crate::chrome::RailItem {
+                        name,
+                        icon: (p.icons)(*entry),
+                        windows: *windows,
+                        front: *front,
+                        attention: *attention,
+                    },
+                    b.x,
+                    b.y,
+                );
+            }
             Content::Box => {}
             Content::Choice => match mark {
                 Mark::Rest => {}

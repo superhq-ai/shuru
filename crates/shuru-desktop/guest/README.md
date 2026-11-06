@@ -9,8 +9,8 @@ listed in its `SHA256SUMS`.
 
 | file | installs to | does |
 |---|---|---|
-| `applications/*.desktop` | `/usr/local/share/applications/` | the apps of the rail, with their names and actions |
-| `icons/hicolor/` | `/usr/local/share/icons/hicolor/` | the terminal icon at 16, 32 and 64 px; `icons/src/` holds its SVGs |
+| `applications/*.desktop` | `/usr/local/share/applications/` | the apps and Settings, with their names and actions |
+| `icons/hicolor/` | `/usr/local/share/icons/hicolor/` | terminal and Settings icons at 16, 32 and 64 px; `icons/src/` holds its SVGs |
 | `themes/SuperHQ/` | `/usr/share/themes/SuperHQ/` | the light GTK 3 theme (the default) |
 | `themes/SuperHQ-dark/` | `/usr/share/themes/SuperHQ-dark/` | the dark GTK 3 theme |
 | `gtk-3.0/settings.ini` | `/etc/gtk-3.0/settings.ini` | the theme, Inter, the window buttons on the left, no animations |
@@ -23,7 +23,7 @@ listed in its `SHA256SUMS`.
 
 ```sh
 apt-get install --no-install-recommends \
-  xvfb dbus-x11 dbus-user-session libglib2.0-bin dconf-gsettings-backend \
+  xvfb at-spi2-core dbus-x11 dbus-user-session libglib2.0-bin dconf-gsettings-backend \
   adwaita-icon-theme fontconfig locales shared-mime-info xdg-utils \
   chromium chromium-l10n xterm
 ```

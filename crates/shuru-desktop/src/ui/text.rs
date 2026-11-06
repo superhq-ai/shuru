@@ -44,6 +44,17 @@ impl Field {
         })
     }
 
+    pub fn selection_indices(&self) -> (usize, usize) {
+        let value = self.value();
+        let position = |byte: usize| value.get(..byte).unwrap_or(&value).chars().count();
+        let focus = position(self.editor.cursor().index);
+        let anchor = match self.editor.selection() {
+            Selection::Normal(cursor) => position(cursor.index),
+            _ => focus,
+        };
+        (anchor, focus)
+    }
+
     pub fn insert(&mut self, text: &str) {
         self.editor
             .insert_string(&text.replace(['\n', '\r'], " "), None);

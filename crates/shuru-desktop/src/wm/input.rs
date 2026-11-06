@@ -6,9 +6,8 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::{CURRENT_TIME, NONE};
 
-use super::menu::Anchor;
 use super::{Place, Target, Wm, R};
-use crate::chrome::{self, Light, PanelHit, BAR_H, PANEL_H};
+use crate::chrome::{self, Light, BAR_H, PANEL_H};
 
 const DRAG_START: i32 = 4;
 const DOUBLE_CLICK_MS: u32 = 400;
@@ -94,27 +93,15 @@ impl Wm {
         }
         if w == self.ours.panel {
             if e.detail == 1 {
-                match self.panel_layout.hit(e.event_x as f32, e.event_y as f32) {
-                    Some(PanelHit::Apps) => self.open_apps_menu()?,
-                    Some(PanelHit::App) => {
-                        if let Some(t) = self.front_target() {
-                            self.open_app_menu(t, Anchor::Panel)?;
-                        }
-                    }
-                    None => {}
+                if let Some(hit) = self.panel_hit(e.event_x as f32, e.event_y as f32) {
+                    self.panel_click(hit)?;
                 }
             }
         } else if w == self.ours.rail {
             self.show_tooltip(None)?;
-            let hit = chrome::rail_hit(self.rail_targets.len(), e.event_x as f32, e.root_y as f32);
+            let hit = self.rail_hit(e.event_x as f32, e.root_y as f32);
             if let Some(i) = hit {
-                let t = self.rail_targets[i].clone();
-                match e.detail {
-                    1 if self.in_front(&t) => self.open_app_menu(t, Anchor::Panel)?,
-                    1 => self.activate(&t)?,
-                    3 => self.open_app_menu(t, Anchor::Rail(i))?,
-                    _ => {}
-                }
+                self.rail_click(i, e.detail)?;
             }
         } else if let Some(&client) = self.frames.get(&w) {
             if e.detail == 1 {
@@ -138,16 +125,32 @@ impl Wm {
         })
     }
 
+    pub(super) fn light_click(&mut self, win: Window, light: Light) -> Result<()> {
+        match light {
+            Light::Close => {
+                self.close(win)?;
+                Ok(())
+            }
+            Light::Minimize => self.minimize(win),
+            Light::Maximize => self.toggle_maximized(win),
+        }
+    }
+
+    fn title_hit(&self, win: Window, x: f32, y: f32) -> Option<Light> {
+        let tree = self.bar_trees.get(&win)?;
+        let c = self.clients.get(&win)?;
+        let (w, h) = tree.size();
+        let id = tree.hit_node(crate::draw::Rect::new(-1.0, -1.0, w, h), x, y)?;
+        chrome::title_light(win, c.parent.is_some() || c.kind != super::Kind::Normal, id)
+    }
+
     fn frame_press(&mut self, client: Window, w: Window, e: &ButtonPressEvent) -> Result<()> {
         let Some(c) = self.clients.get(&client) else {
             return Ok(());
         };
         let card = c.card;
         let is_grip = w == c.grip;
-        let (bar, close_only) = (
-            c.bar_h() > 0,
-            c.parent.is_some() || c.kind != super::Kind::Normal,
-        );
+        let bar = c.bar_h() > 0;
         if self.focused != Some(client) {
             self.focus(client)?;
         }
@@ -168,7 +171,7 @@ impl Wm {
         if !bar || cy < 0.0 || cy >= BAR_H as f32 {
             return Ok(());
         }
-        if let Some(light) = chrome::light_hit(close_only, cx, cy) {
+        if let Some(light) = self.title_hit(client, cx, cy) {
             if self.grab_pointer(self.cursors.arrow)? {
                 self.drag = Some(Drag::Light { win: client, light });
                 if let Some(c) = self.clients.get_mut(&client) {
@@ -447,21 +450,14 @@ impl Wm {
             Some(Drag::Light { win, light }) => {
                 self.end_drag()?;
                 let over = self.clients.get(&win).and_then(|c| {
-                    let close_only = c.parent.is_some() || c.kind != super::Kind::Normal;
-                    chrome::light_hit(close_only, (x - c.card.0) as f32, (y - c.card.1) as f32)
+                    self.title_hit(win, (x - c.card.0) as f32, (y - c.card.1) as f32)
                 });
                 if let Some(c) = self.clients.get_mut(&win) {
                     c.pressed = None;
                 }
                 self.draw_frame(win)?;
                 if over == Some(light) {
-                    match light {
-                        Light::Close => {
-                            self.close(win)?;
-                        }
-                        Light::Minimize => self.minimize(win)?,
-                        Light::Maximize => self.toggle_maximized(win)?,
-                    }
+                    self.light_click(win, light)?;
                 }
             }
             None => {}
@@ -478,7 +474,7 @@ impl Wm {
         }
         let w = e.event;
         if w == self.ours.panel {
-            let hover = self.panel_layout.hit(e.event_x as f32, e.event_y as f32);
+            let hover = self.panel_hit(e.event_x as f32, e.event_y as f32);
             let cursor = self.control_cursor(hover.is_some());
             self.set_cursor(w, cursor)?;
             if hover != self.panel_hover {
@@ -486,8 +482,7 @@ impl Wm {
                 self.draw_panel()?;
             }
         } else if w == self.ours.rail {
-            let hover =
-                chrome::rail_hit(self.rail_targets.len(), e.event_x as f32, e.root_y as f32);
+            let hover = self.rail_hit(e.event_x as f32, e.root_y as f32);
             let cursor = self.control_cursor(hover.is_some());
             self.set_cursor(w, cursor)?;
             if hover != self.rail_hover {

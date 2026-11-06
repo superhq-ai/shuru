@@ -24,8 +24,16 @@ pub enum Msg {
     Close,
 }
 
-/// The messages locale: LC_ALL, then LC_MESSAGES, then LANG.
+pub const SUPPORTED: [(&str, &str); 2] =
+    [("en_US.UTF-8", "English (US)"), ("zh_CN.UTF-8", "简体中文")];
+
+/// The saved language, then LC_ALL, LC_MESSAGES and LANG.
 pub fn messages_locale() -> String {
+    if let Ok(saved) = std::fs::read_to_string(crate::appearance::dir().join("language")) {
+        if SUPPORTED.iter().any(|(locale, _)| *locale == saved.trim()) {
+            return saved.trim().into();
+        }
+    }
     locale_from(|k| std::env::var(k).ok())
 }
 

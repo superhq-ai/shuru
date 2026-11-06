@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Settings
+Name[zh_CN]=设置
+GenericName=Desktop settings
+GenericName[zh_CN]=桌面设置
+Comment=Appearance, language and default apps
+Exec=shuru-desktop --settings
+Icon=superhq-settings
+Terminal=false
+Categories=Settings;DesktopSettings;
+StartupWMClass=SuperHQSettings

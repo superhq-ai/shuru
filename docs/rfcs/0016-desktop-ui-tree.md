@@ -58,13 +58,13 @@ There is no timer when idle.
 
 ## Semantics API
 
-`GET /tree` returns the nodes agents see in the open shell popup, each
+`GET /tree` returns the nodes agents see in the panel, rail, title bars and open
+shell popup, each
 with `id`, `role`, `name`, `value`, `states`, `actions` and `bounds`, and
 `children`, the ids of the nearest seen nodes under it. Presentational
 nodes (labels inside a row, icons, key caps) are left out, so the menu
 lists its items and the search input. Bounds are screen pixels, after
-scrolling. States are focused, selected, disabled and expanded. An empty
-list means no retained shell UI is open.
+scrolling. States are focused, selected, disabled and expanded. The panel and rail remain in the list while no popup is open.
 
 `POST /tree/action` takes `{id, action, value?}`. The actions are `click`,
 `focus` and `set_value`. Unsupported actions return 400 and absent nodes
@@ -75,24 +75,35 @@ only describes shell UI, not application accessibility trees.
 ## Scope and order
 
 This slice ports launcher and app menu rows, layout, hit testing,
-selection and search editing. The connected shell outline, panel and rail
-pill labels still share the existing chrome drawing routines. The rest
-of the shell stays on draw.rs. Small antialiasing differences at widget
+selection and search editing. The panel and rail each retain a tree with taffy layout, semantic buttons
+and hit testing by node. Their Content variants share the existing pill
+labels and icon drawing routines to preserve the pixels. The connected
+shell outline and the rest of the shell stay on draw.rs. Small antialiasing differences at widget
 curves can result from the new painter.
 
-Next come the panel, rail and title bars, in that order, then a Settings
-app using the same tree. The shell tree list has a single collection
+Title bars retain their own trees, with named buttons for Close, Minimize
+and Maximize or Restore. Pointer release and semantic clicks use the same
+window actions. Bars of minimized and fullscreen windows leave the shell
+collection. Settings uses the same tree as a normal managed X11 client,
+launched by `shuru-desktop --settings`. It has appearance and language
+choices, MIME defaults, notification capabilities and an About section.
+Its own process publishes its retained tree through the shared AT-SPI
+module. Preferences use XDG configuration files; language takes effect on
+the next desktop session, while appearance follows the existing watch. The shell tree list has a single collection
 point where those surfaces can join the popup nodes.
 
-AT-SPI publishing comes next, so the shell joins GTK apps and Chromium
+AT-SPI publishing lets the shell join GTK apps and Chromium
 in one accessibility tree. accesskit_atspi_common, which maps an
 accesskit tree to AT-SPI and has no D-Bus code, stays a dependency; the
 D-Bus side that accesskit_unix provides on zbus 5 and its own executor
-is written here on zbus 6 and the tokio runtime of the desktop: finding
+lives here on zbus 6 and the tokio runtime of the desktop: finding
 the accessibility bus, registering with the registry, serving the
 Accessible, Component, Action, Text, Value and Selection interfaces of
-each node, and sending events. The guest image gains at-spi2-core, and
-Chromium starts with renderer accessibility.
+each node, and sending events. The bridge sends retained tree changes after input settles in the window
+manager loop, without polling the accessibility bus or adding an idle
+timer. Missing accessibility services leave the desktop operational. The
+guest needs at-spi2-core; the console image already installs it, and the
+Chromium desktop entry already enables renderer accessibility.
 
 ## Tests
 

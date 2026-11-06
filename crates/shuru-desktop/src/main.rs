@@ -7,6 +7,8 @@ mod appearance;
 #[cfg(target_os = "linux")]
 mod apps;
 #[cfg(target_os = "linux")]
+mod atspi;
+#[cfg(target_os = "linux")]
 mod bus;
 #[cfg(target_os = "linux")]
 mod chrome;
@@ -20,6 +22,8 @@ mod icon;
 mod locale;
 #[cfg(target_os = "linux")]
 mod server;
+#[cfg(target_os = "linux")]
+mod settings;
 #[cfg(target_os = "linux")]
 mod ui;
 #[cfg(target_os = "linux")]
@@ -60,8 +64,11 @@ mod linux {
         #[arg(long, env = "DISPLAY")]
         display: String,
         /// The unix socket to serve on, made with mode 0600.
+        #[arg(long, required_unless_present = "settings")]
+        socket: Option<PathBuf>,
+        /// Opens the Settings client instead of managing the display.
         #[arg(long)]
-        socket: PathBuf,
+        settings: bool,
         /// Apps for the rail: paths to .desktop files or their ids, such
         /// as org.gnome.Calculator.
         #[arg(long, value_delimiter = ',')]
@@ -70,6 +77,10 @@ mod linux {
 
     pub fn run() -> Result<()> {
         let args = Args::parse();
+        if args.settings {
+            return crate::settings::run(&args.display);
+        }
+        let socket = args.socket.context("--socket is required")?;
         let mut apps = Vec::new();
         for spec in &args.apps {
             match crate::apps::load(spec) {
@@ -80,8 +91,8 @@ mod linux {
         let (bus_tx, bus_rx) = tokio::sync::mpsc::unbounded_channel();
         let (wm, settle) = crate::wm::start(&args.display, apps, bus_tx)
             .with_context(|| format!("managing {}", args.display))?;
-        let listener = bind(&args.socket)?;
-        eprintln!("shuru-desktop: serving on {}", args.socket.display());
+        let listener = bind(&socket)?;
+        eprintln!("shuru-desktop: serving on {}", socket.display());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -108,7 +119,7 @@ mod linux {
             }
             anyhow::Ok(())
         });
-        let _ = fs::remove_file(&args.socket);
+        let _ = fs::remove_file(&socket);
         served
     }
 

@@ -372,6 +372,31 @@ pub fn load(spec: &str) -> Result<App> {
     bail!("no {file} in the application dirs")
 }
 
+/// The installed application choices, with user entries first.
+pub fn catalog() -> Vec<App> {
+    let mut seen = std::collections::HashSet::new();
+    let mut apps = Vec::new();
+    for dir in dirs() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "desktop") {
+                continue;
+            }
+            if !seen.insert(entry.file_name()) {
+                continue;
+            }
+            if let Ok(Some(app)) = read(&path) {
+                apps.push(app);
+            }
+        }
+    }
+    apps.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    apps
+}
+
 /// Finds an app by name: the configured ones first, then the XDG dirs.
 pub fn find(configured: &[App], name: &str) -> Option<App> {
     if let Some(a) = configured.iter().find(|a| a.is_named(name)) {
