@@ -1,9 +1,9 @@
-//! A normal X11 client with retained layout, input and accessibility.
+//! The Settings window: X11 input, painting and the AT-SPI bridge.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{mpsc as sync, Arc};
 
-use accesskit::{Action, ActionRequest, NodeId, TreeId, TreeInfo, TreeUpdate};
+use accesskit::{Action, ActionData, ActionRequest, NodeId, TreeId, TreeInfo, TreeUpdate};
 use anyhow::{bail, Result};
 use tokio::sync::mpsc;
 use x11rb::connection::Connection;
@@ -13,16 +13,41 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME};
 
-use super::Preferences;
+use super::{Preferences, ROOT};
 use crate::draw::{self, Canvas, Font, Rect};
+use crate::locale::{tr, Msg};
 use crate::ui::widgets::Paint;
-use crate::ui::Tree;
+use crate::ui::{BarHit, Thumb, Tree};
 
 x11rb::atom_manager! {
     Atoms: AtomsCookie {
         UTF8_STRING, WM_PROTOCOLS, WM_DELETE_WINDOW,
         _NET_WM_NAME, _NET_WM_PID, _NET_WM_WINDOW_TYPE, _NET_WM_WINDOW_TYPE_NORMAL, _NET_ACTIVE_WINDOW,
     }
+}
+
+const WIDTH: u16 = 640;
+const MOST_HEIGHT: u16 = 720;
+/// Room the panel, our title bar and a margin take from the screen.
+const SCREEN_ROOM: u16 = 32 + 46 + 32;
+/// One click of the wheel or one arrow press on the scrollbar.
+const STEP: f32 = 48.0;
+
+mod key {
+    pub const TAB: u32 = 0xff09;
+    pub const LEFT_TAB: u32 = 0xfe20;
+    pub const LEFT: u32 = 0xff51;
+    pub const UP: u32 = 0xff52;
+    pub const RIGHT: u32 = 0xff53;
+    pub const DOWN: u32 = 0xff54;
+    pub const PAGE_UP: u32 = 0xff55;
+    pub const PAGE_DOWN: u32 = 0xff56;
+    pub const HOME: u32 = 0xff50;
+    pub const END: u32 = 0xff57;
+    pub const RETURN: u32 = 0xff0d;
+    pub const KP_ENTER: u32 = 0xff8d;
+    pub const SPACE: u32 = 0x20;
+    pub const ESCAPE: u32 = 0xff1b;
 }
 
 pub(super) fn run(display: &str) -> Result<()> {
@@ -41,7 +66,7 @@ pub(super) fn run(display: &str) -> Result<()> {
     let display = display.to_string();
     runtime.block_on(async move {
         let publisher = tokio::spawn(crate::atspi::run(
-            "SuperHQ Settings".into(),
+            tr(Msg::Settings).into(),
             tree_rx,
             actions,
         ));
@@ -63,6 +88,41 @@ pub(super) fn run(display: &str) -> Result<()> {
     })
 }
 
+/// The keysyms of each keycode, read once.
+struct Keymap {
+    min: u8,
+    per: usize,
+    syms: Vec<u32>,
+}
+
+impl Keymap {
+    fn read(conn: &RustConnection) -> Result<Self> {
+        let setup = conn.setup();
+        let (min, max) = (setup.min_keycode, setup.max_keycode);
+        let reply = conn.get_keyboard_mapping(min, max - min + 1)?.reply()?;
+        Ok(Self {
+            min,
+            per: reply.keysyms_per_keycode as usize,
+            syms: reply.keysyms,
+        })
+    }
+
+    fn sym(&self, code: u8) -> u32 {
+        let i = code.saturating_sub(self.min) as usize * self.per;
+        self.syms.get(i).copied().unwrap_or(0)
+    }
+}
+
+/// What a paint shows, to skip painting when nothing changed.
+#[derive(Clone, Copy, PartialEq)]
+struct Look {
+    scroll: f32,
+    hovered: Option<u64>,
+    selected: Option<usize>,
+    pointer: bool,
+    thumb: Thumb,
+}
+
 struct Client {
     conn: RustConnection,
     window: Window,
@@ -73,6 +133,7 @@ struct Client {
     width: u16,
     height: u16,
     font: Font,
+    keymap: Keymap,
     preferences: Preferences,
     tree: Tree,
     trees: mpsc::UnboundedSender<crate::atspi::Snapshot>,
@@ -94,19 +155,19 @@ impl Client {
         let (conn, screen_num) = RustConnection::connect(Some(display))?;
         let screen = &conn.setup().roots[screen_num];
         let (root, depth) = (screen.root, screen.root_depth);
+        let height = MOST_HEIGHT.min(screen.height_in_pixels.saturating_sub(SCREEN_ROOM).max(240));
         let atoms = Atoms::new(&conn)?.reply()?;
         let window = conn.generate_id()?;
         let gc = conn.generate_id()?;
         let preferences = Preferences::load();
         draw::set_dark(preferences.dark);
-        let (width, height) = (680, 700);
         conn.create_window(
             COPY_DEPTH_FROM_PARENT,
             window,
             root,
             0,
             0,
-            width,
+            WIDTH,
             height,
             0,
             WindowClass::INPUT_OUTPUT,
@@ -118,6 +179,7 @@ impl Client {
                         | EventMask::STRUCTURE_NOTIFY
                         | EventMask::KEY_PRESS
                         | EventMask::BUTTON_PRESS
+                        | EventMask::BUTTON_RELEASE
                         | EventMask::POINTER_MOTION
                         | EventMask::LEAVE_WINDOW
                         | EventMask::FOCUS_CHANGE,
@@ -130,20 +192,6 @@ impl Client {
             AtomEnum::WM_CLASS,
             AtomEnum::STRING,
             b"superhq-settings\0SuperHQSettings\0",
-        )?;
-        conn.change_property8(
-            PropMode::REPLACE,
-            window,
-            atoms._NET_WM_NAME,
-            atoms.UTF8_STRING,
-            b"SuperHQ Settings",
-        )?;
-        conn.change_property8(
-            PropMode::REPLACE,
-            window,
-            AtomEnum::WM_NAME,
-            AtomEnum::STRING,
-            b"SuperHQ Settings",
         )?;
         conn.change_property32(
             PropMode::REPLACE,
@@ -167,19 +215,19 @@ impl Client {
             &[atoms._NET_WM_WINDOW_TYPE_NORMAL],
         )?;
         let mut font = Font::new();
-        let tree = preferences.tree(&mut font, width as f32);
-        conn.map_window(window)?;
-        conn.flush()?;
-        Ok(Self {
+        let tree = preferences.tree(&mut font, WIDTH as f32);
+        let keymap = Keymap::read(&conn)?;
+        let client = Self {
             conn,
             window,
             root,
             gc,
             depth,
             atoms,
-            width,
+            width: WIDTH,
             height,
             font,
+            keymap,
             preferences,
             tree,
             trees,
@@ -189,31 +237,72 @@ impl Client {
             origin: (0, 0),
             focused: false,
             last: None,
-        })
+        };
+        client.set_title()?;
+        client.conn.map_window(window)?;
+        client.conn.flush()?;
+        Ok(client)
+    }
+
+    fn set_title(&self) -> Result<()> {
+        let title = tr(Msg::Settings).as_bytes();
+        self.conn.change_property8(
+            PropMode::REPLACE,
+            self.window,
+            self.atoms._NET_WM_NAME,
+            self.atoms.UTF8_STRING,
+            title,
+        )?;
+        self.conn.change_property8(
+            PropMode::REPLACE,
+            self.window,
+            AtomEnum::WM_NAME,
+            AtomEnum::STRING,
+            title,
+        )?;
+        Ok(())
     }
 
     fn view(&self) -> Rect {
         Rect::new(0.0, 0.0, self.width as f32, self.height as f32)
     }
 
-    fn rebuild(&mut self) {
-        let selected = self.tree.focused;
-        let scroll = self.tree.scroll;
-        self.tree = self.preferences.tree(&mut self.font, self.width as f32);
-        self.tree.scroll = scroll.min((self.tree.size().1 - self.height as f32).max(0.0));
-        if let Some(row) = selected {
-            self.tree.select(Some(row), self.height as f32);
+    fn h(&self) -> f32 {
+        self.height as f32
+    }
+
+    fn look(&self) -> Look {
+        Look {
+            scroll: self.tree.scroll,
+            hovered: self.tree.hovered,
+            selected: self.tree.selected,
+            pointer: self.tree.pointer,
+            thumb: self.tree.thumb,
         }
     }
 
-    fn action(&mut self, id: u64, action: Action) -> Result<()> {
-        let Some(row) = self.tree.row_of(id) else {
-            return Ok(());
-        };
-        if !self.tree.supports(row, action) {
-            return Ok(());
+    /// Builds the tree again, keeping the scroll and the focused control,
+    /// or moving the focus to `focus`.
+    fn rebuild(&mut self, focus: Option<u64>) {
+        let keep = focus.or_else(|| self.tree.selected_id());
+        let (scroll, pointer) = (self.tree.scroll, self.tree.pointer);
+        self.tree = self.preferences.tree(&mut self.font, self.width as f32);
+        self.tree.scroll_to(scroll, self.h());
+        self.tree.pointer = pointer;
+        if let Some(row) = keep.and_then(|id| self.tree.row_of(id)) {
+            let height = self.h();
+            if focus.is_some() {
+                self.tree.select(Some(row), height);
+            } else {
+                // The same row, without scrolling to it.
+                self.tree.selected = Some(row);
+                self.tree.focused = Some(row);
+            }
         }
-        let activate = ClientMessageEvent::new(
+    }
+
+    fn activate(&mut self) -> Result<()> {
+        let message = ClientMessageEvent::new(
             32,
             self.window,
             self.atoms._NET_ACTIVE_WINDOW,
@@ -223,24 +312,129 @@ impl Client {
             false,
             self.root,
             EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-            activate,
+            message,
         )?;
-        match action {
+        Ok(())
+    }
+
+    fn click(&mut self, id: u64) {
+        if !self.tree.node_supports(id, Action::Click) {
+            return;
+        }
+        let focus = self.preferences.click(id).or(Some(id));
+        draw::set_dark(self.preferences.dark);
+        self.rebuild(focus);
+    }
+
+    /// An action from an assistive tool.
+    fn action(&mut self, request: ActionRequest) -> Result<()> {
+        let id = request.target_node.0;
+        let h = self.h();
+        match request.action {
             Action::Click => {
-                if let Err(e) = self.preferences.click(id) {
-                    self.preferences.status = e.to_string();
-                }
-                draw::set_dark(self.preferences.dark);
-                self.rebuild();
-                self.tree.select(Some(row), self.height as f32);
-            }
-            Action::Focus => {
+                self.activate()?;
                 self.tree.pointer = false;
-                self.tree.select(Some(row), self.height as f32);
+                self.click(id);
             }
+            Action::Focus | Action::ScrollIntoView => {
+                if self.tree.node_supports(id, request.action) {
+                    if request.action == Action::Focus {
+                        self.activate()?;
+                    }
+                    self.tree.pointer = false;
+                    let row = self.tree.row_of(id);
+                    self.tree.select(row, h);
+                }
+            }
+            Action::SetValue if id == self.tree.scrollbar_id() => {
+                if let Some(ActionData::NumericValue(v)) = request.data {
+                    self.tree.scroll_to(v as f32, h);
+                }
+            }
+            Action::ScrollDown if id == ROOT => self.tree.scroll_to(self.tree.scroll + h, h),
+            Action::ScrollUp if id == ROOT => self.tree.scroll_to(self.tree.scroll - h, h),
             _ => {}
         }
         Ok(())
+    }
+
+    fn key(&mut self, event: KeyPressEvent) {
+        let shift = u16::from(event.state) & u16::from(KeyButMask::SHIFT) != 0;
+        let h = self.h();
+        let row = self.tree.focused;
+        match self.keymap.sym(event.detail) {
+            key::TAB if !shift => self.tree.step(true, h),
+            key::TAB | key::LEFT_TAB => self.tree.step(false, h),
+            key::DOWN => self.tree.step(true, h),
+            key::UP => self.tree.step(false, h),
+            k @ (key::LEFT | key::RIGHT) => {
+                if let Some(next) = row.and_then(|r| self.tree.radio_step(r, k == key::RIGHT)) {
+                    self.tree.pointer = false;
+                    self.click(next);
+                }
+            }
+            key::RETURN | key::KP_ENTER | key::SPACE => {
+                if let Some(id) = self.tree.selected_id() {
+                    self.tree.pointer = false;
+                    self.click(id);
+                }
+            }
+            key::ESCAPE => {
+                if let Some(open) = self.preferences.open {
+                    self.tree.pointer = false;
+                    self.click(open);
+                }
+            }
+            key::PAGE_DOWN => self.tree.scroll_to(self.tree.scroll + h - STEP, h),
+            key::PAGE_UP => self.tree.scroll_to(self.tree.scroll - h + STEP, h),
+            key::HOME => self.tree.scroll_to(0.0, h),
+            key::END => self.tree.scroll_to(f32::MAX, h),
+            _ => {}
+        }
+    }
+
+    fn press(&mut self, e: ButtonPressEvent) {
+        let (x, y, h) = (e.event_x as f32, e.event_y as f32, self.h());
+        match e.detail {
+            1 => match self.tree.bar_hit(self.view(), x, y) {
+                Some(BarHit::Thumb(grab)) => self.tree.thumb = Thumb::Held(grab),
+                Some(BarHit::Track(down)) => {
+                    let page = if down { h - STEP } else { STEP - h };
+                    self.tree.scroll_to(self.tree.scroll + page, h);
+                }
+                None => {
+                    if let Some(id) = self.tree.hit_node(self.view(), x, y) {
+                        self.tree.pointer = true;
+                        self.click(id);
+                    }
+                }
+            },
+            4 => self.tree.scroll_to(self.tree.scroll - STEP, h),
+            5 => self.tree.scroll_to(self.tree.scroll + STEP, h),
+            _ => {}
+        }
+    }
+
+    fn motion(&mut self, x: f32, y: f32) {
+        let view = self.view();
+        if let Thumb::Held(grab) = self.tree.thumb {
+            self.tree.drag_thumb(view, y, grab);
+            return;
+        }
+        self.tree.thumb = match self.tree.bar_hit(view, x, y) {
+            Some(BarHit::Thumb(_)) => Thumb::Hover,
+            _ => Thumb::Rest,
+        };
+        let over_bar = self.tree.thumb != Thumb::Rest;
+        self.tree.hovered = self.tree.hit_node(view, x, y).filter(|_| !over_bar);
+        let row = self
+            .tree
+            .hit(view, x, y)
+            .filter(|&r| !over_bar && self.tree.actionable(r));
+        if row.is_some() || self.tree.pointer {
+            self.tree.pointer = true;
+            self.tree.selected = row;
+        }
     }
 
     fn paint(&mut self) -> Result<()> {
@@ -272,8 +466,16 @@ impl Client {
                 &bytes[y * c.w * 4..(y + count) * c.w * 4],
             )?;
         }
+        self.publish();
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Sends the tree to the accessibility bus when it changed.
+    fn publish(&mut self) {
+        let view = self.view();
         let (mut nodes, focus) = self.tree.accesskit(view, self.origin);
-        if let Some((_, root)) = nodes.iter_mut().find(|(id, _)| *id == NodeId(1)) {
+        if let Some((_, root)) = nodes.iter_mut().find(|(id, _)| *id == NodeId(ROOT)) {
             root.set_bounds(accesskit::Rect::new(
                 self.origin.0 as f64,
                 self.origin.1 as f64,
@@ -284,9 +486,9 @@ impl Client {
         let snapshot = crate::atspi::Snapshot {
             tree: TreeUpdate {
                 nodes,
-                tree: Some(TreeInfo::new(NodeId(1))),
+                tree: Some(TreeInfo::new(NodeId(ROOT))),
                 tree_id: TreeId::ROOT,
-                focus: if self.focused { focus } else { NodeId(1) },
+                focus: if self.focused { focus } else { NodeId(ROOT) },
             },
             focused: self.focused,
         };
@@ -294,36 +496,32 @@ impl Client {
             let _ = self.trees.send(snapshot.clone());
             self.last = Some(snapshot);
         }
-        self.conn.flush()?;
-        Ok(())
     }
 
-    fn key(&mut self, event: KeyPressEvent) -> Result<()> {
-        let mapping = self.conn.get_keyboard_mapping(event.detail, 1)?.reply()?;
-        let key = mapping.keysyms.first().copied().unwrap_or(0);
-        match key {
-            0xff09 | 0xff54 => self.tree.step(
-                u16::from(event.state) & u16::from(KeyButMask::SHIFT) == 0,
-                self.height as f32,
-            ),
-            0xfe20 | 0xff52 => self.tree.step(false, self.height as f32),
-            0xff0d | 0x20 => {
-                if let Some(id) = self.tree.selected_id() {
-                    self.action(id, Action::Click)?;
-                }
-            }
-
-            _ => {}
+    /// Follows a change of the settings files, made here or elsewhere.
+    fn settings_changed(&mut self, changes: crate::appearance::Changes) -> Result<()> {
+        if changes.appearance {
+            self.preferences.dark = crate::appearance::read();
+            draw::set_dark(self.preferences.dark);
         }
+        if changes.language {
+            crate::locale::reload();
+            self.preferences.lang = crate::locale::lang();
+            self.set_title()?;
+        }
+        if changes.do_not_disturb {
+            self.preferences.quiet = crate::dnd::read();
+        }
+        self.rebuild(None);
         Ok(())
     }
 
     fn run(mut self) -> Result<()> {
         self.paint()?;
         loop {
+            let before = self.look();
             let mut changed = false;
             while let Some(event) = self.conn.poll_for_event()? {
-                changed = true;
                 match event {
                     Event::ClientMessage(e)
                         if e.type_ == self.atoms.WM_PROTOCOLS
@@ -332,63 +530,69 @@ impl Client {
                         return Ok(())
                     }
                     Event::DestroyNotify(e) if e.window == self.window => return Ok(()),
+                    Event::Expose(_) => changed = true,
                     Event::ConfigureNotify(e) => {
-                        self.width = e.width.max(1);
-                        self.height = e.height.max(1);
-                        let translated = self
+                        let at = self
                             .conn
                             .translate_coordinates(self.window, self.root, 0, 0)?
                             .reply()?;
-                        self.origin = (translated.dst_x, translated.dst_y);
-                        self.rebuild();
+                        self.origin = (at.dst_x, at.dst_y);
+                        if (e.width, e.height) != (self.width, self.height) {
+                            self.width = e.width.max(1);
+                            self.height = e.height.max(1);
+                            self.rebuild(None);
+                            changed = true;
+                        }
                     }
-                    Event::ButtonPress(e) => match e.detail {
-                        1 => {
-                            if let Some(id) =
-                                self.tree
-                                    .hit_node(self.view(), e.event_x as f32, e.event_y as f32)
-                            {
-                                self.action(id, Action::Click)?;
+                    Event::ButtonPress(e) => {
+                        self.press(e);
+                        changed = true;
+                    }
+                    Event::ButtonRelease(e) => {
+                        if matches!(self.tree.thumb, Thumb::Held(_)) {
+                            self.tree.thumb = Thumb::Rest;
+                            self.motion(e.event_x as f32, e.event_y as f32);
+                        }
+                    }
+                    Event::MotionNotify(e) => self.motion(e.event_x as f32, e.event_y as f32),
+                    Event::LeaveNotify(_) => {
+                        if !matches!(self.tree.thumb, Thumb::Held(_)) {
+                            self.tree.thumb = Thumb::Rest;
+                            self.tree.hovered = None;
+                            if self.tree.pointer {
+                                self.tree.selected = None;
                             }
                         }
-                        4 | 5 => {
-                            self.tree.scroll = (self.tree.scroll
-                                + if e.detail == 4 { -48.0 } else { 48.0 })
-                            .clamp(0.0, (self.tree.size().1 - self.height as f32).max(0.0));
-                        }
-                        _ => {}
-                    },
-                    Event::MotionNotify(e) => {
-                        let row = self
-                            .tree
-                            .hit(self.view(), e.event_x as f32, e.event_y as f32)
-                            .filter(|r| self.tree.supports(*r, Action::Click));
-                        self.tree.pointer = true;
-                        self.tree.select(row, self.height as f32);
                     }
-                    Event::LeaveNotify(_) => {
-                        self.tree.pointer = true;
-                        self.tree.select(None, self.height as f32);
+                    Event::KeyPress(e) => {
+                        self.key(e);
+                        changed = true;
                     }
-                    Event::KeyPress(e) => self.key(e)?,
-                    Event::FocusIn(_) => self.focused = true,
-                    Event::FocusOut(_) => self.focused = false,
+                    Event::FocusIn(_) => {
+                        self.focused = true;
+                        self.publish();
+                    }
+                    Event::FocusOut(_) => {
+                        self.focused = false;
+                        self.publish();
+                    }
                     _ => {}
                 }
             }
             while let Ok(request) = self.actions.try_recv() {
-                self.action(request.target_node.0, request.action)?;
+                self.action(request)?;
                 changed = true;
             }
-            if self.watch.as_ref().is_some_and(|w| w.drain()) {
-                self.preferences.dark = crate::appearance::read();
-                draw::set_dark(self.preferences.dark);
-                self.rebuild();
-                changed = true;
+            if let Some(changes) = self.watch.as_ref().map(|w| w.drain()) {
+                if changes.any() {
+                    self.settings_changed(changes)?;
+                    changed = true;
+                }
             }
-            if changed {
+            if changed || self.look() != before {
                 self.paint()?;
             }
+            self.conn.flush()?;
             let mut fds = [
                 libc::pollfd {
                     fd: self.conn.stream().as_raw_fd(),

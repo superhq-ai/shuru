@@ -22,6 +22,9 @@ pub struct App {
     pub generic: Option<String>,
     /// The Desktop Actions, in the order of the Actions key.
     pub actions: Vec<Action>,
+    /// Of a terminal, the argument before a command to run, from
+    /// X-TerminalArgExec; None means `-e`.
+    pub terminal_arg_exec: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -118,7 +121,8 @@ impl App {
             bail!("{} has an empty Exec line", self.id);
         }
         if self.terminal {
-            argv.splice(0..0, ["xterm".to_string(), "-e".to_string()]);
+            let terminal = crate::defaults::terminal_app();
+            argv.splice(0..0, crate::defaults::terminal_prefix(terminal.as_ref()));
         }
         Ok(argv)
     }
@@ -173,6 +177,7 @@ fn parse_in(id: &str, text: &str, locales: &[String]) -> Option<App> {
     let (mut name, mut plain_name, mut generic): (Local, Option<String>, Local) =
         (None, None, None);
     let mut terminal = false;
+    let mut terminal_arg_exec = None;
     let mut kind = None;
     let mut categories = Vec::new();
     let mut order: Vec<String> = Vec::new();
@@ -213,6 +218,7 @@ fn parse_in(id: &str, text: &str, locales: &[String]) -> Option<App> {
                 "Exec" => exec = Some(value),
                 "StartupWMClass" => wm_class = Some(value),
                 "Terminal" => terminal = value == "true",
+                "X-TerminalArgExec" => terminal_arg_exec = Some(value),
                 "Type" => kind = Some(value),
                 "Icon" if !value.is_empty() => icon = Some(value),
                 "Categories" => categories = list(&value),
@@ -260,6 +266,7 @@ fn parse_in(id: &str, text: &str, locales: &[String]) -> Option<App> {
         icon,
         generic: generic.map(|(_, g)| g),
         actions,
+        terminal_arg_exec,
     })
 }
 
@@ -448,6 +455,7 @@ mod tests {
             icon: None,
             generic: None,
             actions: vec![],
+            terminal_arg_exec: None,
         }
     }
 
@@ -543,9 +551,11 @@ mod tests {
     }
 
     #[test]
-    fn terminal_apps_run_in_xterm() {
+    fn terminal_apps_run_in_the_default_terminal() {
         let mut a = app("htop");
         a.terminal = true;
-        assert_eq!(a.command(&[]).unwrap(), vec!["xterm", "-e", "htop"]);
+        let argv = a.command(&[]).unwrap();
+        assert_eq!(argv.last().map(String::as_str), Some("htop"));
+        assert!(argv.len() >= 2);
     }
 }

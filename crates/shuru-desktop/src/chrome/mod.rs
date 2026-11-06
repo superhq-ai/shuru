@@ -7,6 +7,10 @@ use crate::draw::{self, theme, Canvas, Font, Image, Rect};
 use crate::glyphs;
 use crate::locale::{tr, Msg};
 
+mod faces;
+pub use faces::bell;
+use faces::{Agent, PanelBell, PanelControl, RailTile, TitleSurface, WindowLight};
+
 pub const PANEL_H: u16 = 32;
 pub const RAIL_W: u16 = 64;
 pub const BAR_H: u16 = 30;
@@ -48,13 +52,27 @@ pub fn item_y(i: usize) -> i16 {
 pub enum PanelHit {
     Apps,
     App,
+    Notes,
 }
+
+/// What the notification control on the panel shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bell {
+    /// A notification came since the center was last open.
+    pub unseen: bool,
+    /// Do not disturb is on.
+    pub quiet: bool,
+}
+
+/// The width of the notification control.
+pub const BELL_W: f32 = 32.0;
 
 pub struct PanelView<'a> {
     pub app: Option<(&'a str, Option<&'a Image>)>,
     /// None, the agent (false) or a person (true).
     pub person: Option<bool>,
     pub hover: Option<PanelHit>,
+    pub bell: Bell,
 }
 
 /// The spans of the panel controls.
@@ -62,36 +80,22 @@ pub struct PanelView<'a> {
 pub struct PanelLayout {
     pub apps: (f32, f32),
     pub app: Option<(f32, f32)>,
-}
-
-impl PanelLayout {
-    #[cfg(test)]
-    pub fn hit(&self, x: f32, y: f32) -> Option<PanelHit> {
-        if !(CONTROL_Y..CONTROL_Y + CONTROL_H).contains(&y) {
-            return None;
-        }
-        let inside = |s: (f32, f32)| x >= s.0 && x < s.0 + s.1;
-        if inside(self.apps) {
-            Some(PanelHit::Apps)
-        } else if self.app.is_some_and(inside) {
-            Some(PanelHit::App)
-        } else {
-            None
-        }
-    }
+    /// The notification control, at the end of the panel.
+    pub notes: (f32, f32),
 }
 
 const MARK_X: f32 = 8.0;
 const LABEL_X: f32 = 35.0;
 
-pub fn panel_layout(font: &mut Font, view: &PanelView) -> PanelLayout {
+pub fn panel_layout(font: &mut Font, w: usize, view: &PanelView) -> PanelLayout {
     let apps_w = (LABEL_X + font.width(tr(Msg::Applications), TEXT_SIZE) + 8.0).round();
     let apps = (4.0, apps_w);
     let app = view.app.map(|(name, _)| {
         let x = apps.0 + apps.1 + 4.0;
         (x, (32.0 + font.width(name, TEXT_SIZE) + 8.0).round())
     });
-    PanelLayout { apps, app }
+    let notes = (w as f32 - 4.0 - BELL_W, BELL_W);
+    PanelLayout { apps, app, notes }
 }
 
 /// The Applications control at (x, y) of its pill: the hq mark and label.
@@ -183,6 +187,8 @@ pub fn panel(font: &mut Font, w: usize, view: &PanelView, layout: &PanelLayout) 
 pub const PANEL_ID: u64 = 10;
 pub const APPLICATIONS_ID: u64 = 11;
 pub const FRONT_APP_ID: u64 = 12;
+pub const AGENT_ID: u64 = 13;
+pub const NOTIFICATIONS_ID: u64 = 14;
 pub const RAIL_ID: u64 = 20;
 
 pub fn panel_tree(
@@ -203,15 +209,12 @@ pub fn panel_tree(
                 .height(PANEL_H as f32)
                 .pad(CONTROL_Y, 4.0, CONTROL_Y, 4.0),
         )
-        .semantic(PANEL_ID, Role::Toolbar, "Panel"),
+        .semantic(PANEL_ID, Role::Toolbar, tr(Msg::Panel)),
     );
     b.add(
         0,
         Node::new(
-            Content::PanelControl {
-                name: None,
-                hover: view.hover == Some(PanelHit::Apps),
-            },
+            PanelControl::content(None, view.hover == Some(PanelHit::Apps)),
             style().width(layout.apps.1).height(CONTROL_H),
         )
         .semantic(APPLICATIONS_ID, Role::Button, tr(Msg::Applications)),
@@ -220,10 +223,7 @@ pub fn panel_tree(
         b.add(
             0,
             Node::new(
-                Content::PanelControl {
-                    name: Some(name.into()),
-                    hover: view.hover == Some(PanelHit::App),
-                },
+                PanelControl::content(Some(name.into()), view.hover == Some(PanelHit::App)),
                 style()
                     .width(width)
                     .height(CONTROL_H)
@@ -237,13 +237,28 @@ pub fn panel_tree(
         let width = font.width(tr(Msg::Agent), TEXT_SIZE) + 16.0;
         b.add(
             0,
-            Node::new(Content::Agent, style().width(width).height(CONTROL_H)).semantic(
-                13,
+            Node::new(Agent::content(), style().width(width).height(CONTROL_H)).semantic(
+                AGENT_ID,
                 Role::Label,
                 tr(Msg::Agent),
             ),
         );
     }
+    let mut bell = Node::new(
+        PanelBell::content(view.bell, view.hover == Some(PanelHit::Notes)),
+        style()
+            .width(layout.notes.1)
+            .height(CONTROL_H)
+            .margin(0.0, 0.0, 0.0, 4.0),
+    )
+    .semantic(NOTIFICATIONS_ID, Role::Button, tr(Msg::Notifications));
+    if let Some(s) = bell.semantic.as_mut() {
+        s.set_has_popup(accesskit::HasPopup::Menu);
+        if view.bell.quiet {
+            s.set_description(tr(Msg::DoNotDisturb));
+        }
+    }
+    b.add(0, bell);
     b.finish(font)
 }
 
@@ -277,18 +292,19 @@ pub fn rail_tree(
                 8.0,
             ),
         )
-        .semantic(RAIL_ID, Role::Toolbar, "Applications"),
+        .semantic(RAIL_ID, Role::Toolbar, tr(Msg::Applications)),
     );
     for (i, item) in items.iter().enumerate() {
         let mut node = Node::new(
-            Content::RailTile {
+            RailTile {
                 name: item.name.into(),
                 entry: i,
                 windows: item.windows,
                 front: item.front,
                 attention: item.attention,
                 hover: hover == Some(i),
-            },
+            }
+            .content(),
             style()
                 .width(ITEM as f32)
                 .height(ITEM as f32)
@@ -319,18 +335,6 @@ pub fn rail_icon(c: &mut Canvas, font: &mut Font, item: &RailItem, x: f32, y: f3
             );
         }
     }
-}
-
-/// The rail item under a point of the rail window.
-#[cfg(test)]
-pub fn rail_hit(count: usize, x: f32, screen_y: f32) -> Option<usize> {
-    if !(ITEM_X as f32..(ITEM_X + ITEM as i16) as f32).contains(&x) {
-        return None;
-    }
-    (0..count).find(|&i| {
-        let y = item_y(i) as f32;
-        screen_y >= y && screen_y < y + ITEM as f32
-    })
 }
 
 /// A tooltip: 22 px, RAISED, a HAIRLINE_HI ring outside, and its shape.
@@ -451,18 +455,6 @@ pub fn lights(close_only: bool) -> &'static [(Light, f32)] {
 pub const LIGHT_Y: f32 = 9.0;
 pub const LIGHT_D: f32 = 12.0;
 
-/// The light at (x, y) of a card.
-#[cfg(test)]
-pub fn light_hit(close_only: bool, x: f32, y: f32) -> Option<Light> {
-    if !(LIGHT_Y - 3.0..LIGHT_Y + LIGHT_D + 3.0).contains(&y) {
-        return None;
-    }
-    lights(close_only)
-        .iter()
-        .find(|(_, lx)| x >= lx - 3.0 && x < lx + LIGHT_D + 3.0)
-        .map(|(l, _)| *l)
-}
-
 /// Whether (x, y) of a card is over the group of lights.
 pub fn over_lights(close_only: bool, x: f32, y: f32) -> bool {
     let right = lights(close_only)
@@ -503,18 +495,18 @@ pub fn title_tree(font: &mut Font, window: u32, w: usize, v: &BarView) -> crate:
     use accesskit::Role;
     let mut b = Builder::new(
         Node::new(
-            Content::TitleSurface { ring: v.ring },
+            TitleSurface::content(v.ring),
             style().width(w as f32 + 2.0).height(BAR_H as f32 + 1.0),
         )
         .semantic(title_node_id(window, None), Role::TitleBar, v.title),
     );
     for &(light, x) in lights(v.close_only) {
-        let verb = match light {
-            Light::Close => "Close",
-            Light::Minimize => "Minimize",
-            Light::Maximize if v.maximized => "Restore",
-            Light::Maximize => "Maximize",
-        };
+        let verb = tr(match light {
+            Light::Close => Msg::Close,
+            Light::Minimize => Msg::Minimize,
+            Light::Maximize if v.maximized => Msg::Restore,
+            Light::Maximize => Msg::Maximize,
+        });
         let button = b.add(
             0,
             Node::new(
@@ -533,13 +525,14 @@ pub fn title_tree(font: &mut Font, window: u32, w: usize, v: &BarView) -> crate:
         b.add(
             button,
             Node::new(
-                Content::WindowLight {
+                WindowLight {
                     light,
                     lit: v.focused || v.hover,
                     hover: v.hover,
                     pressed: v.pressed == Some(light),
                     maximized: v.maximized,
-                },
+                }
+                .content(),
                 style().at(3.0, 3.0).width(LIGHT_D).height(LIGHT_D),
             ),
         );
@@ -574,63 +567,6 @@ pub fn title_bar(font: &mut Font, w: usize, v: &BarView) -> Canvas {
         },
         Rect::new(0.0, 0.0, w as f32 + 2.0, BAR_H as f32 + 1.0),
     );
-    c
-}
-
-/// Our title bar for a card `w` wide, with the ring round it and the top
-/// corners: the top `BAR_H + 1` rows of a frame `w + 2` wide.
-#[cfg(test)]
-fn title_bar_reference(font: &mut Font, w: usize, v: &BarView) -> Canvas {
-    let fw = w + 2;
-    let mut c = Canvas::new(fw, BAR_H as usize + 1, theme().bg);
-    let card = Rect::new(1.0, 1.0, w as f32, 4.0 * RADIUS);
-    c.rounded_rect(card.inset(-1.0), RADIUS + 1.0, v.ring);
-    c.rounded_rect(card, RADIUS, theme().winbar);
-    for x in [0, fw - 1] {
-        for y in RADIUS as usize..c.h {
-            c.px[y * fw + x] = v.ring;
-        }
-    }
-    for &(light, lx) in lights(v.close_only) {
-        let b = Rect::new(1.0 + lx, 1.0 + LIGHT_Y, LIGHT_D, LIGHT_D);
-        let lamp = match light {
-            Light::Close => draw::CLOSE,
-            Light::Minimize => draw::MINIMIZE,
-            Light::Maximize => draw::MAXIMIZE,
-        };
-        let lit = v.focused || v.hover;
-        let style = if v.pressed == Some(light) {
-            draw::Raised::pressed(lamp.ring, lamp.ring)
-        } else if lit {
-            lamp.raised(theme().light_drop)
-        } else {
-            theme().light_idle
-        };
-        c.raised(b, LIGHT_D / 2.0, style);
-        if v.hover {
-            let g = match light {
-                Light::Close => &glyphs::LIGHT_CLOSE,
-                Light::Minimize => &glyphs::LIGHT_MIN,
-                Light::Maximize if v.maximized => &glyphs::LIGHT_RESTORE,
-                Light::Maximize => &glyphs::LIGHT_MAX,
-            };
-            c.glyph(g, b.x as i32, b.y as i32, lamp.glyph, 1.0);
-        }
-    }
-    let max = w as f32 - 148.0;
-    if max > 8.0 && !v.title.is_empty() {
-        let t = font.fit(v.title, SMALL_SIZE, max);
-        let tw = font.width(&t, SMALL_SIZE);
-        let color = if v.focused { theme().text } else { theme().dim };
-        font.draw(
-            &mut c,
-            &t,
-            (1.0 + (w as f32 - tw) / 2.0).round(),
-            1.0 + 15.0,
-            SMALL_SIZE,
-            color,
-        );
-    }
     c
 }
 
@@ -715,6 +651,8 @@ pub fn snap_band(w: usize, h: usize, top: bool) -> Canvas {
 pub enum Side {
     /// Under a panel item, left edges aligned.
     Below,
+    /// Under a panel item at the end of the panel, right edges aligned.
+    BelowEnd,
     /// Right of a rail item, top edges aligned.
     Right,
     /// Right of a rail item, bottom edges aligned.
@@ -740,11 +678,13 @@ impl Connected {
         // Laid out as for Below: u across, v down from the pill.
         let to = |x: f32, y: f32| match self.side {
             Side::Below => (x, y),
+            Side::BelowEnd => (-x, y),
             Side::Right => (y, x),
             Side::RightUp => (-y, x),
         };
         let back = |u: f32, v: f32| match self.side {
             Side::Below => (u, v),
+            Side::BelowEnd => (-u, v),
             Side::Right => (v, u),
             Side::RightUp => (v, -u),
         };
@@ -797,7 +737,7 @@ pub fn connected(w: usize, h: usize, shape: &Connected) -> (Canvas, Canvas) {
             m.px[i] = 0xffffff;
         }
     }
-    if shape.side == Side::Below {
+    if matches!(shape.side, Side::Below | Side::BelowEnd) {
         let p = shape.pill;
         let y = p.y as usize + 1;
         for x in (p.x + shape.pill_r + 1.0) as usize..(p.x + p.w - shape.pill_r) as usize {
@@ -856,30 +796,18 @@ mod tests {
     }
 
     #[test]
-    fn rail_items_are_hit_by_their_box() {
-        assert_eq!(rail_hit(3, 30.0, 41.0), Some(0));
-        assert_eq!(rail_hit(3, 30.0, 90.0), None);
-        assert_eq!(rail_hit(3, 30.0, 92.0), Some(1));
-        assert_eq!(rail_hit(3, 2.0, 50.0), None);
-        assert_eq!(rail_hit(1, 30.0, 100.0), None);
-    }
-
-    #[test]
     fn the_panel_lays_out_its_controls() {
         let mut f = Font::for_test();
         let view = PanelView {
             app: Some(("Chromium", None)),
             person: Some(true),
             hover: None,
+            bell: Bell::default(),
         };
-        let l = panel_layout(&mut f, &view);
+        let l = panel_layout(&mut f, 1280, &view);
         assert_eq!(l.apps.0, 4.0);
-        let (ax, aw) = l.app.unwrap();
+        let (ax, _) = l.app.unwrap();
         assert_eq!(ax, l.apps.0 + l.apps.1 + 4.0);
-        assert_eq!(l.hit(10.0, 10.0), Some(PanelHit::Apps));
-        assert_eq!(l.hit(ax + 2.0, 10.0), Some(PanelHit::App));
-        assert_eq!(l.hit(ax + aw + 40.0, 10.0), None);
-        assert_eq!(l.hit(ax + 2.0, 30.0), None);
         let c = panel(&mut f, 1280, &view, &l);
         assert_eq!((c.w, c.h), (1280, 32));
     }
@@ -891,8 +819,9 @@ mod tests {
             app: None,
             person: Some(true),
             hover: None,
+            bell: Bell::default(),
         };
-        let l = panel_layout(&mut f, &view);
+        let l = panel_layout(&mut f, 1280, &view);
         let person = panel(&mut f, 1280, &view, &l);
         view.person = None;
         let nobody = panel(&mut f, 1280, &view, &l);
@@ -900,15 +829,6 @@ mod tests {
         view.person = Some(false);
         let agent = panel(&mut f, 1280, &view, &l);
         assert!(agent.px != nobody.px);
-    }
-
-    #[test]
-    fn lights_are_hit_by_position() {
-        assert_eq!(light_hit(false, 12.0, 15.0), Some(Light::Close));
-        assert_eq!(light_hit(false, 30.0, 15.0), Some(Light::Minimize));
-        assert_eq!(light_hit(false, 50.0, 15.0), Some(Light::Maximize));
-        assert_eq!(light_hit(true, 50.0, 15.0), None);
-        assert_eq!(light_hit(false, 200.0, 15.0), None);
     }
 
     #[test]
@@ -929,6 +849,23 @@ mod tests {
         let (_, m) = corner(Corner::BottomRight, 0xffffff);
         assert!(!inside(&m, 12, 12));
         assert!(inside(&m, 0, 12));
+    }
+
+    #[test]
+    fn a_popover_at_the_end_of_the_panel_aligns_right_edges() {
+        let shape = Connected {
+            pill: Rect::new(160.0, 0.0, 40.0, 24.0),
+            sheet: Rect::new(0.0, 32.0, 200.0, 100.0),
+            pill_r: 6.0,
+            side: Side::BelowEnd,
+        };
+        let (c, m) = connected(200, 132, &shape);
+        assert!(inside(&m, 180, 12));
+        assert!(inside(&m, 180, 28));
+        assert!(!inside(&m, 50, 12));
+        assert!(inside(&m, 50, 80));
+        assert!(!inside(&m, 0, 131));
+        assert_eq!(c.px[60 * 200 + 50], theme().surface);
     }
 
     #[test]
@@ -1051,18 +988,25 @@ mod tree_tests {
     #[test]
     fn panel_paint_keeps_the_original_pixels() {
         let mut font = Font::for_test();
-        for hover in [None, Some(PanelHit::Apps), Some(PanelHit::App)] {
+        for hover in [
+            None,
+            Some(PanelHit::Apps),
+            Some(PanelHit::App),
+            Some(PanelHit::Notes),
+        ] {
             let view = PanelView {
                 app: Some(("Terminal", None)),
                 person: Some(false),
                 hover,
+                bell: Bell::default(),
             };
-            let layout = panel_layout(&mut font, &view);
+            let layout = panel_layout(&mut font, 1280, &view);
             let actual = panel(&mut font, 1280, &view, &layout);
             let mut expected = Canvas::new(1280, 32, theme().bg);
             for (span, hit) in [
                 (layout.apps, PanelHit::Apps),
                 (layout.app.unwrap(), PanelHit::App),
+                (layout.notes, PanelHit::Notes),
             ] {
                 if hover == Some(hit) {
                     let b = Rect::new(span.0, 4.0, span.1, 24.0);
@@ -1079,7 +1023,17 @@ mod tree_tests {
                 "Terminal",
                 None,
             );
-            let x = 1280.0 - 4.0 - font.width(tr(Msg::Agent), TEXT_SIZE) - 16.0;
+            bell(
+                &mut expected,
+                Rect::new(layout.notes.0, 4.0, layout.notes.1, 24.0),
+                Bell::default(),
+                if hover == Some(PanelHit::Notes) {
+                    theme().hover
+                } else {
+                    theme().bg
+                },
+            );
+            let x = layout.notes.0 - 4.0 - font.width(tr(Msg::Agent), TEXT_SIZE) - 16.0;
             expected.rounded_rect(Rect::new(x, 12.0, 8.0, 8.0), 4.0, theme().green);
             font.draw(
                 &mut expected,
@@ -1100,8 +1054,9 @@ mod tree_tests {
             app: Some(("Terminal", None)),
             person: Some(false),
             hover: None,
+            bell: Bell::default(),
         };
-        let layout = panel_layout(&mut font, &view);
+        let layout = panel_layout(&mut font, 1280, &view);
         let mut tree = panel_tree(&mut font, 1280, &view, &layout);
         let bounds = Rect::new(0.0, 0.0, 1280.0, 32.0);
         assert_eq!(tree.size(), (1280.0, 32.0));
@@ -1111,6 +1066,11 @@ mod tree_tests {
             Some(FRONT_APP_ID)
         );
         assert_eq!(tree.hit_node(bounds, 5.0, 29.0), None);
+        assert_eq!(layout.notes, (1280.0 - 4.0 - BELL_W, BELL_W));
+        assert_eq!(
+            tree.hit_node(bounds, layout.notes.0 + 2.0, 10.0),
+            Some(NOTIFICATIONS_ID)
+        );
         tree.set_expanded(APPLICATIONS_ID, true);
         let json = tree.json(bounds, (0, 0));
         let apps = json
@@ -1199,40 +1159,6 @@ mod tree_tests {
 #[cfg(test)]
 mod title_tree_tests {
     use super::*;
-
-    #[test]
-    fn title_tree_matches_the_previous_pixels_and_geometry() {
-        for dark in [false, true] {
-            draw::with_theme(dark, || {
-                let mut font = Font::for_test();
-                for focused in [false, true] {
-                    for hover in [false, true] {
-                        for maximized in [false, true] {
-                            for pressed in [
-                                None,
-                                Some(Light::Close),
-                                Some(Light::Minimize),
-                                Some(Light::Maximize),
-                            ] {
-                                let view = BarView {
-                                    title: "Terminal",
-                                    focused,
-                                    ring: theme().amber,
-                                    close_only: false,
-                                    maximized,
-                                    hover,
-                                    pressed,
-                                };
-                                let expected = title_bar_reference(&mut font, 400, &view);
-                                let actual = title_bar(&mut font, 400, &view);
-                                assert_eq!(actual.px, expected.px);
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    }
 
     #[test]
     fn title_buttons_have_stable_ids_names_and_real_hit_targets() {

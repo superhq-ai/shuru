@@ -1,5 +1,7 @@
-//! Notifications: up to three cards at the top right of the work area,
-//! newest on top, and the recent ones for the agent.
+//! Notifications: up to three banners at the top right of the work area,
+//! newest on top, and the notification center that keeps them after their
+//! banner goes, until they are dismissed. While do not disturb is on, new
+//! notifications skip the banner.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,13 +28,19 @@ pub const DISMISSED: u32 = 2;
 pub const CLOSED: u32 = 3;
 
 pub struct Record {
-    id: u32,
-    app: String,
-    summary: String,
-    body: String,
+    pub id: u32,
+    pub app: String,
+    pub summary: String,
+    pub body: String,
     time: u64,
-    actions: Vec<(String, String)>,
-    open: bool,
+    /// Keys and labels; "default" is a click on the notification.
+    pub actions: Vec<(String, String)>,
+    /// Not closed yet: in the center, its actions still reach its client.
+    pub open: bool,
+    /// Its banner is up.
+    banner: bool,
+    /// The entry of its app, for its icon in the center.
+    pub entry: Option<usize>,
     icon: Option<Image>,
     deadline: Option<Instant>,
 }
@@ -40,17 +48,33 @@ pub struct Record {
 #[derive(Default)]
 pub struct Notes {
     /// Newest first.
-    recent: VecDeque<Record>,
+    pub recent: VecDeque<Record>,
+    /// Do not disturb.
+    pub quiet: bool,
+    /// A notification came since the center was last open.
+    pub unseen: bool,
     next: u32,
     /// The ids on screen, newest first, where each card is and how it looks.
     shown: Vec<(u32, R, Canvas)>,
 }
 
 impl Notes {
+    pub fn new(quiet: bool) -> Self {
+        Self {
+            quiet,
+            ..Self::default()
+        }
+    }
+
+    /// What the center lists: the notifications not closed, newest first.
+    pub fn listed(&self) -> impl Iterator<Item = &Record> {
+        self.recent.iter().filter(|r| r.open)
+    }
+
     pub fn deadline(&self) -> Option<Instant> {
         self.recent
             .iter()
-            .filter(|r| r.open)
+            .filter(|r| r.open && r.banner)
             .filter_map(|r| r.deadline)
             .min()
     }
@@ -64,6 +88,7 @@ fn record_json(r: &Record) -> Value {
         "body": r.body,
         "time": r.time,
         "open": r.open,
+        "banner": r.banner,
         "actions": r.actions.iter().map(|(k, l)| json!({ "key": k, "label": l })).collect::<Vec<_>>(),
     })
 }
@@ -74,7 +99,15 @@ fn clamp(s: &str, n: usize) -> String {
 
 impl Wm {
     pub(super) fn notify(&mut self, note: Note) -> Result<u32> {
-        let icon = self.note_icon(&note);
+        let entry = self.note_entry(&note);
+        let icon = entry
+            .and_then(|e| self.entries[e].large.as_ref())
+            .map(|i| icon::scale(i, NOTE_ICON))
+            .or_else(|| {
+                (!note.icon.is_empty())
+                    .then(|| icon::load(&note.icon, NOTE_ICON as u32))
+                    .flatten()
+            });
         let id = if note.replaces != 0 && self.notes.recent.iter().any(|r| r.id == note.replaces) {
             note.replaces
         } else {
@@ -96,33 +129,38 @@ impl Wm {
                 .map_or(0, |d| d.as_secs()),
             actions: note.actions,
             open: true,
+            banner: !self.notes.quiet,
+            entry,
             icon,
             deadline,
         };
         self.notes.recent.retain(|r| r.id != id);
         self.notes.recent.push_front(record);
-        self.notes.recent.truncate(KEPT);
+        while self.notes.recent.len() > KEPT {
+            if let Some(old) = self.notes.recent.pop_back().filter(|r| r.open) {
+                self.bus_send(bus::Event::Closed {
+                    id: old.id,
+                    reason: EXPIRED,
+                });
+            }
+        }
+        if !self.pop.as_ref().is_some_and(|p| p.is_notes()) {
+            self.notes.unseen = true;
+        }
         self.layout_notes()?;
+        self.draw_panel()?;
+        self.refresh_notes()?;
         Ok(id)
     }
 
-    fn note_icon(&mut self, note: &Note) -> Option<Image> {
-        let of = |pick: &dyn Fn(&super::Entry) -> bool| {
-            self.entries
-                .iter()
-                .find(|x| pick(x))
-                .and_then(|x| x.large.as_ref())
-                .map(|i| icon::scale(i, NOTE_ICON))
-        };
+    /// The entry of the app that sent a notification, by the desktop entry
+    /// it names, else by its app name.
+    fn note_entry(&self, note: &Note) -> Option<usize> {
+        let find = |pick: &dyn Fn(&super::Entry) -> bool| self.entries.iter().position(pick);
         note.entry
             .as_deref()
-            .and_then(|e| of(&|x| x.app.id == e || x.app.is_named(e)))
-            .or_else(|| of(&|x| x.app.is_named(&note.app)))
-            .or_else(|| {
-                (!note.icon.is_empty())
-                    .then(|| icon::load(&note.icon, NOTE_ICON as u32))
-                    .flatten()
-            })
+            .and_then(|e| find(&|x| x.app.id == e || x.app.is_named(e)))
+            .or_else(|| find(&|x| x.app.is_named(&note.app)))
     }
 
     /// Closes a notification and tells its client why.
@@ -131,9 +169,57 @@ impl Wm {
             return Ok(false);
         };
         r.open = false;
+        r.banner = false;
         self.bus_send(bus::Event::Closed { id, reason });
+        if self.notes.listed().next().is_none() {
+            self.notes.unseen = false;
+        }
         self.layout_notes()?;
+        self.draw_panel()?;
+        self.refresh_notes()?;
         Ok(true)
+    }
+
+    /// Dismisses every notification in the center.
+    pub(super) fn clear_notes(&mut self) -> Result<()> {
+        let ids: Vec<u32> = self.notes.listed().map(|r| r.id).collect();
+        for id in ids {
+            self.close_note(id, DISMISSED)?;
+        }
+        Ok(())
+    }
+
+    /// Turns do not disturb on or off: banners go while it is on.
+    pub(super) fn set_quiet(&mut self, quiet: bool) -> Result<()> {
+        if self.notes.quiet == quiet {
+            return Ok(());
+        }
+        self.notes.quiet = quiet;
+        if quiet {
+            for r in &mut self.notes.recent {
+                r.banner = false;
+            }
+        }
+        self.layout_notes()?;
+        self.draw_panel()?;
+        self.refresh_notes()
+    }
+
+    /// A click on a notification: its default action when it has one, and
+    /// dismissed either way.
+    pub(super) fn open_note(&mut self, id: u32) -> Result<()> {
+        let has_default = self
+            .notes
+            .recent
+            .iter()
+            .find(|r| r.id == id)
+            .is_some_and(|r| r.actions.iter().any(|(k, _)| k == "default"));
+        if has_default {
+            self.note_action(id, "default")?;
+        } else {
+            self.close_note(id, DISMISSED)?;
+        }
+        Ok(())
     }
 
     /// Runs an action of a notification, as a click or the agent does.
@@ -161,16 +247,18 @@ impl Wm {
         }
     }
 
+    /// Takes down the banners whose time is up; their notifications stay
+    /// in the center.
     pub(super) fn expire_notes(&mut self, now: Instant) -> Result<()> {
-        let due: Vec<u32> = self
-            .notes
-            .recent
-            .iter()
-            .filter(|r| r.open && r.deadline.is_some_and(|d| d <= now))
-            .map(|r| r.id)
-            .collect();
-        for id in due {
-            self.close_note(id, EXPIRED)?;
+        let mut any = false;
+        for r in &mut self.notes.recent {
+            if r.banner && r.deadline.is_some_and(|d| d <= now) {
+                r.banner = false;
+                any = true;
+            }
+        }
+        if any {
+            self.layout_notes()?;
         }
         Ok(())
     }
@@ -179,7 +267,10 @@ impl Wm {
     pub(super) fn layout_notes(&mut self) -> Result<()> {
         let (wx, wy, ww, _) = chrome::work_area(self.sw, self.sh);
         let open: Vec<usize> = (0..self.notes.recent.len())
-            .filter(|&i| self.notes.recent[i].open)
+            .filter(|&i| {
+                let r = &self.notes.recent[i];
+                r.open && r.banner && !self.notes.quiet
+            })
             .take(SHOWN)
             .collect();
         let mut shown = Vec::new();
@@ -228,17 +319,10 @@ impl Wm {
         let b = chrome::note_close();
         let on_close =
             (b.x..b.x + b.w).contains(&(x as f32)) && (b.y..b.y + b.h).contains(&(y as f32));
-        let has_default = !on_close
-            && self
-                .notes
-                .recent
-                .iter()
-                .find(|r| r.id == id)
-                .is_some_and(|r| r.actions.iter().any(|(k, _)| k == "default"));
-        if has_default {
-            self.note_action(id, "default")?;
-        } else {
+        if on_close {
             self.close_note(id, DISMISSED)?;
+        } else {
+            self.open_note(id)?;
         }
         Ok(())
     }

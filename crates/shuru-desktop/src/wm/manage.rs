@@ -96,8 +96,18 @@ impl Wm {
                 let mut buf = [0u8; 8];
                 unsafe { libc::read(self.wake.as_raw_fd(), buf.as_mut_ptr().cast(), 8) };
             }
-            if fds[2].revents != 0 && self.watch.as_ref().is_some_and(|w| w.drain()) {
+            let changes = match &self.watch {
+                Some(w) if fds[2].revents != 0 => w.drain(),
+                _ => Default::default(),
+            };
+            if changes.appearance {
                 self.set_appearance(appearance::read())?;
+            }
+            if changes.language && crate::locale::reload() {
+                self.set_language()?;
+            }
+            if changes.do_not_disturb {
+                self.set_quiet(crate::dnd::read())?;
             }
         }
     }

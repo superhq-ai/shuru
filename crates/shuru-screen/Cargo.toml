@@ -1,6 +1,6 @@
 [package]
 name = "shuru-screen"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Streams an X11 display as H.264 over a WebSocket on a unix socket, with gated XTEST input"
 license = "Apache-2.0"

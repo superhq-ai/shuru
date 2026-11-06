@@ -1,5 +1,6 @@
-//! The menus: the Applications menu under its panel control, and the app
-//! menu under the panel app item or beside a rail item. Each is one shaped
+//! The menus: the Applications menu under its panel control, the app menu
+//! under the panel app item or beside a rail item, and the notification
+//! center under its control at the end of the panel. Each is one shaped
 //! window: the open pill and the sheet it flows into.
 
 use anyhow::Result;
@@ -11,9 +12,10 @@ use x11rb::CURRENT_TIME;
 
 use super::{Target, Wm, R};
 use crate::chrome::{self, Connected, PanelHit, Side, ITEM, PANEL_H};
-use crate::draw::{Canvas, Font, Rect};
+use crate::draw::{theme, Canvas, Font, Rect};
 use crate::glyphs;
 use crate::locale::{self, tr, Msg};
+use crate::ui::kit::switch::{Knob, TRACK_H, TRACK_W};
 use crate::ui::text::Field;
 use crate::ui::widgets::{Content, Ink, Paint, LABEL_SIZE, SMALL_SIZE, TEXT_SIZE};
 use crate::ui::{style, Builder, Node, Style, Tree};
@@ -22,10 +24,13 @@ use accesskit::Role;
 const APPS_W: f32 = 320.0;
 const APP_W: f32 = 280.0;
 const APP_MAX_W: f32 = 420.0;
+const NOTES_W: f32 = 360.0;
 const SHEET_PAD: f32 = 5.0;
 const SHEET_TOP: f32 = 36.0;
 const PILL_Y: f32 = 4.0;
 const MAX_WINDOWS: usize = 8;
+/// Where the text of a notification starts in its row, past its icon.
+const NOTE_TEXT_X: f32 = 40.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Anchor {
@@ -42,6 +47,19 @@ enum Act {
     Launch(usize),
     Hide(Target),
     Quit(Target),
+    /// A click on a notification in the center.
+    OpenNote(u32),
+    NoteAction(u32, String),
+    Dismiss(u32),
+    ClearAll,
+    ToggleQuiet,
+}
+
+impl Act {
+    /// Whether the menu stays open after: acts that change the center.
+    fn keeps_open(&self) -> bool {
+        matches!(self, Act::Dismiss(_) | Act::ClearAll | Act::ToggleQuiet)
+    }
 }
 
 enum PRow {
@@ -59,6 +77,28 @@ enum PRow {
         name: String,
         act: Act,
     },
+    /// A setting turned on or off in place.
+    Toggle {
+        name: String,
+        on: bool,
+        act: Act,
+    },
+    /// A notification, with a button that dismisses it.
+    Note {
+        app: String,
+        summary: String,
+        body: String,
+        entry: Option<usize>,
+        act: Act,
+        dismiss: Act,
+    },
+    /// An action under the row it belongs to.
+    Sub {
+        name: String,
+        act: Act,
+    },
+    /// A line that says the menu has nothing to list.
+    Empty(String),
     Sep,
     Footer,
 }
@@ -66,16 +106,33 @@ enum PRow {
 impl PRow {
     fn act(&self) -> Option<&Act> {
         match self {
-            PRow::Item { act, .. } | PRow::Action { act, .. } => Some(act),
+            PRow::Item { act, .. }
+            | PRow::Action { act, .. }
+            | PRow::Toggle { act, .. }
+            | PRow::Note { act, .. }
+            | PRow::Sub { act, .. } => Some(act),
             _ => None,
         }
     }
+
+    /// The act of a node of the row: a button in it, else the row.
+    fn act_for(&self, id: u64) -> Option<Act> {
+        match self {
+            PRow::Note { dismiss, .. } if id == act_id(dismiss) => Some(dismiss.clone()),
+            _ => self.act().cloned(),
+        }
+    }
+}
+
+fn act_id(act: &Act) -> u64 {
+    node_id(&format!("{act:?}"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum What {
     Apps,
     App(Target, Anchor),
+    Notes,
 }
 
 pub(super) struct Pop {
@@ -98,6 +155,7 @@ fn shell_click(id: u64, has_front: bool, targets: &[Target]) -> Option<ShellClic
     match id {
         chrome::APPLICATIONS_ID => Some(ShellClick::Panel(PanelHit::Apps)),
         chrome::FRONT_APP_ID if has_front => Some(ShellClick::Panel(PanelHit::App)),
+        chrome::NOTIFICATIONS_ID => Some(ShellClick::Panel(PanelHit::Notes)),
         _ => targets
             .iter()
             .position(|t| Wm::rail_node_id(t) == id)
@@ -114,6 +172,9 @@ impl Pop {
     }
     pub(super) fn is_rail_app(&self, target: &Target) -> bool {
         matches!(&self.what, What::App(t, _) if t == target)
+    }
+    pub(super) fn is_notes(&self) -> bool {
+        self.what == What::Notes
     }
 }
 
@@ -246,11 +307,7 @@ fn menu_tree(
                         Content::Choice,
                         style().row().center().height(26.0).pad(0.0, 8.0, 0.0, 8.0),
                     )
-                    .semantic(
-                        node_id(&format!("{act:?}")),
-                        Role::MenuItem,
-                        name,
-                    ),
+                    .semantic(act_id(act), Role::MenuItem, name),
                 );
                 let opacity = if *minimized { 0.5 } else { 1.0 };
                 b.add(
@@ -285,21 +342,145 @@ fn menu_tree(
                     );
                 }
             }
-            PRow::Action { name, act } => {
+            PRow::Action { name, act } | PRow::Sub { name, act } => {
+                let left = if matches!(r, PRow::Sub { .. }) {
+                    NOTE_TEXT_X
+                } else {
+                    8.0
+                };
                 let row = b.row(
                     Node::new(
                         Content::Choice,
-                        style().row().center().height(24.0).pad(0.0, 8.0, 0.0, 8.0),
+                        style().row().center().height(24.0).pad(0.0, 8.0, 0.0, left),
                     )
-                    .semantic(
-                        node_id(&format!("{act:?}")),
-                        Role::MenuItem,
-                        name,
-                    ),
+                    .semantic(act_id(act), Role::MenuItem, name),
                 );
                 b.add(
                     row,
                     Node::new(text(name, TEXT_SIZE, Ink::Text), style().grow()),
+                );
+            }
+            PRow::Toggle { name, on, act } => {
+                let mut node = Node::new(
+                    Content::Choice,
+                    style().row().center().height(32.0).pad(0.0, 8.0, 0.0, 8.0),
+                )
+                .semantic(act_id(act), Role::MenuItemCheckBox, name);
+                if let Some(s) = node.semantic.as_mut() {
+                    s.set_toggled(if *on {
+                        accesskit::Toggled::True
+                    } else {
+                        accesskit::Toggled::False
+                    });
+                }
+                let row = b.row(node);
+                b.add(
+                    row,
+                    Node::new(text(name, TEXT_SIZE, Ink::Text), style().grow()),
+                );
+                b.add(
+                    row,
+                    Node::new(Knob::content(*on), style().width(TRACK_W).height(TRACK_H)),
+                );
+            }
+            PRow::Note {
+                app,
+                summary,
+                body,
+                entry,
+                act,
+                dismiss,
+            } => {
+                let title = if summary.is_empty() { app } else { summary };
+                let mut node = Node::new(
+                    Content::Choice,
+                    style().row().center().pad(7.0, 4.0, 7.0, 8.0),
+                )
+                .semantic(act_id(act), Role::MenuItem, title);
+                if let Some(s) = node.semantic.as_mut() {
+                    let about = if body.is_empty() {
+                        app.clone()
+                    } else {
+                        format!("{app}: {body}")
+                    };
+                    s.set_description(about);
+                }
+                let row = b.row(node);
+                b.add(
+                    row,
+                    Node::new(
+                        Content::AppIcon {
+                            entry: *entry,
+                            name: icon_name(*entry, app),
+                            opacity: 1.0,
+                        },
+                        style(),
+                    ),
+                );
+                let lines = b.add(
+                    row,
+                    Node::new(
+                        Content::Box,
+                        style()
+                            .column()
+                            .grow()
+                            .margin(0.0, 8.0, 0.0, NOTE_TEXT_X - 8.0 - 16.0),
+                    ),
+                );
+                b.add(lines, Node::new(text(app, LABEL_SIZE, Ink::Dim), style()));
+                b.add(
+                    lines,
+                    Node::new(
+                        text(title, TEXT_SIZE, Ink::Text),
+                        style().margin(4.0, 0.0, 0.0, 0.0),
+                    ),
+                );
+                if !body.is_empty() {
+                    b.add(
+                        lines,
+                        Node::new(
+                            text(body, SMALL_SIZE, Ink::Dim),
+                            style().margin(4.0, 0.0, 0.0, 0.0),
+                        ),
+                    );
+                }
+                let close = b.add(
+                    row,
+                    Node::new(
+                        Content::Choice,
+                        style()
+                            .row()
+                            .center()
+                            .width(24.0)
+                            .height(24.0)
+                            .pad(0.0, 0.0, 0.0, 4.0),
+                    )
+                    .semantic(
+                        act_id(dismiss),
+                        Role::Button,
+                        &locale::dismiss(title),
+                    ),
+                );
+                b.add(
+                    close,
+                    Node::new(Content::Glyph(&glyphs::CLOSE, Ink::Dim), style()),
+                );
+            }
+            PRow::Empty(label) => {
+                let row = b.row(
+                    Node::new(
+                        Content::Box,
+                        style().row().center().height(40.0).pad(0.0, 8.0, 0.0, 8.0),
+                    )
+                    .semantic(
+                        node_id(&format!("empty:{label}")),
+                        Role::Label,
+                        label,
+                    ),
+                );
+                b.add(
+                    row,
+                    Node::new(text(label, TEXT_SIZE, Ink::Dim), style().grow()),
                 );
             }
             PRow::Sep => {
@@ -365,6 +546,7 @@ impl Wm {
                 let sheet = style().min_width(least).max_width(APP_MAX_W.max(least));
                 (sheet, self.target_name(t))
             }
+            What::Notes => (style().width(NOTES_W), tr(Msg::Notifications).to_string()),
         };
         let entries = &self.entries;
         let icon_name = |entry: Option<usize>, name: &str| {
@@ -387,8 +569,33 @@ impl Wm {
         }
     }
 
+    /// The entry of the default browser, else of the first browser.
     fn browser(&self) -> Option<usize> {
-        self.entries.iter().position(|e| e.app.is_browser())
+        let id = crate::defaults::Defaults::from_env().browser();
+        self.entries
+            .iter()
+            .position(|e| Some(crate::defaults::desktop_id(&e.app)) == id)
+            .or_else(|| self.entries.iter().position(|e| e.app.is_browser()))
+    }
+
+    /// Adds the default browser as an entry when it is not one yet, so
+    /// addresses typed in the launcher open in it.
+    fn add_default_browser(&mut self) {
+        let Some(id) = crate::defaults::Defaults::from_env().browser() else {
+            return;
+        };
+        if self
+            .entries
+            .iter()
+            .any(|e| crate::defaults::desktop_id(&e.app) == id)
+        {
+            return;
+        }
+        if let Ok(app) = crate::apps::load(id.trim_end_matches(".desktop")) {
+            if app.is_browser() {
+                self.entries.push(super::Entry::new(app, false));
+            }
+        }
     }
 
     fn launcher_targets(&self) -> Vec<Target> {
@@ -532,6 +739,88 @@ impl Wm {
         rows
     }
 
+    /// The notification center: do not disturb, then the notifications
+    /// newest first, each with its actions, then Clear all.
+    fn notes_rows(&self) -> Vec<PRow> {
+        let mut rows = vec![
+            PRow::Toggle {
+                name: tr(Msg::DoNotDisturb).into(),
+                on: self.notes.quiet,
+                act: Act::ToggleQuiet,
+            },
+            PRow::Sep,
+            PRow::Section(tr(Msg::Notifications).into()),
+        ];
+        let mut any = false;
+        for r in self.notes.listed() {
+            any = true;
+            rows.push(PRow::Note {
+                app: r.app.clone(),
+                summary: r.summary.clone(),
+                body: r.body.split_whitespace().collect::<Vec<_>>().join(" "),
+                entry: r.entry,
+                act: Act::OpenNote(r.id),
+                dismiss: Act::Dismiss(r.id),
+            });
+            for (key, label) in r.actions.iter().filter(|(k, _)| k != "default") {
+                rows.push(PRow::Sub {
+                    name: label.clone(),
+                    act: Act::NoteAction(r.id, key.clone()),
+                });
+            }
+        }
+        if any {
+            rows.push(PRow::Sep);
+            rows.push(PRow::Action {
+                name: tr(Msg::ClearAll).into(),
+                act: Act::ClearAll,
+            });
+        } else {
+            rows.push(PRow::Empty(tr(Msg::NoNotifications).into()));
+        }
+        rows
+    }
+
+    pub(super) fn open_notes(&mut self) -> Result<()> {
+        let was = self.pop.as_ref().map(|p| p.what.clone());
+        self.close_pop()?;
+        if was == Some(What::Notes) {
+            return Ok(());
+        }
+        self.notes.unseen = false;
+        let rows = self.notes_rows();
+        self.show_pop(What::Notes, rows, String::new(), None)
+    }
+
+    /// Rebuilds the notification center when it is open, keeping the
+    /// keyboard where it was.
+    pub(super) fn refresh_notes(&mut self) -> Result<()> {
+        let Some(p) = self.pop.as_ref().filter(|p| p.is_notes()) else {
+            return Ok(());
+        };
+        let was = p.tree.selected;
+        let rows = self.notes_rows();
+        let sel = was.and_then(|s| {
+            let s = s.min(rows.len() - 1);
+            (s..rows.len())
+                .chain((0..s).rev())
+                .find(|&i| rows[i].act().is_some())
+        });
+        self.show_pop(What::Notes, rows, String::new(), sel)
+    }
+
+    /// Does what a row or a button in it does, and closes the menu unless
+    /// the act changes what the menu shows.
+    fn choose(&mut self, act: Act) -> Result<()> {
+        if act.keeps_open() {
+            self.run_act(act)?;
+            self.refresh_notes()
+        } else {
+            self.close_pop()?;
+            self.run_act(act)
+        }
+    }
+
     fn first_act(rows: &[PRow]) -> Option<usize> {
         rows.iter().position(|r| r.act().is_some())
     }
@@ -542,6 +831,7 @@ impl Wm {
         if was == Some(What::Apps) {
             return Ok(());
         }
+        self.add_default_browser();
         let rows = self.apps_rows("");
         let sel = Self::first_act(&rows);
         self.show_pop(What::Apps, rows, String::new(), sel)
@@ -600,6 +890,15 @@ impl Wm {
                         Side::RightUp,
                     ))
                 }
+            }
+            What::Notes => {
+                let (x, w) = self.panel_layout.notes;
+                Some((
+                    Rect::new(x, PILL_Y, w, 24.0),
+                    Rect::new(x + w - width, SHEET_TOP, width, height),
+                    6.0,
+                    Side::BelowEnd,
+                ))
             }
         }
     }
@@ -753,6 +1052,13 @@ impl Wm {
                 };
                 chrome::rail_icon(c, &mut self.font, &item, pill.x, pill.y);
             }
+            What::Notes => {
+                let bell = chrome::Bell {
+                    unseen: false,
+                    quiet: self.notes.quiet,
+                };
+                chrome::bell(c, pill, bell, theme().surface);
+            }
         }
     }
 
@@ -820,10 +1126,12 @@ impl Wm {
         let on_pill = lx >= pill.x && lx < pill.x + pill.w && ly >= pill.y && ly < pill.y + pill.h;
         if let Some(i) = Self::row_at(p, lx, ly) {
             if e.detail == 1 {
-                let act = p.rows[i].act().cloned();
-                self.close_pop()?;
+                let act = match p.tree.hit_node(p.shape.sheet, lx, ly) {
+                    Some(id) => p.rows[i].act_for(id),
+                    None => p.rows[i].act().cloned(),
+                };
                 if let Some(a) = act {
-                    self.run_act(a)?;
+                    self.choose(a)?;
                 }
             }
             return Ok(());
@@ -884,6 +1192,21 @@ impl Wm {
                     self.close(w)?;
                 }
             }
+            Act::OpenNote(id) => self.open_note(id)?,
+            Act::NoteAction(id, key) => {
+                self.note_action(id, &key)?;
+            }
+            Act::Dismiss(id) => {
+                self.close_note(id, super::notes::DISMISSED)?;
+            }
+            Act::ClearAll => self.clear_notes()?,
+            Act::ToggleQuiet => {
+                let quiet = !self.notes.quiet;
+                if let Err(e) = crate::dnd::write(quiet) {
+                    eprintln!("shuru-desktop: do not disturb: {e}");
+                }
+                self.set_quiet(quiet)?;
+            }
         }
         Ok(())
     }
@@ -942,15 +1265,24 @@ impl Wm {
         let Some(p) = &self.pop else {
             return Ok(());
         };
+        // Space types in the search field of Applications, else activates.
+        let activate = matches!(base, 0xff0d | 0xff8d) || (base == 0x20 && p.what != What::Apps);
         match base {
             0xff1b => return self.close_pop(),
-            0xff0d | 0xff8d => {
-                let act = p.tree.selected.and_then(|i| p.rows[i].act().cloned());
-                if act.is_some() {
-                    self.close_pop()?;
-                    if let Some(a) = act {
-                        self.run_act(a)?;
-                    }
+            _ if activate => {
+                if let Some(a) = p.tree.selected.and_then(|i| p.rows[i].act().cloned()) {
+                    self.choose(a)?;
+                }
+                return Ok(());
+            }
+            // Delete and BackSpace dismiss the notification under the keyboard.
+            0xffff | 0xff08 if p.what == What::Notes => {
+                let dismiss = p.tree.selected.and_then(|i| match &p.rows[i] {
+                    PRow::Note { dismiss, .. } => Some(dismiss.clone()),
+                    _ => None,
+                });
+                if let Some(a) = dismiss {
+                    self.choose(a)?;
                 }
                 return Ok(());
             }
@@ -1102,6 +1434,7 @@ impl Wm {
         match id {
             chrome::APPLICATIONS_ID => Some(PanelHit::Apps),
             chrome::FRONT_APP_ID => Some(PanelHit::App),
+            chrome::NOTIFICATIONS_ID => Some(PanelHit::Notes),
             _ => None,
         }
     }
@@ -1131,6 +1464,7 @@ impl Wm {
                 }
                 Ok(())
             }
+            PanelHit::Notes => self.open_notes(),
         }
     }
 
@@ -1189,7 +1523,7 @@ impl Wm {
                 .map(|()| json!({"ok": true}))
                 .map_err(|e| (500, e.to_string()));
         }
-        if [chrome::PANEL_ID, chrome::RAIL_ID, 13].contains(&id) {
+        if [chrome::PANEL_ID, chrome::RAIL_ID, chrome::AGENT_ID].contains(&id) {
             return Err((400, "unsupported action".into()));
         }
         let p = self.pop.as_mut().ok_or((404, "no open UI".into()))?;
@@ -1209,10 +1543,9 @@ impl Wm {
         let out = match wanted {
             accesskit::Action::Click => {
                 let act = p.rows[row]
-                    .act()
-                    .cloned()
+                    .act_for(id)
                     .ok_or((400, "unsupported action".into()))?;
-                self.close_pop().and_then(|()| self.run_act(act))
+                self.choose(act)
             }
             accesskit::Action::Focus => {
                 p.tree.focused = Some(row);
@@ -1459,6 +1792,123 @@ mod tests {
         tree.paint(&mut c, &mut paint, Rect::new(0.0, 0.0, w, h));
         assert!(c.px.contains(&crate::draw::theme().selected));
         assert!(c.px.contains(&crate::draw::theme().raised));
+    }
+
+    fn center() -> Vec<PRow> {
+        vec![
+            PRow::Toggle {
+                name: "Do not disturb".into(),
+                on: true,
+                act: Act::ToggleQuiet,
+            },
+            PRow::Sep,
+            PRow::Section("Notifications".into()),
+            PRow::Note {
+                app: "Chromium".into(),
+                summary: "Build finished".into(),
+                body: "All 93 tests passed".into(),
+                entry: None,
+                act: Act::OpenNote(7),
+                dismiss: Act::Dismiss(7),
+            },
+            PRow::Sub {
+                name: "View log".into(),
+                act: Act::NoteAction(7, "log".into()),
+            },
+            PRow::Sep,
+            PRow::Action {
+                name: "Clear all".into(),
+                act: Act::ClearAll,
+            },
+        ]
+    }
+
+    #[test]
+    fn the_center_routes_a_dismiss_button_apart_from_its_row() {
+        let rows = center();
+        let note = &rows[3];
+        assert_eq!(
+            note.act_for(act_id(&Act::Dismiss(7))),
+            Some(Act::Dismiss(7))
+        );
+        assert_eq!(
+            note.act_for(act_id(&Act::OpenNote(7))),
+            Some(Act::OpenNote(7))
+        );
+        assert!(Act::Dismiss(7).keeps_open());
+        assert!(Act::ToggleQuiet.keeps_open());
+        assert!(Act::ClearAll.keeps_open());
+        assert!(!Act::OpenNote(7).keeps_open());
+        assert!(!Act::NoteAction(7, "log".into()).keeps_open());
+    }
+
+    #[test]
+    fn the_center_describes_its_rows() {
+        let mut font = Font::for_test();
+        let names = |_: Option<usize>, n: &str| n.to_string();
+        let rows = center();
+        let mut tree = locale::with_lang(locale::Lang::En, || {
+            menu_tree(
+                &mut font,
+                sheet(NOTES_W),
+                "notes",
+                "Notifications",
+                &rows,
+                &names,
+            )
+        });
+        let quiet = tree.semantic(act_id(&Act::ToggleQuiet)).unwrap();
+        assert_eq!(quiet.role(), Role::MenuItemCheckBox);
+        assert_eq!(quiet.toggled(), Some(accesskit::Toggled::True));
+        assert!(quiet.supports_action(accesskit::Action::Click));
+        let note = tree.semantic(act_id(&Act::OpenNote(7))).unwrap();
+        assert_eq!(note.label(), Some("Build finished"));
+        assert_eq!(note.description(), Some("Chromium: All 93 tests passed"));
+        let dismiss = tree.semantic(act_id(&Act::Dismiss(7))).unwrap();
+        assert_eq!(dismiss.role(), Role::Button);
+        assert_eq!(dismiss.label(), Some("Dismiss Build finished"));
+        assert!(dismiss.supports_action(accesskit::Action::Click));
+        let (w, h) = tree.size();
+        let view = Rect::new(0.0, 0.0, w, h);
+        let row = tree.row_of(act_id(&Act::Dismiss(7))).unwrap();
+        assert_eq!(row, 3, "the button belongs to the row of its notification");
+        let b = tree.row_bounds(row, (0.0, 0.0));
+        assert_eq!(
+            tree.hit_node(view, b.x + b.w - 14.0, b.y + b.h / 2.0),
+            Some(act_id(&Act::Dismiss(7)))
+        );
+        assert_eq!(
+            tree.hit_node(view, b.x + 60.0, b.y + b.h / 2.0),
+            Some(act_id(&Act::OpenNote(7)))
+        );
+        let walked: Vec<usize> = (0..5)
+            .map(|_| {
+                tree.step(true, h);
+                tree.selected.unwrap()
+            })
+            .collect();
+        assert_eq!(walked, [0, 3, 4, 6, 0], "arrows skip what does not act");
+    }
+
+    #[test]
+    fn an_empty_center_says_so() {
+        let mut font = Font::for_test();
+        let names = |_: Option<usize>, n: &str| n.to_string();
+        let rows = vec![PRow::Empty("No notifications".into())];
+        let tree = menu_tree(
+            &mut font,
+            sheet(NOTES_W),
+            "notes",
+            "Notifications",
+            &rows,
+            &names,
+        );
+        let json = tree.json(Rect::new(0.0, 0.0, NOTES_W, 100.0), (0, 0));
+        assert!(json
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["role"] == "label" && n["name"] == "No notifications"));
     }
 
     #[test]

@@ -601,7 +601,7 @@ pub fn start(
         keys: input::Keys::default(),
         watch: appearance::Watch::new(),
         xsettings_serial: 0,
-        notes: notes::Notes::default(),
+        notes: notes::Notes::new(crate::dnd::read()),
         bus: Some(bus),
         last_accessibility: None,
     };
