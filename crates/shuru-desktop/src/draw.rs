@@ -159,8 +159,27 @@ pub static LIGHT: Theme = Theme {
 
 static IS_DARK: AtomicBool = AtomicBool::new(false);
 
+#[cfg(test)]
+std::thread_local! { static TEST_THEME: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
+
+#[cfg(test)]
+pub fn with_theme<T>(dark: bool, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_THEME.with(|theme| theme.set(self.0));
+        }
+    }
+    let _restore = Restore(TEST_THEME.with(|theme| theme.replace(Some(dark))));
+    f()
+}
+
 /// The theme of the current appearance.
 pub fn theme() -> &'static Theme {
+    #[cfg(test)]
+    if let Some(dark) = TEST_THEME.with(|theme| theme.get()) {
+        return if dark { &DARK } else { &LIGHT };
+    }
     if IS_DARK.load(Ordering::Relaxed) {
         &DARK
     } else {
@@ -738,5 +757,42 @@ mod tests {
         assert!(lines[1].ends_with('\u{2026}'));
         assert!(lines.iter().all(|l| f.width(l, 13.0) <= 90.0));
         assert_eq!(f.wrap("short", 13.0, 90.0, 2), vec!["short"]);
+    }
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+
+    fn luminance(color: u32) -> f64 {
+        let channel = |shift: u32| {
+            let v = ((color >> shift) & 255u32) as f64 / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+    }
+
+    #[test]
+    fn settings_text_meets_aa_on_each_control_surface() {
+        for theme in [&LIGHT, &DARK] {
+            for ink in [theme.text, theme.dim] {
+                for surface in [
+                    theme.bg,
+                    theme.surface,
+                    theme.raised,
+                    theme.hover,
+                    theme.selected,
+                    theme.winbar,
+                ] {
+                    let (a, b) = (luminance(ink), luminance(surface));
+                    let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+                    assert!(contrast >= 4.5, "{ink:06x} on {surface:06x}: {contrast}");
+                }
+            }
+        }
     }
 }

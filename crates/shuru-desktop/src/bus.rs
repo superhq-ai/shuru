@@ -16,6 +16,7 @@ pub enum Event {
     Closed { id: u32, reason: u32 },
     Action { id: u32, key: String },
     Appearance(bool),
+    Tree(Box<accesskit::TreeUpdate>),
 }
 
 /// A notification as a client sent it.
@@ -187,6 +188,38 @@ pub async fn run(wm: Handle, mut events: mpsc::UnboundedReceiver<Event>) {
         eprintln!("shuru-desktop: no session bus, so no notifications or portal settings");
         return;
     }
+    let (trees, tree_rx) = mpsc::unbounded_channel();
+    let (actions, mut action_rx) = mpsc::unbounded_channel::<accesskit::ActionRequest>();
+    let action_wm = wm.clone();
+    tokio::spawn(async move {
+        while let Some(request) = action_rx.recv().await {
+            let (action, value) = match request.action {
+                accesskit::Action::Click => ("click", None),
+                accesskit::Action::Focus => ("focus", None),
+                accesskit::Action::SetValue => (
+                    "set_value",
+                    match request.data {
+                        Some(accesskit::ActionData::Value(v)) => Some(v.into()),
+                        _ => None,
+                    },
+                ),
+                _ => continue,
+            };
+            let _ = action_wm
+                .call(|reply| Cmd::TreeAction {
+                    id: request.target_node.0,
+                    action: action.into(),
+                    value,
+                    reply,
+                })
+                .await;
+        }
+    });
+    tokio::spawn(crate::atspi::run(
+        "SuperHQ desktop".into(),
+        tree_rx,
+        actions,
+    ));
     let conn = zbus::connection::Builder::session()
         .name("org.freedesktop.Notifications")
         .name("org.freedesktop.portal.Desktop")
@@ -204,6 +237,14 @@ pub async fn run(wm: Handle, mut events: mpsc::UnboundedReceiver<Event>) {
     let server = conn.object_server();
     while let Some(ev) = events.recv().await {
         let sent = match ev {
+            Event::Tree(update) => {
+                let focused = update.focus != accesskit::NodeId(1);
+                let _ = trees.send(crate::atspi::Snapshot {
+                    tree: *update,
+                    focused,
+                });
+                continue;
+            }
             Event::Closed { id, reason } => {
                 match server.interface::<_, Notifications>(NOTIFICATIONS).await {
                     Ok(i) => {

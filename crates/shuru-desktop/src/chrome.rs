@@ -3,7 +3,7 @@
 
 use std::f32::consts::{FRAC_PI_2, PI};
 
-use crate::draw::{self, theme, Canvas, Font, Image, Raised, Rect};
+use crate::draw::{self, theme, Canvas, Font, Image, Rect};
 use crate::glyphs;
 use crate::locale::{tr, Msg};
 
@@ -44,14 +44,6 @@ pub fn item_y(i: usize) -> i16 {
     ITEM_TOP + ITEM_PITCH * i as i16
 }
 
-fn mid_of(y: f32, h: f32) -> f32 {
-    y + h / 2.0
-}
-
-fn dot(c: &mut Canvas, x: f32, cy: f32, d: f32, color: u32) {
-    c.rounded_rect(Rect::new(x, cy - d / 2.0, d, d), d / 2.0, color);
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelHit {
     Apps,
@@ -73,6 +65,7 @@ pub struct PanelLayout {
 }
 
 impl PanelLayout {
+    #[cfg(test)]
     pub fn hit(&self, x: f32, y: f32) -> Option<PanelHit> {
         if !(CONTROL_Y..CONTROL_Y + CONTROL_H).contains(&y) {
             return None;
@@ -170,31 +163,88 @@ pub fn app_icon(
 }
 
 /// The panel: 32 px on BG.
+#[cfg(test)]
 pub fn panel(font: &mut Font, w: usize, view: &PanelView, layout: &PanelLayout) -> Canvas {
+    let tree = panel_tree(font, w, view, layout);
     let mut c = Canvas::new(w, PANEL_H as usize, theme().bg);
-    let pill = |c: &mut Canvas, s: (f32, f32), hit: PanelHit| {
-        if view.hover == Some(hit) {
-            let r = Rect::new(s.0, CONTROL_Y, s.1, CONTROL_H);
-            c.rounded_rect(r, 6.0, theme().hover);
-            c.ring_in(r, 6.0, theme().hairline);
-        }
-    };
-    pill(&mut c, layout.apps, PanelHit::Apps);
-    apps_label(&mut c, font, layout.apps.0, CONTROL_Y);
-    if let (Some(s), Some((name, icon))) = (layout.app, view.app) {
-        pill(&mut c, s, PanelHit::App);
-        app_label(&mut c, font, s.0, CONTROL_Y, name, icon);
-    }
-    // Who has control shows only for the agent: a person in control sees
-    // it on the page, and the screen shows it as amber frames.
-    if view.person == Some(false) {
-        let mid = mid_of(CONTROL_Y, CONTROL_H);
-        let label = tr(Msg::Agent);
-        let x = w as f32 - 4.0 - font.width(label, TEXT_SIZE) - 16.0;
-        dot(&mut c, x, mid, 8.0, theme().green);
-        font.draw(&mut c, label, x + 16.0, mid, TEXT_SIZE, theme().text);
-    }
+    let icons = |_| view.app.and_then(|(_, icon)| icon);
+    tree.paint(
+        &mut c,
+        &mut crate::ui::widgets::Paint {
+            font,
+            icons: &icons,
+            field: None,
+        },
+        Rect::new(0.0, 0.0, w as f32, PANEL_H as f32),
+    );
     c
+}
+
+pub const PANEL_ID: u64 = 10;
+pub const APPLICATIONS_ID: u64 = 11;
+pub const FRONT_APP_ID: u64 = 12;
+pub const RAIL_ID: u64 = 20;
+
+pub fn panel_tree(
+    font: &mut Font,
+    w: usize,
+    view: &PanelView,
+    layout: &PanelLayout,
+) -> crate::ui::Tree {
+    use crate::ui::widgets::Content;
+    use crate::ui::{style, Builder, Node};
+    use accesskit::Role;
+    let mut b = Builder::new(
+        Node::new(
+            Content::Box,
+            style()
+                .row()
+                .width(w as f32)
+                .height(PANEL_H as f32)
+                .pad(CONTROL_Y, 4.0, CONTROL_Y, 4.0),
+        )
+        .semantic(PANEL_ID, Role::Toolbar, "Panel"),
+    );
+    b.add(
+        0,
+        Node::new(
+            Content::PanelControl {
+                name: None,
+                hover: view.hover == Some(PanelHit::Apps),
+            },
+            style().width(layout.apps.1).height(CONTROL_H),
+        )
+        .semantic(APPLICATIONS_ID, Role::Button, tr(Msg::Applications)),
+    );
+    if let (Some((name, _)), Some((_, width))) = (view.app, layout.app) {
+        b.add(
+            0,
+            Node::new(
+                Content::PanelControl {
+                    name: Some(name.into()),
+                    hover: view.hover == Some(PanelHit::App),
+                },
+                style()
+                    .width(width)
+                    .height(CONTROL_H)
+                    .margin(0.0, 0.0, 0.0, 4.0),
+            )
+            .semantic(FRONT_APP_ID, Role::Button, name),
+        );
+    }
+    b.add(0, Node::new(Content::Box, style().grow()));
+    if view.person == Some(false) {
+        let width = font.width(tr(Msg::Agent), TEXT_SIZE) + 16.0;
+        b.add(
+            0,
+            Node::new(Content::Agent, style().width(width).height(CONTROL_H)).semantic(
+                13,
+                Role::Label,
+                tr(Msg::Agent),
+            ),
+        );
+    }
+    b.finish(font)
 }
 
 pub struct RailItem<'a> {
@@ -206,27 +256,49 @@ pub struct RailItem<'a> {
     pub attention: bool,
 }
 
-/// The rail: 64 px wide from the panel down, item `i` at screen y
-/// `item_y(i)`. `top` is the screen y of the rail window.
-pub fn rail(
+pub fn rail_tree(
     font: &mut Font,
     items: &[RailItem],
+    ids: &[u64],
     hover: Option<usize>,
     h: usize,
     top: i16,
-) -> Canvas {
-    let mut c = Canvas::new(RAIL_W as usize, h, theme().bg);
+) -> crate::ui::Tree {
+    use crate::ui::widgets::Content;
+    use crate::ui::{style, Builder, Node};
+    use accesskit::Role;
+    let mut b = Builder::new(
+        Node::new(
+            Content::Box,
+            style().column().width(RAIL_W as f32).height(h as f32).pad(
+                (ITEM_TOP - top) as f32,
+                8.0,
+                0.0,
+                8.0,
+            ),
+        )
+        .semantic(RAIL_ID, Role::Toolbar, "Applications"),
+    );
     for (i, item) in items.iter().enumerate() {
-        let y = (item_y(i) - top) as f32;
-        let b = Rect::new(ITEM_X as f32, y, ITEM as f32, ITEM as f32);
-        if item.front {
-            c.rounded_rect(b, 12.0, theme().rail_active);
-        } else if hover == Some(i) {
-            c.rounded_rect(b, 12.0, theme().hover);
-        }
-        rail_icon(&mut c, font, item, ITEM_X as f32, y);
+        let mut node = Node::new(
+            Content::RailTile {
+                name: item.name.into(),
+                entry: i,
+                windows: item.windows,
+                front: item.front,
+                attention: item.attention,
+                hover: hover == Some(i),
+            },
+            style()
+                .width(ITEM as f32)
+                .height(ITEM as f32)
+                .margin(0.0, 0.0, 4.0, 0.0),
+        )
+        .semantic(ids[i], Role::Button, item.name);
+        node.semantic.as_mut().unwrap().set_selected(item.front);
+        b.add(0, node);
     }
-    c
+    b.finish(font)
 }
 
 /// The icon and running dots of a rail item whose box is at (x, y).
@@ -250,6 +322,7 @@ pub fn rail_icon(c: &mut Canvas, font: &mut Font, item: &RailItem, x: f32, y: f3
 }
 
 /// The rail item under a point of the rail window.
+#[cfg(test)]
 pub fn rail_hit(count: usize, x: f32, screen_y: f32) -> Option<usize> {
     if !(ITEM_X as f32..(ITEM_X + ITEM as i16) as f32).contains(&x) {
         return None;
@@ -379,6 +452,7 @@ pub const LIGHT_Y: f32 = 9.0;
 pub const LIGHT_D: f32 = 12.0;
 
 /// The light at (x, y) of a card.
+#[cfg(test)]
 pub fn light_hit(close_only: bool, x: f32, y: f32) -> Option<Light> {
     if !(LIGHT_Y - 3.0..LIGHT_Y + LIGHT_D + 3.0).contains(&y) {
         return None;
@@ -407,9 +481,106 @@ pub struct BarView<'a> {
     pub pressed: Option<Light>,
 }
 
+pub fn title_node_id(window: u32, light: Option<Light>) -> u64 {
+    ((window as u64) << 32)
+        | match light {
+            None => 0xb400,
+            Some(Light::Close) => 0xb401,
+            Some(Light::Minimize) => 0xb402,
+            Some(Light::Maximize) => 0xb403,
+        }
+}
+
+pub fn title_light(window: u32, close_only: bool, id: u64) -> Option<Light> {
+    lights(close_only)
+        .iter()
+        .find_map(|(light, _)| (title_node_id(window, Some(*light)) == id).then_some(*light))
+}
+
+pub fn title_tree(font: &mut Font, window: u32, w: usize, v: &BarView) -> crate::ui::Tree {
+    use crate::ui::widgets::{Content, Ink};
+    use crate::ui::{style, Builder, Node};
+    use accesskit::Role;
+    let mut b = Builder::new(
+        Node::new(
+            Content::TitleSurface { ring: v.ring },
+            style().width(w as f32 + 2.0).height(BAR_H as f32 + 1.0),
+        )
+        .semantic(title_node_id(window, None), Role::TitleBar, v.title),
+    );
+    for &(light, x) in lights(v.close_only) {
+        let verb = match light {
+            Light::Close => "Close",
+            Light::Minimize => "Minimize",
+            Light::Maximize if v.maximized => "Restore",
+            Light::Maximize => "Maximize",
+        };
+        let button = b.add(
+            0,
+            Node::new(
+                Content::Box,
+                style()
+                    .at(x - 2.0, LIGHT_Y - 2.0)
+                    .width(LIGHT_D + 6.0)
+                    .height(LIGHT_D + 6.0),
+            )
+            .semantic(
+                title_node_id(window, Some(light)),
+                Role::Button,
+                &format!("{verb} {}", v.title),
+            ),
+        );
+        b.add(
+            button,
+            Node::new(
+                Content::WindowLight {
+                    light,
+                    lit: v.focused || v.hover,
+                    hover: v.hover,
+                    pressed: v.pressed == Some(light),
+                    maximized: v.maximized,
+                },
+                style().at(3.0, 3.0).width(LIGHT_D).height(LIGHT_D),
+            ),
+        );
+    }
+    let width = w as f32 - 148.0;
+    if width > 8.0 && !v.title.is_empty() {
+        b.add(
+            0,
+            Node::new(
+                Content::CenteredText {
+                    text: v.title.into(),
+                    size: SMALL_SIZE,
+                    ink: if v.focused { Ink::Text } else { Ink::Dim },
+                },
+                style().at(75.0, 10.0).width(width).height(12.0),
+            ),
+        );
+    }
+    b.finish(font)
+}
+
+#[cfg(test)]
+pub fn title_bar(font: &mut Font, w: usize, v: &BarView) -> Canvas {
+    let tree = title_tree(font, 100, w, v);
+    let mut c = Canvas::new(w + 2, BAR_H as usize + 1, theme().bg);
+    tree.paint(
+        &mut c,
+        &mut crate::ui::widgets::Paint {
+            font,
+            icons: &|_| None,
+            field: None,
+        },
+        Rect::new(0.0, 0.0, w as f32 + 2.0, BAR_H as f32 + 1.0),
+    );
+    c
+}
+
 /// Our title bar for a card `w` wide, with the ring round it and the top
 /// corners: the top `BAR_H + 1` rows of a frame `w + 2` wide.
-pub fn title_bar(font: &mut Font, w: usize, v: &BarView) -> Canvas {
+#[cfg(test)]
+fn title_bar_reference(font: &mut Font, w: usize, v: &BarView) -> Canvas {
     let fw = w + 2;
     let mut c = Canvas::new(fw, BAR_H as usize + 1, theme().bg);
     let card = Rect::new(1.0, 1.0, w as f32, 4.0 * RADIUS);
@@ -429,7 +600,7 @@ pub fn title_bar(font: &mut Font, w: usize, v: &BarView) -> Canvas {
         };
         let lit = v.focused || v.hover;
         let style = if v.pressed == Some(light) {
-            Raised::pressed(lamp.ring, lamp.ring)
+            draw::Raised::pressed(lamp.ring, lamp.ring)
         } else if lit {
             lamp.raised(theme().light_drop)
         } else {
@@ -695,7 +866,7 @@ mod tests {
 
     #[test]
     fn the_panel_lays_out_its_controls() {
-        let mut f = Font::new();
+        let mut f = Font::for_test();
         let view = PanelView {
             app: Some(("Chromium", None)),
             person: Some(true),
@@ -715,7 +886,7 @@ mod tests {
 
     #[test]
     fn the_panel_shows_no_control_for_a_person() {
-        let mut f = Font::new();
+        let mut f = Font::for_test();
         let mut view = PanelView {
             app: None,
             person: Some(true),
@@ -802,7 +973,7 @@ mod tests {
 
     #[test]
     fn a_note_wraps_its_body() {
-        let mut f = Font::new();
+        let mut f = Font::for_test();
         let (c, m) = note(
             &mut f,
             None,
@@ -817,7 +988,7 @@ mod tests {
 
     #[test]
     fn a_title_bar_has_lights_and_a_ring() {
-        let mut f = Font::new();
+        let mut f = Font::for_test();
         let v = BarView {
             title: "Terminal",
             focused: true,
@@ -870,5 +1041,233 @@ mod tests {
         let mid = RIPPLE as usize / 2;
         assert!(!inside(&m, mid, mid));
         assert!(inside(&m, mid + 15, mid));
+    }
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    #[test]
+    fn panel_paint_keeps_the_original_pixels() {
+        let mut font = Font::for_test();
+        for hover in [None, Some(PanelHit::Apps), Some(PanelHit::App)] {
+            let view = PanelView {
+                app: Some(("Terminal", None)),
+                person: Some(false),
+                hover,
+            };
+            let layout = panel_layout(&mut font, &view);
+            let actual = panel(&mut font, 1280, &view, &layout);
+            let mut expected = Canvas::new(1280, 32, theme().bg);
+            for (span, hit) in [
+                (layout.apps, PanelHit::Apps),
+                (layout.app.unwrap(), PanelHit::App),
+            ] {
+                if hover == Some(hit) {
+                    let b = Rect::new(span.0, 4.0, span.1, 24.0);
+                    expected.rounded_rect(b, 6.0, theme().hover);
+                    expected.ring_in(b, 6.0, theme().hairline);
+                }
+            }
+            apps_label(&mut expected, &mut font, layout.apps.0, 4.0);
+            app_label(
+                &mut expected,
+                &mut font,
+                layout.app.unwrap().0,
+                4.0,
+                "Terminal",
+                None,
+            );
+            let x = 1280.0 - 4.0 - font.width(tr(Msg::Agent), TEXT_SIZE) - 16.0;
+            expected.rounded_rect(Rect::new(x, 12.0, 8.0, 8.0), 4.0, theme().green);
+            font.draw(
+                &mut expected,
+                tr(Msg::Agent),
+                x + 16.0,
+                16.0,
+                TEXT_SIZE,
+                theme().text,
+            );
+            assert_eq!(actual.px, expected.px);
+        }
+    }
+
+    #[test]
+    fn panel_nodes_keep_control_sizes_and_hit_targets() {
+        let mut font = Font::for_test();
+        let view = PanelView {
+            app: Some(("Terminal", None)),
+            person: Some(false),
+            hover: None,
+        };
+        let layout = panel_layout(&mut font, &view);
+        let mut tree = panel_tree(&mut font, 1280, &view, &layout);
+        let bounds = Rect::new(0.0, 0.0, 1280.0, 32.0);
+        assert_eq!(tree.size(), (1280.0, 32.0));
+        assert_eq!(tree.hit_node(bounds, 5.0, 5.0), Some(APPLICATIONS_ID));
+        assert_eq!(
+            tree.hit_node(bounds, layout.app.unwrap().0 + 1.0, 5.0),
+            Some(FRONT_APP_ID)
+        );
+        assert_eq!(tree.hit_node(bounds, 5.0, 29.0), None);
+        tree.set_expanded(APPLICATIONS_ID, true);
+        let json = tree.json(bounds, (0, 0));
+        let apps = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == APPLICATIONS_ID)
+            .unwrap();
+        assert_eq!(apps["role"], "button");
+        assert_eq!(apps["actions"], serde_json::json!(["click"]));
+        assert_eq!(apps["bounds"]["width"], layout.apps.1);
+        assert_eq!(apps["states"]["expanded"], true);
+        assert!(json
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["name"] == "Agent"));
+    }
+
+    #[test]
+    fn rail_nodes_keep_the_pitch_and_screen_coordinates() {
+        let mut font = Font::for_test();
+        let items: Vec<_> = (0..3)
+            .map(|i| RailItem {
+                name: "Terminal",
+                icon: None,
+                windows: i,
+                front: i == 0,
+                attention: i == 2,
+            })
+            .collect();
+        let tree = rail_tree(&mut font, &items, &[101, 202, 303], None, 768, 32);
+        assert_eq!(tree.size(), (64.0, 768.0));
+        let view = Rect::new(0.0, 32.0, 64.0, 768.0);
+        for (i, id) in [101, 202, 303].into_iter().enumerate() {
+            assert_eq!(tree.hit_node(view, 30.0, item_y(i) as f32), Some(id));
+        }
+        assert_eq!(tree.hit_node(view, 30.0, 90.0), None);
+        let json = tree.json(Rect::new(0.0, 0.0, 64.0, 768.0), (0, 32));
+        let first = &json[0];
+        assert_eq!(first["id"], 101);
+        assert_eq!(
+            first["bounds"],
+            serde_json::json!({"x": 8.0, "y": 40.0, "width": 48.0, "height": 48.0})
+        );
+        assert_eq!(first["states"]["selected"], true);
+    }
+
+    #[test]
+    fn rail_paint_keeps_the_original_pixels() {
+        let mut font = Font::for_test();
+        for front in [false, true] {
+            for hover in [None, Some(0)] {
+                let items = [RailItem {
+                    name: "Terminal",
+                    icon: None,
+                    windows: 3,
+                    front,
+                    attention: true,
+                }];
+                let tree = rail_tree(&mut font, &items, &[101], hover, 200, 32);
+                let mut actual = Canvas::new(64, 200, theme().bg);
+                tree.paint(
+                    &mut actual,
+                    &mut crate::ui::widgets::Paint {
+                        font: &mut font,
+                        icons: &|_| None,
+                        field: None,
+                    },
+                    Rect::new(0.0, 0.0, 64.0, 200.0),
+                );
+                let mut expected = Canvas::new(64, 200, theme().bg);
+                let b = Rect::new(8.0, 8.0, 48.0, 48.0);
+                if front {
+                    expected.rounded_rect(b, 12.0, theme().rail_active);
+                } else if hover.is_some() {
+                    expected.rounded_rect(b, 12.0, theme().hover);
+                }
+                rail_icon(&mut expected, &mut font, &items[0], 8.0, 8.0);
+                assert_eq!(actual.px, expected.px);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod title_tree_tests {
+    use super::*;
+
+    #[test]
+    fn title_tree_matches_the_previous_pixels_and_geometry() {
+        for dark in [false, true] {
+            draw::with_theme(dark, || {
+                let mut font = Font::for_test();
+                for focused in [false, true] {
+                    for hover in [false, true] {
+                        for maximized in [false, true] {
+                            for pressed in [
+                                None,
+                                Some(Light::Close),
+                                Some(Light::Minimize),
+                                Some(Light::Maximize),
+                            ] {
+                                let view = BarView {
+                                    title: "Terminal",
+                                    focused,
+                                    ring: theme().amber,
+                                    close_only: false,
+                                    maximized,
+                                    hover,
+                                    pressed,
+                                };
+                                let expected = title_bar_reference(&mut font, 400, &view);
+                                let actual = title_bar(&mut font, 400, &view);
+                                assert_eq!(actual.px, expected.px);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn title_buttons_have_stable_ids_names_and_real_hit_targets() {
+        let mut font = Font::for_test();
+        let mut view = BarView {
+            title: "Terminal",
+            focused: true,
+            ring: theme().hairline_hi,
+            close_only: false,
+            maximized: false,
+            hover: false,
+            pressed: None,
+        };
+        let tree = title_tree(&mut font, 42, 400, &view);
+        assert_eq!(tree.size(), (402.0, 31.0));
+        let bounds = Rect::new(-1.0, -1.0, 402.0, 31.0);
+        for &(light, x) in lights(false) {
+            let id = tree.hit_node(bounds, x, LIGHT_Y).unwrap();
+            assert_eq!(id, title_node_id(42, Some(light)));
+            assert_eq!(title_light(42, false, id), Some(light));
+        }
+        let json = tree.json(Rect::new(0.0, 0.0, 402.0, 31.0), (100, 200));
+        assert_eq!(json[0]["name"], "Close Terminal");
+        assert_eq!(json[0]["actions"], serde_json::json!(["click"]));
+        assert_eq!(json[3]["role"], "title_bar");
+        view.maximized = true;
+        let restored = title_tree(&mut font, 42, 400, &view).json(bounds, (0, 0));
+        assert_eq!(restored[2]["name"], "Restore Terminal");
+        assert_eq!(restored[2]["id"], json[2]["id"]);
+        view.close_only = true;
+        let dialog = title_tree(&mut font, 42, 400, &view);
+        assert_eq!(dialog.hit_node(bounds, 50.0, 15.0), None);
+        assert_eq!(
+            title_light(42, true, title_node_id(42, Some(Light::Maximize))),
+            None
+        );
     }
 }

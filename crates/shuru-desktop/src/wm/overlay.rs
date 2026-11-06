@@ -190,7 +190,19 @@ impl Wm {
                 hover: c.hover,
                 pressed: c.pressed,
             };
-            let canvas = chrome::title_bar(&mut self.font, c.card.2 as usize, &view);
+            let tree = chrome::title_tree(&mut self.font, win, c.card.2 as usize, &view);
+            let (w, h) = tree.size();
+            let mut canvas = Canvas::new(w as usize, h as usize, theme().bg);
+            tree.paint(
+                &mut canvas,
+                &mut crate::ui::widgets::Paint {
+                    font: &mut self.font,
+                    icons: &|_| None,
+                    field: None,
+                },
+                draw::Rect::new(0.0, 0.0, w, h),
+            );
+            self.bar_trees.insert(win, tree);
             self.put(frame, &canvas, 0, 0)?;
         }
         for (k, cw) in corners {
@@ -309,7 +321,23 @@ impl Wm {
             hover: self.panel_hover,
         };
         let layout = chrome::panel_layout(&mut self.font, &view);
-        let c = chrome::panel(&mut self.font, self.sw as usize, &view, &layout);
+        let mut tree = chrome::panel_tree(&mut self.font, self.sw as usize, &view, &layout);
+        if let Some(p) = &self.pop {
+            tree.set_expanded(chrome::APPLICATIONS_ID, p.is_apps());
+            tree.set_expanded(chrome::FRONT_APP_ID, p.is_panel_app());
+        }
+        let mut c = Canvas::new(self.sw as usize, PANEL_H as usize, theme().bg);
+        let icons = |_| view.app.and_then(|(_, icon)| icon);
+        tree.paint(
+            &mut c,
+            &mut crate::ui::widgets::Paint {
+                font: &mut self.font,
+                icons: &icons,
+                field: None,
+            },
+            draw::Rect::new(0.0, 0.0, self.sw as f32, PANEL_H as f32),
+        );
+        self.panel_tree = Some(tree);
         self.panel_layout = layout;
         self.put(self.ours.panel, &c, 0, 0)
     }
@@ -404,13 +432,32 @@ impl Wm {
                 attention: *attention,
             })
             .collect();
-        let c = chrome::rail(
+        let ids: Vec<_> = self.rail_targets.iter().map(Self::rail_node_id).collect();
+        let mut tree = chrome::rail_tree(
             &mut self.font,
             &items,
+            &ids,
             self.rail_hover,
             self.rail_h as usize,
             PANEL_H as i16,
         );
+        if let Some(p) = &self.pop {
+            for (i, id) in ids.iter().enumerate() {
+                tree.set_expanded(*id, p.is_rail_app(&self.rail_targets[i]));
+            }
+        }
+        let icons = |i: usize| items[i].icon;
+        let mut c = Canvas::new(RAIL_W as usize, self.rail_h as usize, theme().bg);
+        tree.paint(
+            &mut c,
+            &mut crate::ui::widgets::Paint {
+                font: &mut self.font,
+                icons: &icons,
+                field: None,
+            },
+            draw::Rect::new(0.0, 0.0, RAIL_W as f32, self.rail_h as f32),
+        );
+        self.rail_tree = Some(tree);
         self.put(self.ours.rail, &c, 0, 0)
     }
 

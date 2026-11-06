@@ -52,7 +52,7 @@ HTTP on the unix socket, made with mode 0600. Bodies are JSON. Errors are
 | route | answers |
 |---|---|
 | `GET /healthz` | `{"ok": true}` |
-| `GET /tree` | the nodes of the open shell popup that agents see: `[{id, role, name, value, states, actions, bounds, children?}]`, empty when none is open; `role` is `menu`, `menu_item`, `search_input`, `heading` or `group`; `children` lists the ids of the seen nodes under a node; `bounds` are `{x, y, width, height}` in screen pixels; `states` are `{focused, selected, disabled, expanded}` |
+| `GET /tree` | the nodes of the panel, rail, title bars and open shell popup that agents see: `[{id, role, name, value, states, actions, bounds, children?}]`; `role` is `menu`, `menu_item`, `search_input`, `heading`, `button`, `toolbar`, `title_bar`, `label` or `group`; `children` lists the ids of the seen nodes under a node; `bounds` are `{x, y, width, height}` in screen pixels; `states` are `{focused, selected, disabled, expanded}` |
 | `POST /tree/action {id, action, value?}` | acts on a shell node: `click`, `focus` or `set_value`; `set_value` requires a string `value`; answers `{ok: true}`, 404 for an absent node, 400 for an unsupported action |
 | `GET /windows` | `[{id, app, class, title, pid, focused, kind, fullscreen, state, geometry}]`, most recently focused first; `kind` is `normal`, `dialog`, `utility`, `splash`, `dock` or `popup`; `state` is `maximized`, `floating` or `minimized`; `geometry` is `{x, y, width, height}` of the window on screen |
 | `POST /focus {id, maximize?}` | the window, now focused; a main window is maximized unless `maximize` is false; 404 for an unknown id |
@@ -174,7 +174,7 @@ the pointer once a second (warps make no input events) and measures no
 CPU time over 30 s.
 
 The shell speaks English (en_US, the default) and Simplified Chinese. The
-locale comes from `LC_ALL`, then `LC_MESSAGES`, then `LANG`; `zh_CN`,
+locale comes from the saved Settings language, then `LC_ALL`, then `LC_MESSAGES`, then `LANG`; `zh_CN`,
 `zh_SG` and `zh_Hans` are Simplified Chinese and everything else is
 English. App names and actions come from `.desktop` files by the Desktop
 Entry rules (`Name[zh_CN]`, then `Name[zh]`, then `Name`).
@@ -185,3 +185,51 @@ Inter Medium, under the SIL Open Font License (`fonts/LICENSE-Inter.txt`).
 The releases also carry Noto Sans CJK SC Regular and Noto Color Emoji,
 which a guest installs for Chinese, Japanese and emoji; see
 `guest/README.md`.
+
+## Shell accessibility
+
+The panel, rail, window title bars and open menus publish their retained nodes on AT-SPI next
+to application trees. The desktop obtains the accessibility bus address
+from `org.a11y.Bus`, embeds its application root in the registry and serves
+Accessible, Component, Action, Text, EditableText, Value and Selection as
+supported by each node. Bounds use screen coordinates. Tree changes emit
+AT-SPI events for children, state, bounds, focus and text. Actions use the
+same input paths as the shell API.
+
+The bridge uses `accesskit_atspi_common` for mapping and the existing zbus 6
+connection machinery and tokio runtime for D-Bus. There is no additional
+executor or zbus 5 connection. Without an accessibility bus the desktop
+continues normally. Install `at-spi2-core` in the guest; the console image
+already does. The Chromium desktop entry already includes
+`--force-renderer-accessibility`.
+
+## Settings
+
+`shuru-desktop --settings --display :1` opens SuperHQ Settings as a normal
+X11 client, using the shell theme, font, Raised controls and retained tree.
+Install `guest/applications/settings.desktop` and its icons with the other
+guest files. Settings then appears in Applications without being pinned to
+the rail. It publishes its own AT-SPI application with the same bridge;
+its nodes do not join the desktop socket tree.
+
+- Appearance saves `light` or `dark` in the watched appearance file and
+  applies live.
+- Language saves `en_US.UTF-8` or `zh_CN.UTF-8` in
+  `$XDG_CONFIG_HOME/superhq/language`. Restart the desktop session to reload
+  the shell string table. The saved language takes priority over the
+  environment; without it the existing locale environment rules apply.
+- Default apps reads XDG `mimeapps.list` files in precedence order. Activate
+  a row to cycle through installed browsers or terminals. Browser saves
+  HTTP, HTTPS and HTML defaults. Terminal saves `x-scheme-handler/terminal`.
+  User choices go to `$XDG_CONFIG_HOME/mimeapps.list`, preserving other
+  defaults and association sections. Without `XDG_CONFIG_HOME`, the path
+  starts at `~/.config`.
+- Notifications describes the current server: three visible cards, a
+  default expiry of five seconds, a history of fifty and app actions.
+  The server has no preference switches.
+- About shows SuperHQ, the desktop version and the guest OS name from
+  `/etc/os-release`. The guest OS remains Debian.
+
+Tab, Shift+Tab and the arrow keys move through controls; Enter or Space
+activates one. Wheel scrolling and keyboard selection reveal content in a
+short window. Changes appear immediately, with no reveal animations.

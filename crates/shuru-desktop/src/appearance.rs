@@ -65,8 +65,11 @@ pub struct Watch {
 
 impl Watch {
     pub fn new() -> Option<Watch> {
-        let dir = dir();
-        std::fs::create_dir_all(&dir).ok()?;
+        Self::in_dir(&dir())
+    }
+
+    fn in_dir(dir: &Path) -> Option<Watch> {
+        std::fs::create_dir_all(dir).ok()?;
         let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if raw < 0 {
             return None;
@@ -96,7 +99,9 @@ impl Watch {
             let mut at = 0;
             let head = std::mem::size_of::<libc::inotify_event>();
             while at + head <= n as usize {
-                let ev = unsafe { &*(buf.as_ptr().add(at) as *const libc::inotify_event) };
+                let ev = unsafe {
+                    std::ptr::read_unaligned(buf.as_ptr().add(at).cast::<libc::inotify_event>())
+                };
                 let name = &buf[at + head..at + head + ev.len as usize];
                 let name = name.split(|&b| b == 0).next().unwrap_or_default();
                 if name == b"appearance" {
@@ -216,6 +221,20 @@ pub fn xsettings(serial: u32, theme: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_reads_appearance_events_after_atomic_replacement() {
+        let path =
+            std::env::temp_dir().join(format!("shuru-appearance-watch-{}", std::process::id()));
+        let watch = Watch::in_dir(&path).unwrap();
+        std::fs::write(path.join("other"), "ignored").unwrap();
+        assert!(!watch.drain());
+        std::fs::write(path.join(".appearance.tmp"), "dark\n").unwrap();
+        std::fs::rename(path.join(".appearance.tmp"), path.join("appearance")).unwrap();
+        assert!(watch.drain());
+        assert!(!watch.drain());
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     #[test]
     fn only_dark_is_dark() {

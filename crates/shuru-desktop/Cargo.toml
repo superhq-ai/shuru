@@ -1,6 +1,6 @@
 [package]
 name = "shuru-desktop"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "An X11 stacking window manager for a desktop an agent uses, with a panel, a rail, menus, overlays and an API on a unix socket"
 license = "Apache-2.0"
@@ -15,6 +15,7 @@ path = "src/main.rs"
 # `cargo build --workspace` working there.
 [target.'cfg(target_os = "linux")'.dependencies]
 accesskit = "0.25"
+accesskit_atspi_common = { version = "0.21.1", features = ["simplified-api"] }
 taffy = "0.15"
 tiny-skia = "0.12"
 anyhow = "1"
@@ -30,5 +31,5 @@ png = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "net", "sync", "macros", "time", "signal"] }
-zbus = { version = "6", default-features = false, features = ["tokio", "service"] }
+zbus = { version = "6", default-features = false, features = ["tokio", "service", "proxy"] }
 x11rb = { version = "0.13", features = ["cursor", "damage", "randr", "shape", "xfixes", "xinput"] }
