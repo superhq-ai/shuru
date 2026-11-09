@@ -36,6 +36,14 @@ them, HTTP and WebSocket on a unix socket that only root can reach. It
 does no authentication of its own; whatever exposes the API beyond the
 host brings that.
 
+The hosted `serve` default is 4 vCPUs and 8192 MiB of guest memory.
+Operators may override it with `--cpus` and `--memory`. Create records
+those values in `sandbox.json`; starting an existing sandbox uses its
+recorded size, including after a daemon restart. Changing the default
+does not resize an existing sandbox or rewrite snapshot CPU topology.
+The per-sandbox cgroup CPU quota follows the recorded vCPU count.
+The one-shot `run` command keeps its separate defaults.
+
 ```
 POST   /v1/sandboxes                  { "name": "web-1" }
 GET    /v1/sandboxes                  ?prefix= &max_results= &continuation_token=

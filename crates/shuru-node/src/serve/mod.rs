@@ -47,7 +47,7 @@ pub struct ServeArgs {
     #[arg(long)]
     disk: PathBuf,
     /// CPUs of each new sandbox.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 4)]
     cpus: usize,
     /// Guest memory of each new sandbox, in MiB.
     #[arg(long, default_value_t = 8192)]
@@ -170,4 +170,36 @@ async fn accept(
     drop(listener);
     node.shut_down().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Args {
+        #[command(flatten)]
+        serve: ServeArgs,
+    }
+
+    #[test]
+    fn hosted_size_defaults_and_operator_overrides() {
+        let required = [
+            "serve", "--kernel", "kernel", "--initrd", "initrd", "--disk", "base",
+        ];
+        let defaults = Args::try_parse_from(required).unwrap().serve;
+        assert_eq!(defaults.cpus, 4);
+        assert_eq!(defaults.memory, 8192);
+
+        let overridden = Args::try_parse_from(
+            required
+                .into_iter()
+                .chain(["--cpus", "2", "--memory", "4096"]),
+        )
+        .unwrap()
+        .serve;
+        assert_eq!(overridden.cpus, 2);
+        assert_eq!(overridden.memory, 4096);
+    }
 }
