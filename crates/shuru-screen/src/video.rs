@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 
-use crate::budget::Budget;
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
 use crate::encoder::{Encoder, Profile};
@@ -529,16 +528,22 @@ fn capture_loop(
             cap.damaged_at = None;
             full_next = true;
         }
-        let paintover_due = paintover_left > 0 && last_motion.elapsed() >= cfg.paintover_delay;
+        // Paint-over waits for the screen to be still a moment, and for a
+        // full bucket to sharpen it with.
+        let paintover_wait = (paintover_left > 0).then(|| {
+            let target = hub.target_kbps.load(Ordering::Relaxed);
+            let refill = hub
+                .budget
+                .lock()
+                .unwrap()
+                .until_full(Instant::now(), target);
+            cfg.paintover_delay
+                .saturating_sub(last_motion.elapsed())
+                .max(refill)
+        });
+        let paintover_due = paintover_wait.is_some_and(|w| w.is_zero());
         if !cap.damaged && !want_key && !paintover_due {
-            let timeout = if paintover_left == 0 {
-                100
-            } else {
-                cfg.paintover_delay
-                    .saturating_sub(last_motion.elapsed())
-                    .as_millis() as i32
-                    + 1
-            };
+            let timeout = paintover_wait.map_or(100, |w| w.as_millis() as i32 + 1);
             wait_any(&[cap.fd(), hub.waker.fd()], timeout);
             continue;
         }
@@ -682,7 +687,6 @@ fn encode_loop(
     cfg: VideoConfig,
 ) {
     let epoch = hub.epoch;
-    let mut budget = Budget::new(Instant::now());
     let (mut applied_kbit, mut applied_crf) = (0u32, -1f32);
     while let Ok(job) = rx.recv() {
         if !job.force_idr && !job.paintover && job.band.is_none() {
@@ -697,7 +701,11 @@ fn encode_loop(
         };
         // Each frame, keyframes and paint-over too, may take what the
         // bucket holds.
-        let cap = budget.frame_kbit(Instant::now(), target, cfg.fps);
+        let cap = hub
+            .budget
+            .lock()
+            .unwrap()
+            .frame_kbit(Instant::now(), target, cfg.fps);
         if crf != applied_crf || cap != applied_kbit {
             enc.set_rate(crf, cap);
             applied_crf = crf;
@@ -738,7 +746,7 @@ fn encode_loop(
         let size = out.len();
         let msg = Bytes::from(out);
         let now = Instant::now();
-        budget.spend(size, target);
+        hub.budget.lock().unwrap().spend(size, target);
         for c in hub.clients() {
             if c.queued() > MAX_QUEUED {
                 if c.started.load(Ordering::Relaxed) {

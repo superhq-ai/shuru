@@ -12,6 +12,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::budget::Budget;
 use crate::input::InputEvent;
 
 pub enum Out {
@@ -356,6 +357,8 @@ pub struct Hub {
     pub pointer: Mutex<Option<(i32, i32)>>,
     /// The bitrate cap the encoder applies, kbit/s.
     pub target_kbps: AtomicU32,
+    /// The bits the encoder may spend, kept across encoder rebuilds.
+    pub budget: Mutex<Budget>,
     pub waker: Wake,
     pub input: std_mpsc::Sender<InputEvent>,
     pub gate: Mutex<Gate>,
@@ -379,6 +382,7 @@ impl Hub {
             cursor_image: Mutex::new(None),
             pointer: Mutex::new(None),
             target_kbps: AtomicU32::new(0),
+            budget: Mutex::new(Budget::new(Instant::now())),
             waker: Wake::new()?,
             input,
             gate: Mutex::new(Gate::Shut),

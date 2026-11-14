@@ -5,7 +5,8 @@
 //! bucket holds, so a change after a still moment (a tab switch, a
 //! keyframe) comes out sharp at once, while during sustained motion the
 //! bucket is empty and each frame gets its share of the target. Nothing
-//! waits: the frame rate is never what gives.
+//! waits: the frame rate is never what gives. Paint-over, which sharpens
+//! a screen gone still, waits for a full bucket so it can sharpen fully.
 //!
 //! x264 cannot keep this bucket itself. Without `b_vfr_input` it refills by
 //! 1/fps for each frame encoded, and frames come only when the screen
@@ -13,7 +14,7 @@
 //! driven stream cannot afford. So x264 only caps each frame (see x264.c),
 //! at the size this bucket says.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The deepest the bucket gets, as video at the target.
 pub const DEPTH_MS: f64 = 400.0;
@@ -51,6 +52,13 @@ impl Budget {
         self.level.max(share).max(1.0) as u32
     }
 
+    /// How long until the bucket is full again.
+    pub fn until_full(&mut self, now: Instant, kbps: u32) -> Duration {
+        self.refill(now, kbps);
+        let short = Self::depth(kbps) - self.level;
+        Duration::from_secs_f64((short / kbps.max(1) as f64).max(0.0))
+    }
+
     /// A frame of `bytes` went out.
     pub fn spend(&mut self, bytes: usize, kbps: u32) {
         // A frame over its cap is owed, up to one bucket.
@@ -61,7 +69,6 @@ impl Budget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -112,6 +119,19 @@ mod tests {
         // 400 ms pays the debt back, 400 more fills the bucket.
         assert_eq!(b.frame_kbit(t0 + ms(400), 1500, 30), 50);
         assert_eq!(b.frame_kbit(t0 + ms(800), 1500, 30), 600);
+    }
+
+    #[test]
+    fn paint_over_knows_when_the_bucket_is_full() {
+        let t0 = Instant::now();
+        let mut b = Budget::new(t0);
+        assert_eq!(b.until_full(t0, 1500), Duration::ZERO);
+        b.frame_kbit(t0, 1500, 30);
+        b.spend(75_000, 1500);
+        let near = |d: Duration, want: u64| (d.as_secs_f64() * 1000.0 - want as f64).abs() < 0.01;
+        assert!(near(b.until_full(t0, 1500), 400));
+        assert!(near(b.until_full(t0 + ms(100), 1500), 300));
+        assert_eq!(b.until_full(t0 + ms(401), 1500), Duration::ZERO);
     }
 
     #[test]
