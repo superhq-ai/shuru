@@ -3,6 +3,8 @@
 //! socket only; whatever exposes it further brings its own authentication.
 
 #[cfg(target_os = "linux")]
+mod budget;
+#[cfg(target_os = "linux")]
 mod capture;
 #[cfg(target_os = "linux")]
 mod convert;

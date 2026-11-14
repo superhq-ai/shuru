@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 
+use crate::budget::Budget;
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
 use crate::encoder::{Encoder, Profile};
@@ -74,7 +75,8 @@ fn open(display: &str, cfg: &VideoConfig) -> Result<(Capturer, Encoder, Geometry
         cfg.fps,
         cfg.threads,
         cfg.crf,
-        cfg.max_kbps,
+        // Set again from the bucket before each frame.
+        cfg.max_kbps * 2 / 5,
         cfg.profile,
     )?;
     let geometry = Geometry {
@@ -550,12 +552,6 @@ fn capture_loop(
             wait_any(&[cap.fd(), hub.waker.fd()], 4);
             continue;
         }
-        // The frames sent are still going out at the bitrate.
-        let pace = hub.pacer.lock().unwrap().wait(Instant::now());
-        if !want_key && !pace.is_zero() {
-            wait_any(&[hub.waker.fd()], (pace.as_micros() as i32 + 999) / 1000);
-            continue;
-        }
         // The encoder may still hold the frame we want.
         if pool[next_idx].is_none() {
             match ret_rx.recv_timeout(Duration::from_millis(50)) {
@@ -686,7 +682,8 @@ fn encode_loop(
     cfg: VideoConfig,
 ) {
     let epoch = hub.epoch;
-    let (mut applied_kbps, mut applied_crf) = (0u32, -1f32);
+    let mut budget = Budget::new(Instant::now());
+    let (mut applied_kbit, mut applied_crf) = (0u32, -1f32);
     while let Ok(job) = rx.recv() {
         if !job.force_idr && !job.paintover && job.band.is_none() {
             let _ = ret.send((job.idx, job.buf));
@@ -698,14 +695,13 @@ fn encode_loop(
         } else {
             cfg.crf
         };
-        // One cap for every frame, keyframes and paint-over too: at most
-        // 400 ms of video at the target. The pacer keeps the average.
-        let moved = applied_kbps == 0
-            || (target as f64 - applied_kbps as f64).abs() > applied_kbps as f64 * 0.04;
-        if crf != applied_crf || moved {
-            enc.set_rate(crf, target);
+        // Each frame, keyframes and paint-over too, may take what the
+        // bucket holds.
+        let cap = budget.frame_kbit(Instant::now(), target, cfg.fps);
+        if crf != applied_crf || cap != applied_kbit {
+            enc.set_rate(crf, cap);
             applied_crf = crf;
-            applied_kbps = target;
+            applied_kbit = cap;
         }
         // x264 wants 1 on macroblocks that did not change.
         let mut info = job
@@ -742,7 +738,7 @@ fn encode_loop(
         let size = out.len();
         let msg = Bytes::from(out);
         let now = Instant::now();
-        hub.pacer.lock().unwrap().sent(size, now, applied_kbps);
+        budget.spend(size, target);
         for c in hub.clients() {
             if c.queued() > MAX_QUEUED {
                 if c.started.load(Ordering::Relaxed) {

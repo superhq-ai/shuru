@@ -19,10 +19,8 @@ struct screen_enc {
 
 /* Each frame is at most frame_kbit: a buffer of one frame, refilled whole
  * every frame (x264's single frame VBV), so the cap does not depend on
- * what came before. The average rate is paced by the caller in wall time.
- * x264 cannot: with b_vfr_input off it refills its buffer by 1/fps for
- * each frame encoded, and frames come only when the screen changes, so a
- * long buffer would stay empty across a still screen. */
+ * what came before. The caller sets it from a bucket kept in wall time
+ * (budget.rs). */
 static void set_frame_cap(x264_param_t *p, int frame_kbit)
 {
     if (frame_kbit < 1)
@@ -71,9 +69,12 @@ struct screen_enc *screen_enc_open(int width, int height, int fps, int threads, 
     p->rc.b_mb_tree = 0;
     p->i_sync_lookahead = 0;
     /* The diamond search of ultrafast only follows motion of a few pixels;
-     * UMH finds a dragged window or a scroll for about the same CPU. */
+     * UMH finds a dragged window or a scroll for about the same CPU. A fast
+     * scroll moves 100 to 250 rows a frame: range 64 misses it and codes
+     * the page again, 29 kB a frame at 240 rows against 13 kB at 256, for
+     * about 1 ms more a frame. */
     p->analyse.i_me_method = X264_ME_UMH;
-    p->analyse.i_me_range = 64;
+    p->analyse.i_me_range = 256;
     /* Unchanged macroblocks, from X damage, skip analysis. */
     p->analyse.b_mb_info = 1;
     /* ultrafast turns CABAC and the 8x8 transform off, which leaves
