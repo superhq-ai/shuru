@@ -35,8 +35,12 @@ come from voxl; the server, the protocol and the gate are new.
   the rate it reads them, or over the safe rate until that is measured.
   More than about 200 ms of video waiting steps the bitrate down toward
   that rate, and it steps back up once the queue drains. Past about
-  400 ms, frames wait until it drains. A keyframe is at most about 400 ms
-  of video at the current bitrate.
+  400 ms, frames wait until it drains.
+- Any frame, a keyframe or a page that changed whole, may take up to
+  about 400 ms of video at the current bitrate, so it comes out sharp.
+  x264 caps each frame on its own; the average is kept in wall time by
+  holding the next capture until the frames sent have gone out at the
+  bitrate. Under heavy change the frame rate gives, not the quality.
 - Blocks sent while they moved are sent again at higher quality once they
   have been still for a moment (the paint-over), so text sharpens when the
   screen settles.

@@ -19,11 +19,11 @@ extern "C" {
         fps: i32,
         threads: i32,
         crf: f32,
-        max_kbps: i32,
+        frame_kbit: i32,
         high: i32,
     ) -> *mut RawEncoder;
     fn screen_enc_avc(e: *mut RawEncoder, out: *mut u8) -> i32;
-    fn screen_enc_set_rate(e: *mut RawEncoder, crf: f32, max_kbps: i32, buf_kbit: i32);
+    fn screen_enc_set_rate(e: *mut RawEncoder, crf: f32, frame_kbit: i32);
     #[allow(clippy::too_many_arguments)]
     fn screen_enc_encode(
         e: *mut RawEncoder,
@@ -50,9 +50,19 @@ pub enum Profile {
     High,
 }
 
+/// The longest a frame may be, as video at the bitrate: 400 ms. A
+/// keyframe or a page that changed whole needs about this much to come
+/// out sharp at the starting bitrate; the frames after a large one wait
+/// until it has gone out (see `Pacer` in hub.rs).
+const FRAME_BUDGET_MS: u32 = 400;
+
+/// The most a frame may take at `kbps`, in kbit.
+pub fn frame_kbit(kbps: u32) -> u32 {
+    (kbps.saturating_mul(FRAME_BUDGET_MS) / 1000).max(1)
+}
+
 pub struct Encoder {
     raw: *mut RawEncoder,
-    fps: u32,
     pts: i64,
 }
 
@@ -66,7 +76,7 @@ impl Encoder {
         fps: u32,
         threads: u32,
         crf: f32,
-        max_kbps: u32,
+        kbps: u32,
         profile: Profile,
     ) -> Result<Self> {
         let raw = unsafe {
@@ -76,14 +86,14 @@ impl Encoder {
                 fps as i32,
                 threads as i32,
                 crf,
-                max_kbps as i32,
+                frame_kbit(kbps) as i32,
                 (profile == Profile::High) as i32,
             )
         };
         if raw.is_null() {
             bail!("x264 would not open an encoder for {width}x{height}");
         }
-        Ok(Encoder { raw, fps, pts: 0 })
+        Ok(Encoder { raw, pts: 0 })
     }
 
     /// The WebCodecs codec string of the stream, such as `avc1.42c01f`.
@@ -95,13 +105,10 @@ impl Encoder {
         Ok(format!("avc1.{:02x}{:02x}{:02x}", avc[0], avc[1], avc[2]))
     }
 
-    /// Rate control with a buffer of about 1.25 frames at `max_kbps`.
-    pub fn set_rate(&mut self, crf: f32, max_kbps: u32) {
-        self.set_rate_buf(crf, max_kbps, max_kbps / self.fps.max(1) * 5 / 4);
-    }
-
-    pub fn set_rate_buf(&mut self, crf: f32, max_kbps: u32, buf_kbit: u32) {
-        unsafe { screen_enc_set_rate(self.raw, crf, max_kbps as i32, buf_kbit as i32) }
+    /// Quality `crf`, each frame capped at `frame_kbit(kbps)`. The cap is
+    /// per frame only; the caller paces frames to `kbps` on average.
+    pub fn set_rate(&mut self, crf: f32, kbps: u32) {
+        unsafe { screen_enc_set_rate(self.raw, crf, frame_kbit(kbps) as i32) }
     }
 
     /// Encodes `pic` and appends the access unit to `out`; true for a
@@ -146,5 +153,20 @@ impl Encoder {
 impl Drop for Encoder {
     fn drop(&mut self) {
         unsafe { screen_enc_close(self.raw) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_frame_takes_at_most_400_ms_of_video() {
+        // 1500 kbit/s, where a viewer starts: 600 kbit, 75 kB.
+        assert_eq!(frame_kbit(1500), 600);
+        assert_eq!(frame_kbit(6000), 2400);
+        // Never 0, which x264 would take as no cap at all.
+        assert_eq!(frame_kbit(0), 1);
+        assert_eq!(frame_kbit(u32::MAX), u32::MAX / 1000);
     }
 }

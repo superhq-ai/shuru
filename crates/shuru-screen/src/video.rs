@@ -550,6 +550,12 @@ fn capture_loop(
             wait_any(&[cap.fd(), hub.waker.fd()], 4);
             continue;
         }
+        // The frames sent are still going out at the bitrate.
+        let pace = hub.pacer.lock().unwrap().wait(Instant::now());
+        if !want_key && !pace.is_zero() {
+            wait_any(&[hub.waker.fd()], (pace.as_micros() as i32 + 999) / 1000);
+            continue;
+        }
         // The encoder may still hold the frame we want.
         if pool[next_idx].is_none() {
             match ret_rx.recv_timeout(Duration::from_millis(50)) {
@@ -692,24 +698,14 @@ fn encode_loop(
         } else {
             cfg.crf
         };
-        let cap = if job.paintover {
-            target.saturating_mul(2)
-        } else {
-            target
-        };
-        if job.force_idr {
-            // A keyframe is what a new viewer sees first: at most about
-            // 400 ms of video at the cap, sent at up to 4x the cap.
-            enc.set_rate_buf(crf, cap.saturating_mul(4), (cap * 2 / 5).max(1));
-            applied_kbps = 0;
-        } else {
-            let moved = applied_kbps == 0
-                || (cap as f64 - applied_kbps as f64).abs() > applied_kbps as f64 * 0.04;
-            if crf != applied_crf || moved {
-                enc.set_rate(crf, cap);
-                applied_crf = crf;
-                applied_kbps = cap;
-            }
+        // One cap for every frame, keyframes and paint-over too: at most
+        // 400 ms of video at the target. The pacer keeps the average.
+        let moved = applied_kbps == 0
+            || (target as f64 - applied_kbps as f64).abs() > applied_kbps as f64 * 0.04;
+        if crf != applied_crf || moved {
+            enc.set_rate(crf, target);
+            applied_crf = crf;
+            applied_kbps = target;
         }
         // x264 wants 1 on macroblocks that did not change.
         let mut info = job
@@ -746,6 +742,7 @@ fn encode_loop(
         let size = out.len();
         let msg = Bytes::from(out);
         let now = Instant::now();
+        hub.pacer.lock().unwrap().sent(size, now, applied_kbps);
         for c in hub.clients() {
             if c.queued() > MAX_QUEUED {
                 if c.started.load(Ordering::Relaxed) {

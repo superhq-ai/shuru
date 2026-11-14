@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
@@ -331,6 +331,33 @@ pub struct Snapshot {
     pub cursor: Option<crate::cursor::CursorImage>,
 }
 
+/// Paces the stream to the target bitrate in wall time. Each frame sent
+/// keeps the link busy for its size at the bitrate, from when it is sent
+/// or when the frames before it are through, whichever is later; the next
+/// capture waits until then. One frame may be large (a keyframe, a page
+/// changed whole) and come out sharp: the frame rate gives, not the
+/// quality.
+pub struct Pacer {
+    free_at: Instant,
+}
+
+impl Pacer {
+    pub fn new(now: Instant) -> Self {
+        Pacer { free_at: now }
+    }
+
+    /// A frame of `bytes` went out at `now`, with the bitrate at `kbps`.
+    pub fn sent(&mut self, bytes: usize, now: Instant, kbps: u32) {
+        let secs = bytes as f64 * 8.0 / (kbps.max(1) as f64 * 1000.0);
+        self.free_at = self.free_at.max(now) + Duration::from_secs_f64(secs);
+    }
+
+    /// How long the next capture waits.
+    pub fn wait(&self, now: Instant) -> Duration {
+        self.free_at.saturating_duration_since(now)
+    }
+}
+
 /// The size of the stream and its codec, as the hello says them.
 #[derive(Clone)]
 pub struct Geometry {
@@ -356,6 +383,8 @@ pub struct Hub {
     pub pointer: Mutex<Option<(i32, i32)>>,
     /// The bitrate cap the encoder applies, kbit/s.
     pub target_kbps: AtomicU32,
+    /// Holds capture while the frames sent are still going out.
+    pub pacer: Mutex<Pacer>,
     pub waker: Wake,
     pub input: std_mpsc::Sender<InputEvent>,
     pub gate: Mutex<Gate>,
@@ -379,6 +408,7 @@ impl Hub {
             cursor_image: Mutex::new(None),
             pointer: Mutex::new(None),
             target_kbps: AtomicU32::new(0),
+            pacer: Mutex::new(Pacer::new(Instant::now())),
             waker: Wake::new()?,
             input,
             gate: Mutex::new(Gate::Shut),
@@ -513,7 +543,44 @@ pub fn pointer_message(x: i32, y: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+
+    fn ms(d: Duration) -> f64 {
+        d.as_secs_f64() * 1000.0
+    }
+
+    fn near(d: Duration, want_ms: f64) -> bool {
+        (ms(d) - want_ms).abs() < 0.01
+    }
+
+    #[test]
+    fn a_large_frame_holds_the_next_until_it_is_out() {
+        let t0 = Instant::now();
+        let mut p = Pacer::new(t0);
+        assert_eq!(p.wait(t0), Duration::ZERO);
+        // 75 kB at 1500 kbit/s is 400 ms on the link.
+        p.sent(75_000, t0, 1500);
+        assert!(near(p.wait(t0), 400.0), "{:?}", p.wait(t0));
+        let t = t0 + Duration::from_millis(300);
+        assert!(near(p.wait(t), 100.0), "{:?}", p.wait(t));
+        assert!(near(p.wait(t0 + Duration::from_millis(400)), 0.0));
+        assert_eq!(p.wait(t0 + Duration::from_millis(401)), Duration::ZERO);
+    }
+
+    #[test]
+    fn frames_queue_behind_each_other_not_behind_idle_time() {
+        let t0 = Instant::now();
+        let mut p = Pacer::new(t0);
+        // Two frames at once: the second goes out after the first.
+        p.sent(7_500, t0, 1500);
+        p.sent(7_500, t0, 1500);
+        assert!(near(p.wait(t0), 80.0), "{:?}", p.wait(t0));
+        // A still screen for a while: the link is free, and a frame sent
+        // then counts from then, not from the time it was idle.
+        let later = t0 + Duration::from_secs(5);
+        assert_eq!(p.wait(later), Duration::ZERO);
+        p.sent(7_500, later, 6000);
+        assert!(near(p.wait(later), 10.0), "{:?}", p.wait(later));
+    }
 
     #[test]
     fn capacity_only_from_busy_windows() {

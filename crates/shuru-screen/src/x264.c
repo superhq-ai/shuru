@@ -6,6 +6,7 @@
  * changes between x264 builds, out of Rust.
  */
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <x264.h>
@@ -16,8 +17,23 @@ struct screen_enc {
     x264_picture_t pic;
 };
 
+/* Each frame is at most frame_kbit: a buffer of one frame, refilled whole
+ * every frame (x264's single frame VBV), so the cap does not depend on
+ * what came before. The average rate is paced by the caller in wall time.
+ * x264 cannot: with b_vfr_input off it refills its buffer by 1/fps for
+ * each frame encoded, and frames come only when the screen changes, so a
+ * long buffer would stay empty across a still screen. */
+static void set_frame_cap(x264_param_t *p, int frame_kbit)
+{
+    if (frame_kbit < 1)
+        frame_kbit = 1;
+    int64_t max_kbps = (int64_t)frame_kbit * (p->i_fps_num > 0 ? p->i_fps_num : 1);
+    p->rc.i_vbv_buffer_size = frame_kbit;
+    p->rc.i_vbv_max_bitrate = max_kbps > INT_MAX ? INT_MAX : (int)max_kbps;
+}
+
 struct screen_enc *screen_enc_open(int width, int height, int fps, int threads, float crf,
-                                   int max_kbps, int high)
+                                   int frame_kbit, int high)
 {
     struct screen_enc *e = calloc(1, sizeof(*e));
     if (!e)
@@ -67,10 +83,7 @@ struct screen_enc *screen_enc_open(int width, int height, int fps, int threads, 
         p->b_cabac = 1;
         p->analyse.b_transform_8x8 = 1;
     }
-    if (max_kbps > 0) {
-        p->rc.i_vbv_max_bitrate = max_kbps;
-        p->rc.i_vbv_buffer_size = max_kbps / (fps > 0 ? fps : 1) * 5 / 4;
-    }
+    set_frame_cap(p, frame_kbit);
     /* BT.601 limited range, as libyuv ARGBToI420 writes it. */
     p->vui.i_colorprim = 1;
     p->vui.i_transfer = 1;
@@ -117,13 +130,10 @@ int screen_enc_avc(struct screen_enc *e, uint8_t out[3])
     return -1;
 }
 
-void screen_enc_set_rate(struct screen_enc *e, float crf, int max_kbps, int buf_kbit)
+void screen_enc_set_rate(struct screen_enc *e, float crf, int frame_kbit)
 {
     e->param.rc.f_rf_constant = crf;
-    if (max_kbps > 0) {
-        e->param.rc.i_vbv_max_bitrate = max_kbps;
-        e->param.rc.i_vbv_buffer_size = buf_kbit > 0 ? buf_kbit : 1;
-    }
+    set_frame_cap(&e->param, frame_kbit);
     x264_encoder_reconfig(e->h, &e->param);
 }
 
