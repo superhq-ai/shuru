@@ -1,32 +1,27 @@
-// Derived from voxl (https://github.com/tembo/voxl), Copyright (c) 2026 Tembo,
-// under the MIT license: see LICENSE-voxl.
+// Vendored from voxl 0.3.5 (https://github.com/tembo/voxl), Copyright (c)
+// 2026 Tembo, under the MIT license: see LICENSE-voxl. Pinned to v0.3.5.
+// Stripped to the Linux streaming core: voxl's macOS display switching,
+// dynamic resize, audio and clipboard state are dropped, the per-task gate
+// is extracted into gate.rs, and a thin layer (our cursor/pointer greeting
+// and JSON hello) sits over voxl's ack-based flow control unchanged.
 
-//! State shared by the capture and encode threads and the viewers.
-
-use std::collections::VecDeque;
-use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc as std_mpsc, Arc, Mutex};
-use std::time::Instant;
+//! Shared state between the video producer and the websocket clients: voxl's
+//! ack-based `Client` flow control, plus shuru's cursor/pointer greeting.
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use parking_lot::Mutex;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::mpsc;
 
-use crate::budget::Budget;
-use crate::input::InputEvent;
+use crate::cursor::CursorImage;
+use crate::still::Snapshot;
 
 pub enum Out {
     Bin(Bytes),
     Text(String),
-}
-
-impl Out {
-    pub fn len(&self) -> usize {
-        match self {
-            Out::Bin(b) => b.len(),
-            Out::Text(t) => t.len(),
-        }
-    }
 }
 
 pub struct Inflight {
@@ -35,67 +30,78 @@ pub struct Inflight {
     pub bytes: usize,
 }
 
-/// One open stream.
 pub struct Client {
     pub id: u64,
+    /// The viewer id this stream carries (`/stream?viewer=`), for the gate.
     pub viewer: Option<String>,
-    tx: mpsc::UnboundedSender<Out>,
-    /// Bytes handed to the writer and not yet on the socket.
-    queued: AtomicUsize,
-    /// Bytes the writer has put on the socket.
-    written: AtomicU64,
-    /// The socket, for the bytes in it the viewer has not read yet.
-    fd: RawFd,
-    pub drain: Mutex<DrainEst>,
-    /// Frames sent and not yet acknowledged.
+    pub tx: mpsc::UnboundedSender<Out>,
+    /// Whether this client is watching the video (all shuru clients are).
+    pub video: AtomicBool,
     pub inflight: Mutex<VecDeque<Inflight>>,
-    /// Has acknowledged a frame: only such clients steer flow and bitrate.
-    pub acks: AtomicBool,
+    /// Slow-rising minimum RTT (ms), derived from ack timing in `on_ack` (0 until the
+    /// first ack: flow uses a 40 ms default until then).
+    pub min_rtt_ms: AtomicU32,
+    /// Exponentially-weighted estimate of delivered bytes/sec, from acks.
     pub delivered: Mutex<RateEst>,
-    pub delay: Mutex<DelayEst>,
     pub needs_keyframe: AtomicBool,
-    /// Has had a keyframe since the stream (re)started for it.
+    /// Has received a keyframe since (re)starting video.
     pub started: AtomicBool,
+    pub delay: Mutex<DelayEst>,
 }
 
-/// Send to ack delay: `base_ms` is a slowly expiring minimum, the excess
-/// over it is queueing on the path or in the decoder.
+/// Send->ack delay tracking: `base` is the (slowly expiring) minimum, the excess over
+/// it is queueing somewhere on the path (network buffers or a slow decoder).
 pub struct DelayEst {
     pub base_ms: f64,
     pub base_at: Instant,
     pub queue_ms: f64,
+    /// Slow-rising minimum send->ack time (ms): a lower bound on path RTT, fed to
+    /// `Client::min_rtt_ms` so `flow_ok`/`RateCtl` use a real estimate instead of the
+    /// hardcoded 40 ms default (the resync build sends no ping). `f64::MAX` until the
+    /// first ack.
+    pub rtt_min_ms: f64,
 }
 
-/// How fast a viewer reads, from the send queue: what the writer put on
-/// the socket less what is still in it.
-pub struct DrainEst {
-    pub at: Instant,
-    pub delivered: u64,
-    /// Every sample of this window had bytes waiting.
-    pub busy: bool,
-    /// Read rate over all windows, bit/s.
-    pub rate_bps: f64,
-    /// Read rate over windows with bytes waiting throughout: what the
-    /// viewer can take. 0 until one.
-    pub capacity_bps: f64,
-    /// Last time the viewer read something or had nothing waiting.
-    pub progress_at: Instant,
+/// A frame at or below this size may refresh the clean-path baseline once it has gone
+/// stale; a larger one may not.
+///
+/// UPSTREAM-VOXL CANDIDATE (voxl 0.3.5 `hub.rs` bug 1): voxl refreshes `base_ms` from
+/// *any* sample once `base_at` is >= 10 s old. After an idle moment the first change is a
+/// large frame whose ack time is mostly serialization, so adopting it as the baseline
+/// makes `queue_ms = ms - base_ms` collapse to ~0 and blinds `RateCtl`'s `q > 30`
+/// congestion test for up to 10 s. Gating the staleness refresh to small frames (a
+/// genuinely lower sample always still refreshes, regardless of size) keeps the baseline
+/// a clean-path minimum. See docs/findings/voxl-bugs.md #1.
+const BASE_REFRESH_MAX_BYTES: usize = 8 * 1024;
+
+impl DelayEst {
+    /// Folds one send->ack sample (`ms`, for a frame of `bytes` bytes) into the delay and
+    /// RTT estimates. Pure given the current state and the sample, so it is unit-tested
+    /// directly. Returns the RTT estimate (ms, >= 1) to publish to `min_rtt_ms`.
+    pub fn observe(&mut self, ms: f64, bytes: usize) -> u32 {
+        // base_ms is the clean-path send->ack minimum; the excess over it is queueing.
+        // Only a genuinely lower sample, or a *small* frame after the staleness window,
+        // may move it (bug 1 fix: a big post-idle frame must not reset the baseline).
+        if ms < self.base_ms
+            || (self.base_at.elapsed().as_secs() >= 10 && bytes <= BASE_REFRESH_MAX_BYTES)
+        {
+            self.base_ms = ms;
+            self.base_at = Instant::now();
+        }
+        let qd = ms - self.base_ms;
+        self.queue_ms = self.queue_ms * 0.7 + qd * 0.3;
+        // RTT estimate: the send->ack minimum is a path-RTT lower bound. Snap down to any
+        // new low instantly; otherwise drift up at most 0.5 ms per ack (never past the
+        // current sample), so a lucky low reading is not pinned forever yet one slow ack
+        // cannot inflate the floor (an inflated RTT would loosen `flow_ok`'s queue bound).
+        self.rtt_min_ms = if ms < self.rtt_min_ms {
+            ms
+        } else {
+            (self.rtt_min_ms + 0.5).min(ms)
+        };
+        self.rtt_min_ms.round().clamp(1.0, 2000.0) as u32
+    }
 }
-
-/// What the send queue of a viewer says now.
-pub struct QueueState {
-    /// Bytes waiting, in the writer and in the socket.
-    pub pending: usize,
-    pub rate_bps: f64,
-    pub capacity_bps: f64,
-}
-
-/// The window the read rate is measured over.
-const DRAIN_WINDOW: f64 = 0.3;
-
-/// A frame below this is small enough that its send-to-ack time is mostly
-/// the round trip, not transmission, so it may set the delay baseline.
-const REF_BYTES: usize = 8 << 10;
 
 pub struct RateEst {
     pub window_start: Instant,
@@ -105,99 +111,31 @@ pub struct RateEst {
 
 impl Client {
     pub fn send(&self, m: Out) {
-        self.queued.fetch_add(m.len(), Ordering::Relaxed);
         let _ = self.tx.send(m);
     }
 
-    pub fn queued(&self) -> usize {
-        self.queued.load(Ordering::Relaxed)
-    }
-
-    /// The writer put `n` bytes on the socket.
-    pub fn wrote(&self, n: usize) {
-        self.queued.fetch_sub(n, Ordering::Relaxed);
-        self.written.fetch_add(n as u64, Ordering::Relaxed);
-    }
-
-    /// Bytes in the socket the viewer has not read. Counts kernel buffers,
-    /// so a little above the payload.
-    fn socket_queued(&self) -> usize {
-        if self.fd < 0 {
-            return 0;
-        }
-        let mut n: libc::c_int = 0;
-        if unsafe { libc::ioctl(self.fd, libc::TIOCOUTQ, &mut n) } != 0 {
-            return 0;
-        }
-        n.max(0) as usize
-    }
-
-    /// Bytes waiting for this viewer, in the writer and in the socket.
-    pub fn pending(&self) -> usize {
-        self.queued() + self.socket_queued()
-    }
-
-    /// Samples the send queue; called about every 100 ms.
-    pub fn sample_queue(&self) -> QueueState {
-        let outq = self.socket_queued();
-        let pending = self.queued() + outq;
-        let delivered = self
-            .written
-            .load(Ordering::Relaxed)
-            .saturating_sub(outq as u64);
-        let mut d = self.drain.lock().unwrap();
-        d.sample(Instant::now(), pending, delivered);
-        QueueState {
-            pending,
-            rate_bps: d.rate_bps,
-            capacity_bps: d.capacity_bps,
-        }
-    }
-
-    /// Nothing read for a while with bytes waiting: a hidden tab or a dead
-    /// peer, not a slow path.
-    pub fn stalled(&self) -> bool {
-        self.drain.lock().unwrap().progress_at.elapsed().as_secs() >= 4
-    }
-
-    pub fn resync(&self) {
-        self.inflight.lock().unwrap().clear();
-        self.started.store(false, Ordering::Relaxed);
-        self.needs_keyframe.store(true, Ordering::Relaxed);
-    }
-
     pub fn on_ack(&self, id: u32) {
-        self.acks.store(true, Ordering::Relaxed);
-        let mut q = self.inflight.lock().unwrap();
+        let mut q = self.inflight.lock();
         let mut acked = 0;
         let mut sample = None;
         while let Some(f) = q.front() {
-            if !wrapping_le(f.id, id) {
+            if wrapping_le(f.id, id) {
+                acked += f.bytes;
+                if f.id == id {
+                    sample = Some((f.sent.elapsed().as_secs_f64() * 1000.0, f.bytes));
+                }
+                q.pop_front();
+            } else {
                 break;
             }
-            acked += f.bytes;
-            if f.id == id {
-                sample = Some((f.sent.elapsed().as_secs_f64() * 1000.0, f.bytes));
-            }
-            q.pop_front();
         }
         drop(q);
         if let Some((ms, bytes)) = sample {
-            let mut e = self.delay.lock().unwrap();
-            // A big frame takes long to serialise over the link, so its
-            // send-to-ack time is mostly transmission, not the round trip.
-            // Only a small frame may raise the baseline; any frame may
-            // lower it. Otherwise one burst after a still moment sets a
-            // huge base, and the queueing it causes reads as none.
-            let small = bytes < REF_BYTES;
-            if ms < e.base_ms || (small && e.base_at.elapsed().as_secs() >= 10) {
-                e.base_ms = ms;
-                e.base_at = Instant::now();
-            }
-            let qd = ms - e.base_ms;
-            e.queue_ms = e.queue_ms * 0.7 + qd * 0.3;
+            let rtt = self.delay.lock().observe(ms, bytes);
+            // Feed the ack-derived RTT back so flow_ok/RateCtl stop defaulting to 40 ms.
+            self.min_rtt_ms.store(rtt, Ordering::Relaxed);
         }
-        let mut d = self.delivered.lock().unwrap();
+        let mut d = self.delivered.lock();
         d.bytes += acked;
         let el = d.window_start.elapsed().as_secs_f64();
         if el >= 0.5 {
@@ -212,237 +150,236 @@ impl Client {
         }
     }
 
-    /// Frames in flight and the age of the oldest, in ms.
+    /// Frames in flight and age of the oldest unacknowledged one.
     pub fn backlog(&self) -> (usize, u128) {
-        let q = self.inflight.lock().unwrap();
+        let q = self.inflight.lock();
         (
             q.len(),
             q.front().map(|f| f.sent.elapsed().as_millis()).unwrap_or(0),
         )
     }
 
-    /// The smallest send to ack time seen lately, or 40 ms before any.
-    pub fn rtt_ms(&self) -> f64 {
-        let base = self.delay.lock().unwrap().base_ms;
-        if base.is_finite() {
-            base.max(1.0)
-        } else {
-            40.0
-        }
+    /// Ask for a fresh keyframe (a reconnecting or decoder-stuck viewer).
+    pub fn resync(&self) {
+        self.needs_keyframe.store(true, Ordering::Relaxed);
+        self.started.store(false, Ordering::Relaxed);
+        self.inflight.lock().clear();
     }
 }
 
-impl DrainEst {
-    pub fn new(now: Instant) -> Self {
-        DrainEst {
-            at: now,
-            delivered: 0,
-            busy: false,
-            rate_bps: 0.0,
-            capacity_bps: 0.0,
-            progress_at: now,
-        }
+/// A non-blocking, close-on-exec pipe for waking a thread that polls file descriptors
+/// (`pipe2` with those flags, which macOS lacks).
+pub fn wake_pipe() -> nix::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+    let (r, w) = nix::unistd::pipe()?;
+    for fd in [&r, &w] {
+        fcntl(fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+        fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+    }
+    Ok((r, w))
+}
+
+/// Something `wait_any` can wait for: a file descriptor on Unix.
+pub type Waitable<'a> = std::os::fd::BorrowedFd<'a>;
+
+/// Wakes a thread blocked in `wait_any`: a pipe on Unix.
+pub struct Wake {
+    r: std::os::fd::OwnedFd,
+    w: std::os::fd::OwnedFd,
+}
+
+impl Wake {
+    pub fn new() -> std::io::Result<Self> {
+        let (r, w) = wake_pipe()?;
+        Ok(Wake { r, w })
     }
 
-    fn sample(&mut self, now: Instant, pending: usize, delivered: u64) {
-        if pending == 0 || delivered > self.delivered {
-            self.progress_at = now;
-        }
-        self.busy &= pending > 0;
-        let el = now.duration_since(self.at).as_secs_f64();
-        if el < DRAIN_WINDOW {
-            return;
-        }
-        let r = delivered.saturating_sub(self.delivered) as f64 * 8.0 / el;
-        self.rate_bps = ewma(self.rate_bps, r);
-        if self.busy {
-            self.capacity_bps = ewma(self.capacity_bps, r);
-        }
-        self.at = now;
-        self.delivered = delivered;
-        self.busy = pending > 0;
+    pub fn signal(&self) {
+        let _ = nix::unistd::write(&self.w, &[1u8]);
+    }
+
+    pub fn drain(&self) {
+        let mut buf = [0u8; 64];
+        while matches!(nix::unistd::read(&self.r, &mut buf), Ok(n) if n > 0) {}
+    }
+
+    pub fn waitable(&self) -> Waitable<'_> {
+        std::os::fd::AsFd::as_fd(&self.r)
     }
 }
 
-fn ewma(old: f64, new: f64) -> f64 {
-    if old == 0.0 {
-        new
-    } else {
-        old * 0.6 + new * 0.4
-    }
+/// Blocks until one of `w` is ready or `timeout_ms` passes (negative: no timeout).
+pub fn wait_any(w: &[Waitable], timeout_ms: i32) {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    let mut p: Vec<PollFd> = w
+        .iter()
+        .map(|&fd| PollFd::new(fd, PollFlags::POLLIN))
+        .collect();
+    let _ = poll(
+        &mut p,
+        PollTimeout::try_from(timeout_ms).unwrap_or(PollTimeout::NONE),
+    );
 }
 
 fn wrapping_le(a: u32, b: u32) -> bool {
     b.wrapping_sub(a) < 0x8000_0000
 }
 
-/// Wakes the capture thread out of `wait_any`.
-pub struct Wake {
-    r: OwnedFd,
-    w: OwnedFd,
-}
-
-impl Wake {
-    fn new() -> std::io::Result<Self> {
-        let mut fds = [0; 2];
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(unsafe {
-            Wake {
-                r: OwnedFd::from_raw_fd(fds[0]),
-                w: OwnedFd::from_raw_fd(fds[1]),
-            }
-        })
-    }
-
-    pub fn signal(&self) {
-        use std::os::fd::AsRawFd;
-        let _ = unsafe { libc::write(self.w.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
-    }
-
-    pub fn drain(&self) {
-        use std::os::fd::AsRawFd;
-        let mut buf = [0u8; 64];
-        while unsafe { libc::read(self.r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
-    }
-
-    pub fn fd(&self) -> BorrowedFd<'_> {
-        self.r.as_fd()
-    }
-}
-
-/// Blocks until one of `fds` is readable or `timeout_ms` passes.
-pub fn wait_any(fds: &[BorrowedFd], timeout_ms: i32) {
-    use std::os::fd::AsRawFd;
-    let mut p: Vec<libc::pollfd> = fds
-        .iter()
-        .map(|fd| libc::pollfd {
-            fd: fd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        })
-        .collect();
-    unsafe { libc::poll(p.as_mut_ptr(), p.len() as libc::nfds_t, timeout_ms) };
-}
-
-/// Who may send input.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Gate {
-    Shut,
-    Agent,
-    Viewer(String),
-}
-
-/// The screen as captured: BGRX, rows packed, and the cursor then.
-pub struct Snapshot {
-    pub width: usize,
-    pub height: usize,
-    pub bgrx: Vec<u8>,
-    pub cursor: Option<crate::cursor::CursorImage>,
-}
-
-/// The size of the stream and its codec, as the hello says them.
-#[derive(Clone)]
-pub struct Geometry {
-    pub width: u32,
-    pub height: u32,
-    pub codec: String,
+#[derive(Default)]
+pub struct Stats {
+    pub captured: AtomicU64,
+    pub encoded: AtomicU64,
+    pub bytes: AtomicU64,
+    pub encode_us: AtomicU64,
+    pub grab_us: AtomicU64,
+    pub convert_us: AtomicU64,
+    pub flow_blocked: AtomicU64,
+    pub paintovers: AtomicU64,
+    pub keyframes: AtomicU64,
+    pub refines: AtomicU64,
+    pub damage_wait_us: AtomicU64,
+    pub send_lat_us: AtomicU64,
 }
 
 pub struct Hub {
     clients: Mutex<Vec<Arc<Client>>>,
     next_id: AtomicU64,
-    pub geometry: Mutex<Geometry>,
-    /// Timestamps count from here, across encoder rebuilds.
-    pub epoch: Instant,
-    /// The number of the last frame sent, across encoder rebuilds.
-    pub frame_id: AtomicU32,
-    pub last_ts: AtomicU64,
-    /// The last cursor message, for new viewers.
+    /// A monotonic epoch for the millisecond clock the input-quiet hook shares.
+    epoch: Instant,
+    pub stats: Stats,
+    pub width: AtomicU32,
+    pub height: AtomicU32,
+    /// Encoded stripes as (y, height).
+    pub stripes: Mutex<Vec<(u32, u32)>>,
+    /// Adaptive bitrate cap applied by the encoder (kbit/s).
+    pub target_kbps: AtomicU32,
+    /// The last cursor message (shuru JSON), replayed to new clients.
     pub cursor: Mutex<Option<String>>,
     /// The last cursor image, for stills when the server refuses one.
-    pub cursor_image: Mutex<Option<crate::cursor::CursorImage>>,
+    pub cursor_image: Mutex<Option<CursorImage>>,
     /// The last pointer position sent.
     pub pointer: Mutex<Option<(i32, i32)>>,
-    /// The bitrate cap the encoder applies, kbit/s.
-    pub target_kbps: AtomicU32,
-    /// The bits the encoder may spend, kept across encoder rebuilds.
-    pub budget: Mutex<Budget>,
+    /// Wakes the capture thread (acks, joins, keyframe requests).
     pub waker: Wake,
-    pub input: std_mpsc::Sender<InputEvent>,
-    pub gate: Mutex<Gate>,
-    /// Stills asked for, answered by the capture thread.
-    pub snapshots: Mutex<Vec<oneshot::Sender<Arc<Snapshot>>>>,
+    pub input: Mutex<Option<std::sync::mpsc::Sender<crate::input::InputEvent>>>,
+    /// Screenshot requests, answered by the capture thread with the current screen.
+    pub snapshots: Mutex<Vec<tokio::sync::oneshot::Sender<Arc<Snapshot>>>>,
+    /// Shallow integration hook (behind the hello `sharpenOnInputQuiet` capability):
+    /// the last time input was applied, in epoch millis, so the video thread can start
+    /// the paint-over countdown when the user goes quiet, not only when pixels settle.
+    pub last_input_ms: AtomicU64,
+    /// How many connected viewers negotiated the input-quiet sharpening hook.
+    sharpen_subs: AtomicUsize,
+    /// How many connected viewers negotiated the keyframe-on-lease hook.
+    lease_subs: AtomicUsize,
 }
 
 impl Hub {
-    pub fn new(
-        geometry: Geometry,
-        input: std_mpsc::Sender<InputEvent>,
-    ) -> std::io::Result<Arc<Self>> {
-        Ok(Arc::new(Hub {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Hub {
             clients: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
-            geometry: Mutex::new(geometry),
             epoch: Instant::now(),
-            frame_id: AtomicU32::new(0),
-            last_ts: AtomicU64::new(0),
+            stats: Stats::default(),
+            width: AtomicU32::new(0),
+            height: AtomicU32::new(0),
+            target_kbps: AtomicU32::new(0),
+            stripes: Mutex::new(Vec::new()),
             cursor: Mutex::new(None),
             cursor_image: Mutex::new(None),
             pointer: Mutex::new(None),
-            target_kbps: AtomicU32::new(0),
-            budget: Mutex::new(Budget::new(Instant::now())),
-            waker: Wake::new()?,
-            input,
-            gate: Mutex::new(Gate::Shut),
+            waker: Wake::new().expect("wake"),
+            input: Mutex::new(None),
             snapshots: Mutex::new(Vec::new()),
-        }))
+            last_input_ms: AtomicU64::new(0),
+            sharpen_subs: AtomicUsize::new(0),
+            lease_subs: AtomicUsize::new(0),
+        })
     }
 
     pub fn wake(&self) {
         self.waker.signal();
     }
 
-    /// A new stream on the socket `fd`, -1 for none. It gets the hello,
-    /// the gate, the cursor and the pointer before any frame.
+    /// Milliseconds since this hub was made, the clock the input-quiet hook shares.
+    pub fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// Records that input was just applied (for the input-quiet sharpening hook).
+    pub fn note_input(&self) {
+        self.last_input_ms.store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    /// Whether the input-quiet sharpening hook is active (a capable viewer is connected).
+    pub fn sharpen_on_input_quiet(&self) -> bool {
+        self.sharpen_subs.load(Ordering::Relaxed) > 0
+    }
+
+    /// Whether the keyframe-on-lease hook is active (a capable viewer is connected).
+    pub fn keyframe_on_lease(&self) -> bool {
+        self.lease_subs.load(Ordering::Relaxed) > 0
+    }
+
+    /// A viewer negotiated these hooks on connect; the counters undo on disconnect so a
+    /// plain voxl viewer, which negotiates nothing, is never affected.
+    pub fn add_caps(&self, sharpen: bool, lease: bool) {
+        if sharpen {
+            self.sharpen_subs.fetch_add(1, Ordering::Relaxed);
+        }
+        if lease {
+            self.lease_subs.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn remove_caps(&self, sharpen: bool, lease: bool) {
+        if sharpen {
+            self.sharpen_subs.fetch_sub(1, Ordering::Relaxed);
+        }
+        if lease {
+            self.lease_subs.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn drain_wake(&self) {
+        self.waker.drain();
+    }
+
+    /// A new stream. It gets the hello, the cursor and the pointer before any frame;
+    /// the server sends the gate state separately (the gate lives outside the hub).
     pub fn add_client(
         &self,
         viewer: Option<String>,
         tx: mpsc::UnboundedSender<Out>,
-        fd: RawFd,
     ) -> Arc<Client> {
         let c = Arc::new(Client {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             viewer,
             tx,
-            queued: AtomicUsize::new(0),
-            written: AtomicU64::new(0),
-            fd,
-            drain: Mutex::new(DrainEst::new(Instant::now())),
+            video: AtomicBool::new(true),
             inflight: Mutex::new(VecDeque::new()),
-            acks: AtomicBool::new(false),
+            min_rtt_ms: AtomicU32::new(0),
             delivered: Mutex::new(RateEst {
                 window_start: Instant::now(),
                 bytes: 0,
                 rate_bps: 0.0,
             }),
-            delay: Mutex::new(DelayEst {
-                base_ms: f64::INFINITY,
-                base_at: Instant::now(),
-                queue_ms: 0.0,
-            }),
             needs_keyframe: AtomicBool::new(true),
             started: AtomicBool::new(false),
+            delay: Mutex::new(DelayEst {
+                base_ms: f64::MAX,
+                base_at: Instant::now(),
+                queue_ms: 0.0,
+                rtt_min_ms: f64::MAX,
+            }),
         });
         // Under the client lock, so no broadcast slips in between.
-        let mut clients = self.clients.lock().unwrap();
+        let mut clients = self.clients.lock();
         c.send(Out::Text(self.hello()));
-        c.send(Out::Text(self.gate_message(c.viewer.as_deref())));
-        if let Some(m) = self.cursor.lock().unwrap().clone() {
+        if let Some(m) = self.cursor.lock().clone() {
             c.send(Out::Text(m));
         }
-        if let Some((x, y)) = *self.pointer.lock().unwrap() {
+        if let Some((x, y)) = *self.pointer.lock() {
             c.send(Out::Text(pointer_message(x, y)));
         }
         clients.push(c.clone());
@@ -451,71 +388,53 @@ impl Hub {
         c
     }
 
-    /// Sends `m` to every stream.
-    pub fn broadcast(&self, m: &str) {
-        for c in self.clients.lock().unwrap().iter() {
-            c.send(Out::Text(m.to_string()));
-        }
-    }
-
     pub fn remove_client(&self, id: u64) {
-        self.clients.lock().unwrap().retain(|c| c.id != id);
+        self.clients.lock().retain(|c| c.id != id);
         self.wake();
     }
 
     pub fn clients(&self) -> Vec<Arc<Client>> {
-        self.clients.lock().unwrap().clone()
+        self.clients.lock().clone()
     }
 
+    pub fn video_clients(&self) -> Vec<Arc<Client>> {
+        self.clients
+            .lock()
+            .iter()
+            .filter(|c| c.video.load(Ordering::Relaxed))
+            .cloned()
+            .collect()
+    }
+
+    /// Sends `m` to every stream.
+    pub fn broadcast(&self, m: &str) {
+        for c in self.clients.lock().iter() {
+            c.send(Out::Text(m.to_string()));
+        }
+    }
+
+    /// The `hello` message: the stream's geometry, codec and stripe layout.
     pub fn hello(&self) -> String {
-        let g = self.geometry.lock().unwrap();
         serde_json::json!({
             "type": "hello",
-            "codec": g.codec,
+            "codec": "h264",
             "format": "annexb",
-            "width": g.width,
-            "height": g.height,
+            "width": self.width.load(Ordering::Relaxed),
+            "height": self.height.load(Ordering::Relaxed),
+            "stripes": *self.stripes.lock(),
         })
         .to_string()
     }
 
-    /// The screen changed size: every stream gets the new hello and starts
-    /// again at a keyframe.
-    pub fn set_geometry(&self, geometry: Geometry) {
-        *self.geometry.lock().unwrap() = geometry;
+    /// After the stream restarts (new size): every client needs the new geometry and
+    /// a keyframe, and acks for the old stream's frames no longer apply.
+    pub fn restart_clients(&self) {
         let hello = self.hello();
-        for c in self.clients.lock().unwrap().iter() {
-            c.resync();
+        for c in self.clients.lock().iter() {
+            c.inflight.lock().clear();
+            c.started.store(false, Ordering::Relaxed);
+            c.needs_keyframe.store(true, Ordering::Relaxed);
             c.send(Out::Text(hello.clone()));
-        }
-        self.wake();
-    }
-
-    /// Whether input from `viewer` lands now.
-    pub fn may_input(&self, viewer: Option<&str>) -> bool {
-        match (&*self.gate.lock().unwrap(), viewer) {
-            (Gate::Viewer(open), Some(v)) => open == v,
-            _ => false,
-        }
-    }
-
-    pub fn gate_message(&self, viewer: Option<&str>) -> String {
-        serde_json::json!({"type": "gate", "input": self.may_input(viewer)}).to_string()
-    }
-
-    /// Opens the gate to someone else, or shuts it. Keys and buttons held
-    /// by whoever had it are let go.
-    pub fn set_gate(&self, gate: Gate) {
-        {
-            let mut g = self.gate.lock().unwrap();
-            if *g == gate {
-                return;
-            }
-            *g = gate;
-        }
-        let _ = self.input.send(InputEvent::ReleaseAll);
-        for c in self.clients() {
-            c.send(Out::Text(self.gate_message(c.viewer.as_deref())));
         }
     }
 }
@@ -529,32 +448,66 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    #[test]
-    fn capacity_only_from_busy_windows() {
-        let t0 = Instant::now();
-        let mut d = DrainEst::new(t0);
-        // A window with nothing waiting at one sample.
-        d.sample(t0 + Duration::from_millis(100), 0, 50_000);
-        d.sample(t0 + Duration::from_millis(400), 1000, 100_000);
-        assert!(d.rate_bps > 0.0);
-        assert_eq!(d.capacity_bps, 0.0);
-        // Bytes waiting throughout: 37.5 kB in 300 ms is 1 Mbit/s.
-        d.sample(t0 + Duration::from_millis(550), 5000, 120_000);
-        d.sample(t0 + Duration::from_millis(700), 5000, 137_500);
-        assert!(
-            (d.capacity_bps - 1_000_000.0).abs() < 1.0,
-            "{}",
-            d.capacity_bps
-        );
+    fn delay(base_ms: f64, base_age: Duration, queue_ms: f64) -> DelayEst {
+        DelayEst {
+            base_ms,
+            base_at: Instant::now() - base_age,
+            queue_ms,
+            rtt_min_ms: base_ms,
+        }
     }
 
+    /// Fix 1: the RTT estimate tracks the send->ack minimum instead of defaulting to
+    /// 40 ms, snaps down to any new low, and is not inflated by one slow ack.
     #[test]
-    fn no_progress_is_a_stall() {
-        let t0 = Instant::now();
-        let mut d = DrainEst::new(t0);
-        d.sample(t0 + Duration::from_secs(1), 500, 0);
-        assert_eq!(d.progress_at, t0);
-        d.sample(t0 + Duration::from_secs(2), 500, 10);
-        assert_eq!(d.progress_at, t0 + Duration::from_secs(2));
+    fn rtt_tracks_ack_minimum() {
+        let mut e = DelayEst {
+            base_ms: f64::MAX,
+            base_at: Instant::now(),
+            queue_ms: 0.0,
+            rtt_min_ms: f64::MAX,
+        };
+        // First ack sets the floor.
+        assert_eq!(e.observe(25.0, 1000), 25);
+        // A much slower ack barely moves the floor (drifts up <= 0.5 ms).
+        let r = e.observe(120.0, 1000);
+        assert!(r <= 26, "one slow ack jumped the RTT floor to {r} ms");
+        // Several more slow acks still only creep upward, nowhere near the sample.
+        for _ in 0..3 {
+            e.observe(120.0, 1000);
+        }
+        assert!(e.rtt_min_ms < 30.0, "RTT crept to {} ms", e.rtt_min_ms);
+        // A lower ack snaps the floor straight down.
+        assert_eq!(e.observe(11.0, 1000), 11);
+    }
+
+    /// Fix 2 / voxl bug 1: after the 10 s staleness window a *big* post-idle frame must
+    /// not reset the baseline, or `queue_ms` collapses and the `q > 30` congestion test
+    /// goes blind. A small frame (or any lower sample) may still refresh it.
+    #[test]
+    fn big_post_idle_frame_does_not_blind_congestion() {
+        // Baseline set low on a clean path, now stale (> 10 s old).
+        let mut e = delay(20.0, Duration::from_secs(11), 0.0);
+        // The first post-idle change is a big frame that acks slow (serialization).
+        e.observe(140.0, 64 * 1024);
+        assert!(
+            e.base_ms <= 20.0 + f64::EPSILON,
+            "big frame reset base_ms to {} (baseline polluted)",
+            e.base_ms
+        );
+        assert!(
+            e.queue_ms > 30.0,
+            "queue_ms collapsed to {} ms: congestion would be invisible",
+            e.queue_ms
+        );
+
+        // A small frame after the same staleness window is still allowed to refresh.
+        let mut small = delay(20.0, Duration::from_secs(11), 0.0);
+        small.observe(35.0, 2000);
+        assert!(
+            (small.base_ms - 35.0).abs() < 1e-6,
+            "small frame failed to refresh base_ms: {}",
+            small.base_ms
+        );
     }
 }

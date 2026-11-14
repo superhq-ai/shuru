@@ -1,9 +1,11 @@
 //! `shuru-screen` streams an X11 display as H.264 over a WebSocket and
 //! takes input for it by XTEST, behind a gate. It serves HTTP on a unix
 //! socket only; whatever exposes it further brings its own authentication.
+//!
+//! The streaming core (capture, encode, flow control, rate control) is
+//! vendored from voxl 0.3.5; server.rs/gate.rs/cursor.rs/still.rs are
+//! shuru's thin layer over it. See NOTICE and docs/findings/screen-resync.md.
 
-#[cfg(target_os = "linux")]
-mod budget;
 #[cfg(target_os = "linux")]
 mod capture;
 #[cfg(target_os = "linux")]
@@ -12,6 +14,8 @@ mod convert;
 mod cursor;
 #[cfg(target_os = "linux")]
 mod encoder;
+#[cfg(target_os = "linux")]
+mod gate;
 #[cfg(target_os = "linux")]
 mod hub;
 #[cfg(target_os = "linux")]
@@ -43,14 +47,16 @@ mod linux {
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    use anyhow::{bail, Context, Result};
+    use anyhow::{anyhow, bail, Context, Result};
     use clap::Parser;
     use tokio::signal::unix::{signal, SignalKind};
 
-    use crate::encoder::Profile;
+    use crate::gate::GateState;
     use crate::input::InputEvent;
+    use crate::server::State;
     use crate::video::VideoConfig;
 
     #[derive(Parser)]
@@ -71,12 +77,11 @@ mod linux {
         /// Lowest bitrate the stream backs off to, in kbit/s.
         #[arg(long, default_value_t = 500)]
         min_kbps: u32,
-        /// The H.264 profile.
-        #[arg(long, value_enum, default_value_t = Profile::High)]
-        profile: Profile,
     }
 
     pub fn run() -> Result<()> {
+        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .try_init();
         let args = Args::parse();
         if !(1..=120).contains(&args.framerate) {
             bail!("--framerate is from 1 to 120");
@@ -86,28 +91,36 @@ mod linux {
         }
         let ncpu = std::thread::available_parallelism().map_or(4, |n| n.get());
         let cfg = VideoConfig {
+            display: Some(args.display.clone()),
             fps: args.framerate,
-            max_kbps: args.max_kbps,
-            min_kbps: args.min_kbps,
+            preset: "ultrafast".into(),
             // x264 slices cost more CPU per frame the more there are; one
             // thread up to 7 CPUs.
             threads: (ncpu as u32 / 4).clamp(1, 4),
             convert_threads: ncpu.clamp(1, 4),
             crf: 24.0,
+            max_kbps: args.max_kbps,
             paintover_crf: 16.0,
             paintover_burst: 3,
-            paintover_delay: Duration::from_millis(150),
-            profile: args.profile,
-            debug: std::env::var_os("SHURU_SCREEN_DEBUG").is_some(),
+            paintover_delay_ms: 150,
+            min_kbps: args.min_kbps,
+            coalesce: Duration::from_micros(0),
+            stripes: 1,
+            adaptive_threads: false,
         };
+        let fps = cfg.fps;
+        let hub = crate::hub::Hub::new();
+        let gate = Arc::new(GateState::new());
         let input = crate::input::spawn(&args.display)
             .with_context(|| format!("input on {}", args.display))?;
-        let fps = cfg.fps;
-        let hub = crate::video::start(&args.display, cfg, input.clone())?;
+        *hub.input.lock() = Some(input.clone());
+        crate::video::spawn(cfg, hub.clone())
+            .map_err(|e| anyhow!("video on {}: {e}", args.display))?;
         crate::cursor::spawn(&args.display, hub.clone(), fps)
             .with_context(|| format!("cursor on {}", args.display))?;
         let listener = bind(&args.socket)?;
         eprintln!("shuru-screen: serving on {}", args.socket.display());
+        let state = State { hub, gate };
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -120,7 +133,7 @@ mod linux {
                 tokio::select! {
                     accepted = listener.accept() => match accepted {
                         Ok((stream, _)) => {
-                            tokio::spawn(crate::server::connection(hub.clone(), stream));
+                            tokio::spawn(crate::server::connection(state.clone(), stream));
                         }
                         Err(e) => {
                             eprintln!("shuru-screen: accepting a connection: {e}");

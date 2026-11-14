@@ -1,11 +1,13 @@
 [package]
 name = "shuru-screen"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2021"
 description = "Streams an X11 display as H.264 over a WebSocket on a unix socket, with gated XTEST input"
 license = "Apache-2.0"
 repository = "https://github.com/superhq-ai/shuru"
 publish = false
+# The vendored x264 bindings (see build.rs) expose DEP_SHURU_SCREEN_RPATH.
+links = "shuru-screen"
 
 [[bin]]
 name = "shuru-screen"
@@ -24,12 +26,19 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+log = "0.4"
+env_logger = "0.11"
+parking_lot = "0.12"
 png = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "signal"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
-x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "xtest", "xinput", "randr", "allow-unsafe-code"] }
+x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "xtest", "shape", "xinput", "randr", "allow-unsafe-code"] }
+
+[target.'cfg(all(target_os = "linux", unix))'.dependencies]
+nix = { version = "0.31", features = ["fs", "poll", "time"] }
 
 [build-dependencies]
-cc = "1"
+bindgen = "0.72"
+pkg-config = "0.3"

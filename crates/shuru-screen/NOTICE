@@ -1,10 +1,13 @@
 shuru-screen
 
 The source of this crate is under the Apache License 2.0, like the rest of
-shuru (see LICENSE at the root of the repository). Parts of it come from
-voxl (https://github.com/tembo/voxl), Copyright (c) 2026 Tembo, under the
-MIT license; those files say so at the top, and the MIT notice is in
-LICENSE-voxl.
+shuru (see LICENSE at the root of the repository). Its streaming core
+(capture.rs, convert.rs, encoder.rs, hub.rs, video.rs, and the x264 bindgen
+in build.rs) is vendored from voxl 0.3.5
+(https://github.com/tembo/voxl), Copyright (c) 2026 Tembo, under the MIT
+license; those files say so at the top, pinned to v0.3.5, and the MIT notice
+is in LICENSE-voxl. shuru's own layer over it (server.rs, gate.rs, cursor.rs,
+still.rs, input.rs, main.rs) is Apache-2.0.
 
 The shuru-screen binary links x264 (https://www.videolan.org/developers/x264.html),
 which is under the GNU General Public License, version 2 or later. The
