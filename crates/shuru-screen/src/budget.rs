@@ -13,34 +13,93 @@
 //! changes; with it, it holds every frame back by one, which a damage
 //! driven stream cannot afford. So x264 only caps each frame (see x264.c),
 //! at the size this bucket says.
+//!
+//! How deep the bucket gets depends on the path. A deep burst only pays
+//! off on a link that can carry it: on one no faster than the target it
+//! just queues for the whole depth, so a fast flick stalls. The reach,
+//! below, reads the measured headroom (the capacity the rate controller
+//! found over the target) and the bucket is deep only once the path has
+//! shown room for it.
 
 use std::time::{Duration, Instant};
 
-/// The deepest the bucket gets, as video at the target.
-pub const DEPTH_MS: f64 = 400.0;
+/// The deepest the bucket gets on a roomy path, as video at the target.
+pub const ROOMY_MS: f64 = 400.0;
+
+/// The deepest on a path with no room over the target: about one frame,
+/// so a change is coded no bigger than the shipped encoder would, and no
+/// deep queue builds.
+pub const TIGHT_MS: f64 = 40.0;
+
+/// Whether the path has shown room for a deep burst. A pure state machine
+/// over the measured headroom (capacity over target), with a gap between
+/// opening and closing so it does not flap on a brief overshoot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reach {
+    /// No room measured over the target: keep the bucket about one frame.
+    Tight,
+    /// The path carried well over the target: allow the full depth.
+    Roomy,
+}
+
+impl Reach {
+    /// Reopens at this much measured headroom. A path whose capacity is
+    /// unknown reads as infinite headroom, so an untried path is roomy.
+    const OPEN: f64 = 1.5;
+
+    /// A queue building now closes it at once, before the ceiling is even
+    /// measured, so the first frames of a burst on a link no faster than
+    /// the target do not run away. It reopens only once the measured
+    /// headroom is clearly above the target and nothing is queued.
+    pub fn step(self, congested: bool, headroom: f64) -> Reach {
+        if congested {
+            Reach::Tight
+        } else if headroom >= Self::OPEN {
+            Reach::Roomy
+        } else {
+            self
+        }
+    }
+
+    pub fn depth_ms(self) -> f64 {
+        match self {
+            Reach::Tight => TIGHT_MS,
+            Reach::Roomy => ROOMY_MS,
+        }
+    }
+}
 
 pub struct Budget {
     /// Kilobits in the bucket. Below 0 after a frame larger than its cap.
     level: f64,
     at: Instant,
+    /// How deep the bucket may get, in ms of video at the target.
+    depth_ms: f64,
 }
 
 impl Budget {
-    /// A full bucket.
+    /// A full bucket, roomy until the path says otherwise.
     pub fn new(now: Instant) -> Self {
         Budget {
             level: f64::INFINITY,
             at: now,
+            depth_ms: ROOMY_MS,
         }
     }
 
-    fn depth(kbps: u32) -> f64 {
-        kbps as f64 * DEPTH_MS / 1000.0
+    /// Sets how deep the bucket may get, from the path's reach.
+    pub fn set_depth_ms(&mut self, depth_ms: f64) {
+        self.depth_ms = depth_ms;
+    }
+
+    fn depth(&self, kbps: u32) -> f64 {
+        kbps as f64 * self.depth_ms / 1000.0
     }
 
     fn refill(&mut self, now: Instant, kbps: u32) {
         let secs = now.saturating_duration_since(self.at).as_secs_f64();
-        self.level = (self.level + secs * kbps as f64).min(Self::depth(kbps));
+        let depth = self.depth(kbps);
+        self.level = (self.level + secs * kbps as f64).min(depth);
         self.at = now;
     }
 
@@ -55,14 +114,15 @@ impl Budget {
     /// How long until the bucket is full again.
     pub fn until_full(&mut self, now: Instant, kbps: u32) -> Duration {
         self.refill(now, kbps);
-        let short = Self::depth(kbps) - self.level;
+        let short = self.depth(kbps) - self.level;
         Duration::from_secs_f64((short / kbps.max(1) as f64).max(0.0))
     }
 
     /// A frame of `bytes` went out.
     pub fn spend(&mut self, bytes: usize, kbps: u32) {
         // A frame over its cap is owed, up to one bucket.
-        self.level = (self.level - bytes as f64 * 8.0 / 1000.0).max(-Self::depth(kbps));
+        let floor = -self.depth(kbps);
+        self.level = (self.level - bytes as f64 * 8.0 / 1000.0).max(floor);
     }
 }
 
@@ -140,5 +200,35 @@ mod tests {
         let mut b = Budget::new(t0);
         assert_eq!(b.frame_kbit(t0, 6000, 30), 2400);
         assert_eq!(b.frame_kbit(t0, 1500, 30), 600);
+    }
+
+    #[test]
+    fn reach_closes_on_a_queue_and_reopens_only_on_room() {
+        // A queue closes it at once, whatever the measured headroom.
+        assert_eq!(Reach::Roomy.step(true, f64::INFINITY), Reach::Tight);
+        assert_eq!(Reach::Roomy.step(true, 3.0), Reach::Tight);
+        // Tight holds while the path has no clear room over the target,
+        // even with nothing queued, so a link at the target stays tight.
+        assert_eq!(Reach::Tight.step(false, 1.0), Reach::Tight);
+        assert_eq!(Reach::Tight.step(false, 1.4), Reach::Tight);
+        // Half again the target's room, and clear, reopens it.
+        assert_eq!(Reach::Tight.step(false, 1.5), Reach::Roomy);
+        // An untried path reads as infinite headroom: roomy.
+        assert_eq!(Reach::Tight.step(false, f64::INFINITY), Reach::Roomy);
+    }
+
+    #[test]
+    fn a_tight_reach_caps_the_burst_near_one_frame() {
+        let t0 = Instant::now();
+        let mut b = Budget::new(t0);
+        // Roomy by default: a change after rest gets the whole 400 ms.
+        assert_eq!(b.frame_kbit(t0, 1500, 30), 600);
+        // On a path with no room the bucket is about one frame, close to
+        // the per-frame share, so a burst cannot run away.
+        b.set_depth_ms(TIGHT_MS);
+        assert_eq!(b.frame_kbit(t0, 1500, 30), 60);
+        // And the debt from an overshoot is bounded at that shallow depth.
+        b.spend(75_000, 1500);
+        assert_eq!(b.frame_kbit(t0, 1500, 30), 50);
     }
 }

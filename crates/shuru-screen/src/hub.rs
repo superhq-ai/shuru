@@ -93,6 +93,10 @@ pub struct QueueState {
 /// The window the read rate is measured over.
 const DRAIN_WINDOW: f64 = 0.3;
 
+/// A frame below this is small enough that its send-to-ack time is mostly
+/// the round trip, not transmission, so it may set the delay baseline.
+const REF_BYTES: usize = 8 << 10;
+
 pub struct RateEst {
     pub window_start: Instant,
     pub bytes: usize,
@@ -173,14 +177,20 @@ impl Client {
             }
             acked += f.bytes;
             if f.id == id {
-                sample = Some(f.sent.elapsed().as_secs_f64() * 1000.0);
+                sample = Some((f.sent.elapsed().as_secs_f64() * 1000.0, f.bytes));
             }
             q.pop_front();
         }
         drop(q);
-        if let Some(ms) = sample {
+        if let Some((ms, bytes)) = sample {
             let mut e = self.delay.lock().unwrap();
-            if ms < e.base_ms || e.base_at.elapsed().as_secs() >= 10 {
+            // A big frame takes long to serialise over the link, so its
+            // send-to-ack time is mostly transmission, not the round trip.
+            // Only a small frame may raise the baseline; any frame may
+            // lower it. Otherwise one burst after a still moment sets a
+            // huge base, and the queueing it causes reads as none.
+            let small = bytes < REF_BYTES;
+            if ms < e.base_ms || (small && e.base_at.elapsed().as_secs() >= 10) {
                 e.base_ms = ms;
                 e.base_at = Instant::now();
             }

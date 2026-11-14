@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 
+use crate::budget::Reach;
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
 use crate::encoder::{Encoder, Profile};
@@ -51,6 +52,11 @@ const MAX_INFLIGHT: usize = 600;
 const QUEUE_HIGH_MS: f64 = 200.0;
 const QUEUE_LOW_MS: f64 = 50.0;
 const QUEUE_HOLD_MS: f64 = 400.0;
+
+/// The target is raised only while the path delivers at least this share
+/// of it: proof the link carries the whole target with room to spare,
+/// rather than a quiet moment on a link that is actually at the target.
+const RAMP_DELIVER: f64 = 1.05;
 
 struct Job {
     buf: Box<I420>,
@@ -196,6 +202,8 @@ struct RateCtl {
     /// Delivered rate at the last congestion: the likely capacity.
     ceiling: f64,
     ceiling_at: Instant,
+    /// Whether the path has room for a deep bit-bucket burst.
+    reach: Reach,
     debug: bool,
     logged: f64,
     /// A rate safe for a viewer not measured yet.
@@ -223,6 +231,7 @@ impl RateCtl {
             slow_start: true,
             ceiling: f64::MAX,
             ceiling_at: past,
+            reach: Reach::Roomy,
             debug,
             logged: 0.0,
         }
@@ -239,6 +248,10 @@ impl RateCtl {
                 hub.target_kbps.store(self.target as u32, Ordering::Relaxed);
             }
             self.slow_start = true;
+            // A fresh path is unmeasured: start optimistic, tighten if it
+            // turns out to have no room.
+            self.ceiling = f64::MAX;
+            self.reach = Reach::Roomy;
         }
         if self.last_eval.elapsed() < Duration::from_millis(100) {
             return;
@@ -288,6 +301,22 @@ impl RateCtl {
             delivered = delivered.max(d);
         }
         let now = Instant::now();
+        // The deep bucket is allowed only on a path with room over the
+        // target. Capacity not confirmed lately is forgotten, so the reach
+        // reopens when the measured ceiling goes stale rather than pinning
+        // tight forever.
+        let headroom =
+            if self.ceiling.is_finite() && self.ceiling_at.elapsed() < Duration::from_secs(15) {
+                self.ceiling / self.target.max(1.0)
+            } else {
+                f64::INFINITY
+            };
+        self.reach = self.reach.step(congested, headroom);
+        // Room to raise the target is shown by the path carrying more than
+        // the target, not merely by a quiet moment. A near-idle link looks
+        // clear while delivering well under the target, and ramping then
+        // runs the target away from a link that cannot hold it.
+        let has_room = delivered >= self.target * RAMP_DELIVER;
         if congested && self.last_dec.elapsed() >= Duration::from_millis(300) {
             let mut t = self.target * 0.85;
             // The delivered rate only tells the capacity when we pushed near
@@ -311,16 +340,16 @@ impl RateCtl {
             // probe below waits for slow start to end.
             if !congested
                 && clear
+                && has_room
                 && self.last_inc.elapsed() >= Duration::from_millis(250)
-                && delivered >= self.target * 0.5
             {
                 self.target = (self.target * 1.5).min(self.max);
                 self.last_inc = now;
             }
         } else if !congested
             && clear
+            && has_room
             && self.last_dec.elapsed() >= Duration::from_secs(1)
-            && delivered >= self.target * 0.5
         {
             // Raise the cap only while the content uses it, and forget a
             // capacity not confirmed lately.
@@ -342,6 +371,10 @@ impl RateCtl {
             }
         }
         hub.target_kbps.store(self.target as u32, Ordering::Relaxed);
+        hub.budget
+            .lock()
+            .unwrap()
+            .set_depth_ms(self.reach.depth_ms());
         if self.debug && (self.target - self.logged).abs() > self.logged * 0.1 {
             eprintln!("shuru-screen: bitrate {} kbps", self.target as u32);
             self.logged = self.target;
