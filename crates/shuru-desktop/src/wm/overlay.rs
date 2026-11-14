@@ -649,9 +649,6 @@ impl Wm {
             None => "nobody",
         };
         eprintln!("shuru-desktop: in control: {name}");
-        if let Some(f) = self.focused {
-            self.ring(f)?;
-        }
         self.chrome()
     }
 

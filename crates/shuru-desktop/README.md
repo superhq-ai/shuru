@@ -30,8 +30,8 @@ image installs next to it; see `guest/README.md`.
   panel and the rail). Windows float, move by their title bar, resize by
   a band round their edge and snap to the halves and the full work area.
   Dialogs and other transient windows float centered over their parent.
-- Windows get a frame: a 1 px ring with 12 px corners, amber while a
-  person is in control. Clients that draw no title bar get ours, with the
+- Windows get a frame: a 1 px ring with 12 px corners, brighter on the
+  focused window. Clients that draw no title bar get ours, with the
   three window lights (close, minimize, maximize) in red, yellow and
   green on the focused window and a neutral gray on the others.
   GTK clients that draw their own (client side decorations) keep theirs,

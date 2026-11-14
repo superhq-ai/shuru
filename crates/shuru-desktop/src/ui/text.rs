@@ -156,13 +156,16 @@ impl Field {
             &mut font.swash,
             color(theme().text),
             color(theme().text),
-            color(theme().selected),
+            color(theme().selection),
             color(theme().text),
             |x, y, w, h, rgba| {
+                // One origin on the pixel grid, rounded, so glyphs neither
+                // lean left nor shift as the field scrolls.
+                let (ox, oy) = ((b.x - self.scroll).round(), b.y.round());
                 for dy in 0..h {
                     for dx in 0..w {
-                        let x = b.x + x as f32 + dx as f32 - self.scroll;
-                        let y = b.y + y as f32 + dy as f32;
+                        let x = ox + (x + dx as i32) as f32;
+                        let y = oy + (y + dy as i32) as f32;
                         if x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h {
                             c.blend(
                                 x as usize,
