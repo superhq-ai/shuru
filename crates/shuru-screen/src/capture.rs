@@ -1,11 +1,13 @@
 // Derived from voxl (https://github.com/tembo/voxl), Copyright (c) 2026 Tembo,
 // under the MIT license: see LICENSE-voxl.
 
-//! X11 capture: the framebuffer of Xvfb read in place, or MIT-SHM GetImage
-//! into a frame of our own, driven by XDamage.
+//! X11 capture: MIT-SHM GetImage into a frame of our own, driven by
+//! XDamage. The server copies the pixels between requests, so a frame
+//! never holds half of one draw and half of the next. Reading the
+//! framebuffer of Xvfb in place (`-shmem`) would race its drawing.
 
 use std::os::fd::{AsFd, BorrowedFd};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Result};
 use x11rb::connection::{Connection, RequestConnection};
@@ -23,8 +25,6 @@ struct ShmBuf {
     ptr: *mut u8,
     len: usize,
     shmid: i32,
-    /// Attached to the segment of another process, never removed by us.
-    foreign: bool,
 }
 
 unsafe impl Send for ShmBuf {}
@@ -46,22 +46,6 @@ impl ShmBuf {
                 ptr: ptr as *mut u8,
                 len,
                 shmid,
-                foreign: false,
-            })
-        }
-    }
-
-    fn attach_readonly(shmid: i32, len: usize) -> Option<Self> {
-        unsafe {
-            let ptr = libc::shmat(shmid, std::ptr::null(), libc::SHM_RDONLY);
-            if ptr as isize == -1 {
-                return None;
-            }
-            Some(ShmBuf {
-                ptr: ptr as *mut u8,
-                len,
-                shmid,
-                foreign: true,
             })
         }
     }
@@ -75,9 +59,7 @@ impl Drop for ShmBuf {
     fn drop(&mut self) {
         unsafe {
             libc::shmdt(self.ptr as *const _);
-            if !self.foreign {
-                libc::shmctl(self.shmid, libc::IPC_RMID, std::ptr::null_mut());
-            }
+            libc::shmctl(self.shmid, libc::IPC_RMID, std::ptr::null_mut());
         }
     }
 }
@@ -108,10 +90,6 @@ pub struct Capturer {
     stride: usize,
     seg: u32,
     buf: ShmBuf,
-    /// Where the pixels start in `buf`: past the XWD header of Xvfb.
-    offset: usize,
-    /// Reading the framebuffer of Xvfb in place: no GetImage needed.
-    direct: bool,
     pub damaged: bool,
     /// When the first damage since the last take came in.
     pub damaged_at: Option<Instant>,
@@ -143,34 +121,12 @@ impl Capturer {
         conn.xfixes_query_version(5, 0)?.reply()?;
         conn.randr_query_version(1, 2)?.reply()?;
         conn.randr_select_input(root, randr::NotifyMask::SCREEN_CHANGE)?;
-        let mut stride = width as usize * 4;
+        let stride = width as usize * 4;
         let seg = conn.generate_id()?;
-        let (buf, offset, direct) = match find_xvfb_framebuffer(
-            &conn,
-            root,
-            width,
-            height,
-            xserver_pid(display),
-        ) {
-            Some((buf, offset, fb_stride)) => {
-                eprintln!(
-                    "shuru-screen: capturing from the Xvfb framebuffer (shmid {})",
-                    buf.shmid
-                );
-                stride = fb_stride;
-                (buf, offset, true)
-            }
-            None => {
-                eprintln!(
-                        "shuru-screen: no Xvfb framebuffer (start Xvfb with -shmem), capturing by MIT-SHM GetImage"
-                    );
-                let buf = ShmBuf::new(stride * height as usize)?;
-                conn.shm_attach(seg, buf.shmid as u32, false)?.check()?;
-                // Removed once both sides detach.
-                unsafe { libc::shmctl(buf.shmid, libc::IPC_RMID, std::ptr::null_mut()) };
-                (buf, 0, false)
-            }
-        };
+        let buf = ShmBuf::new(stride * height as usize)?;
+        conn.shm_attach(seg, buf.shmid as u32, false)?.check()?;
+        // Removed once both sides detach.
+        unsafe { libc::shmctl(buf.shmid, libc::IPC_RMID, std::ptr::null_mut()) };
         let damage = conn.generate_id()?;
         conn.damage_create(damage, root, damage::ReportLevel::RAW_RECTANGLES)?;
         conn.flush()?;
@@ -182,8 +138,6 @@ impl Capturer {
             stride,
             seg,
             buf,
-            offset,
-            direct,
             damaged: true,
             damaged_at: None,
             acc: None,
@@ -310,14 +264,13 @@ impl Capturer {
     }
 
     fn pixels(&self) -> &[u8] {
-        &self.buf.as_slice()[self.offset..self.offset + self.stride * self.height as usize]
+        &self.buf.as_slice()[..self.stride * self.height as usize]
     }
 
-    /// Fetches a full width band into the shm frame, unless the frame is
-    /// the framebuffer itself.
+    /// Fetches a full width band into the shm frame.
     pub fn grab(&self, band: Band) -> Result<()> {
         let h = band.y1 - band.y0;
-        if h == 0 || self.direct {
+        if h == 0 {
             return Ok(());
         }
         let off = band.y0 as usize * self.stride;
@@ -336,109 +289,4 @@ impl Capturer {
             .reply()?;
         Ok(())
     }
-}
-
-/// The pid of the local X server of `display` (":N" or "host:N.S"), from
-/// its lock file.
-fn xserver_pid(display: &str) -> Option<u32> {
-    let after = display.rsplit(':').next()?;
-    let n: u32 = after.split('.').next()?.parse().ok()?;
-    std::fs::read_to_string(format!("/tmp/.X{n}-lock"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-}
-
-fn be32(b: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
-}
-
-/// Xvfb started with `-shmem` keeps each screen as an XWD image in a SysV
-/// segment. Finds it and checks its pixels against the server before
-/// trusting it.
-fn find_xvfb_framebuffer(
-    conn: &RustConnection,
-    root: u32,
-    width: u32,
-    height: u32,
-    server_pid: Option<u32>,
-) -> Option<(ShmBuf, usize, usize)> {
-    let table = std::fs::read_to_string("/proc/sysvipc/shm").ok()?;
-    for line in table.lines().skip(1) {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() < 5 {
-            continue;
-        }
-        let (Ok(shmid), Ok(size)) = (f[1].parse::<i32>(), f[3].parse::<usize>()) else {
-            continue;
-        };
-        // Several Xvfbs may run side by side: only look at segments our X
-        // server made, when we know its pid.
-        if server_pid.is_some_and(|pid| f[4].parse::<u32>().ok() != Some(pid)) {
-            continue;
-        }
-        if size < (width * height * 4) as usize {
-            continue;
-        }
-        let Some(buf) = ShmBuf::attach_readonly(shmid, size) else {
-            continue;
-        };
-        let b = buf.as_slice();
-        if b.len() < 100 {
-            continue;
-        }
-        let header_size = be32(b, 0) as usize;
-        let (w, h, bpp, bpl, ncolors) = (
-            be32(b, 4),
-            be32(b, 5),
-            be32(b, 11),
-            be32(b, 12) as usize,
-            be32(b, 19) as usize,
-        );
-        if be32(b, 1) != 7 || w < width || h < height || bpp != 32 || bpl < (w * 4) as usize {
-            continue;
-        }
-        let offset = header_size + ncolors * 12;
-        if offset + bpl * h as usize > size {
-            continue;
-        }
-        // Compare a strip of pixels with what the server says. The screen
-        // may change between the two reads, so retry and take a near match.
-        let (sy, sh) = (height / 2, 16u32.min(height / 2));
-        for _ in 0..10 {
-            let Ok(Ok(img)) = conn
-                .get_image(
-                    ImageFormat::Z_PIXMAP,
-                    root,
-                    0,
-                    sy as i16,
-                    width as u16,
-                    sh as u16,
-                    !0,
-                )
-                .map(|c| c.reply())
-            else {
-                break;
-            };
-            let total = (width * sh) as usize;
-            let mut same = 0usize;
-            for r in 0..sh as usize {
-                let fb = &b[offset + (sy as usize + r) * bpl..][..width as usize * 4];
-                let im = &img.data[r * width as usize * 4..][..width as usize * 4];
-                same += fb
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .zip(im.as_chunks::<4>().0)
-                    .filter(|(a, c)| a[..3] == c[..3])
-                    .count();
-            }
-            if same * 100 >= total * 98 {
-                return Some((buf, offset, bpl));
-            }
-            std::thread::sleep(Duration::from_millis(30));
-        }
-    }
-    None
 }

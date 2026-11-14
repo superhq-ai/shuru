@@ -12,10 +12,11 @@ come from voxl; the server, the protocol and the gate are new.
 
 ## How it works
 
-- Capture reads the framebuffer of Xvfb in place when Xvfb runs with
-  `-shmem`, or copies by MIT-SHM GetImage otherwise. XDamage says what
-  changed, so a still screen costs no CPU, and x264 skips the macroblocks
-  that did not change.
+- Capture copies the rows that changed by MIT-SHM GetImage. The X server
+  makes the copy between requests, so a frame never holds half of one
+  draw and half of the next, as reading the framebuffer of Xvfb in place
+  would. XDamage says what changed, so a still screen costs no CPU, and
+  x264 skips the macroblocks that did not change.
 - x264 encodes with `ultrafast` and `zerolatency`, no B frames, and a
   keyframe only when a viewer needs one. With `--profile high`, CABAC and
   the 8x8 transform are back on; the rest of `ultrafast` stays.
@@ -57,7 +58,7 @@ cargo build -p shuru-screen --release
 ## Running
 
 ```sh
-Xvfb :1 -screen 0 1280x800x24 -shmem -extension SECURITY &
+Xvfb :1 -screen 0 1280x800x24 -extension SECURITY &
 shuru-screen --display :1 --socket /run/screen.sock
 ```
 
