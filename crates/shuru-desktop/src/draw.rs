@@ -35,6 +35,8 @@ pub struct Theme {
     pub raised: u32,
     /// The keyboard row of a menu.
     pub selected: u32,
+    /// Selected text in a field: tinted, so it reads against any surface.
+    pub selection: u32,
     /// The app in front on the rail.
     pub rail_active: u32,
     pub hairline: u32,
@@ -123,6 +125,7 @@ pub static DARK: Theme = Theme {
     hover: 0x1b1b1e,
     raised: 0x232327,
     selected: 0x232327,
+    selection: 0x2c4a78,
     rail_active: 0x232327,
     hairline: 0x26262b,
     hairline_hi: 0x3a3a40,
@@ -166,6 +169,7 @@ pub static LIGHT: Theme = Theme {
     hover: 0xe3e3e7,
     raised: 0xe6e6ea,
     selected: 0xd6d6db,
+    selection: 0xb8d3fb,
     rail_active: 0xb4b4bb,
     hairline: 0xdadade,
     hairline_hi: 0xc2c2c9,

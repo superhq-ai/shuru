@@ -1038,14 +1038,14 @@ impl Wm {
         self.chrome()
     }
 
-    /// The color of the ring round a frame.
+    /// The color of the ring round a frame: brighter on the focused one.
+    /// Who is in control is the whole screen's, said by the viewer and the
+    /// panel, never by one window's edge.
     pub(super) fn ring_color(&self, w: Window) -> u32 {
-        if self.focused != Some(w) {
-            theme().hairline
-        } else if self.who == Some(Who::Person) {
-            theme().amber
-        } else {
+        if self.focused == Some(w) {
             theme().hairline_hi
+        } else {
+            theme().hairline
         }
     }
 
