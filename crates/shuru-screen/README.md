@@ -12,10 +12,11 @@ come from voxl; the server, the protocol and the gate are new.
 
 ## How it works
 
-- Capture reads the framebuffer of Xvfb in place when Xvfb runs with
-  `-shmem`, or copies by MIT-SHM GetImage otherwise. XDamage says what
-  changed, so a still screen costs no CPU, and x264 skips the macroblocks
-  that did not change.
+- Capture copies the rows that changed by MIT-SHM GetImage. The X server
+  makes the copy between requests, so a frame never holds half of one
+  draw and half of the next, as reading the framebuffer of Xvfb in place
+  would. XDamage says what changed, so a still screen costs no CPU, and
+  x264 skips the macroblocks that did not change.
 - x264 encodes with `ultrafast` and `zerolatency`, no B frames, and a
   keyframe only when a viewer needs one. With `--profile high`, CABAC and
   the 8x8 transform are back on; the rest of `ultrafast` stays.
@@ -35,8 +36,13 @@ come from voxl; the server, the protocol and the gate are new.
   the rate it reads them, or over the safe rate until that is measured.
   More than about 200 ms of video waiting steps the bitrate down toward
   that rate, and it steps back up once the queue drains. Past about
-  400 ms, frames wait until it drains. A keyframe is at most about 400 ms
-  of video at the current bitrate.
+  400 ms, frames wait until it drains.
+- The bits follow a bucket kept in wall time: it holds up to 400 ms of
+  video at the current bitrate and refills at that bitrate, also while the
+  screen is still. Each frame may take what the bucket holds, and never
+  less than its share of the bitrate. A change after a still moment, a
+  keyframe or a page that changed whole, comes out sharp at once; during
+  sustained motion each frame gets its share, and the frame rate holds.
 - Blocks sent while they moved are sent again at higher quality once they
   have been still for a moment (the paint-over), so text sharpens when the
   screen settles.
@@ -53,7 +59,7 @@ cargo build -p shuru-screen --release
 ## Running
 
 ```sh
-Xvfb :1 -screen 0 1280x800x24 -shmem -extension SECURITY &
+Xvfb :1 -screen 0 1280x800x24 -extension SECURITY &
 shuru-screen --display :1 --socket /run/screen.sock
 ```
 

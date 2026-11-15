@@ -148,8 +148,8 @@ fn send_image(conn: &RustConnection, hub: &Hub) -> bool {
     let Ok(msg) = img.message() else {
         return false;
     };
-    *hub.cursor_image.lock().unwrap() = Some(img);
-    *hub.cursor.lock().unwrap() = Some(msg.clone());
+    *hub.cursor_image.lock() = Some(img);
+    *hub.cursor.lock() = Some(msg.clone());
     hub.broadcast(&msg);
     true
 }
@@ -179,7 +179,7 @@ fn cursor_loop(conn: &RustConnection, root: u32, hub: &Hub, interval: Duration) 
             next_poll = Instant::now() + interval;
             let p = conn.query_pointer(root)?.reply()?;
             let at = (p.root_x as i32, p.root_y as i32);
-            let mut last = hub.pointer.lock().unwrap();
+            let mut last = hub.pointer.lock();
             // Moves between polls collapse into one message.
             if *last != Some(at) {
                 *last = Some(at);

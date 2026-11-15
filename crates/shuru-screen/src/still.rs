@@ -2,7 +2,15 @@
 
 use anyhow::Result;
 
-use crate::hub::Snapshot;
+use crate::cursor::CursorImage;
+
+/// The screen as captured: BGRX, rows packed, and the cursor shown then.
+pub struct Snapshot {
+    pub width: usize,
+    pub height: usize,
+    pub bgrx: Vec<u8>,
+    pub cursor: Option<CursorImage>,
+}
 
 /// The snapshot as a PNG at most `width` wide, keeping its aspect, with
 /// the cursor drawn in when `cursor`.

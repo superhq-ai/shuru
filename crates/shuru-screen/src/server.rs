@@ -1,7 +1,14 @@
 //! HTTP and WebSocket on the unix socket. See README.md for the interface.
+//!
+//! This is shuru's thin layer over voxl's streaming hub: the unix-socket
+//! transport, the JSON control protocol, the per-task gate (gate.rs) and the
+//! two integration hooks (a keyframe on a desktop-lease change and on a
+//! decoder-aware reconnect; input-quiet sharpening), each behind a capability
+//! a plain voxl viewer never negotiates.
 
 use std::convert::Infallible;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,10 +32,39 @@ use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::hub::{Client, Gate, Hub, Out};
+use crate::gate::{Gate, GateState};
+use crate::hub::{Client, Hub, Out};
 use crate::input::{InputEvent, TEXT_MAX};
 
 type Body = Full<Bytes>;
+
+/// What the server routes over, carried to every handler.
+#[derive(Clone)]
+pub struct State {
+    pub hub: Arc<Hub>,
+    pub gate: Arc<GateState>,
+}
+
+/// The integration hooks a stream negotiated in `/stream?caps=`.
+#[derive(Clone, Copy, Default)]
+struct Caps {
+    sharpen_on_input_quiet: bool,
+    keyframe_on_lease: bool,
+}
+
+impl Caps {
+    fn parse(csv: Option<&str>) -> Self {
+        let mut c = Caps::default();
+        for cap in csv.unwrap_or("").split(',') {
+            match cap.trim() {
+                "sharpenOnInputQuiet" => c.sharpen_on_input_quiet = true,
+                "keyframeOnLease" => c.keyframe_on_lease = true,
+                _ => {}
+            }
+        }
+        c
+    }
+}
 
 /// A message from a viewer, and the events of `POST /input`.
 #[derive(Deserialize)]
@@ -90,9 +126,9 @@ struct GateBody {
     viewer: Option<String>,
 }
 
-pub async fn connection(hub: Arc<Hub>, stream: tokio::net::UnixStream) {
+pub async fn connection(state: State, stream: tokio::net::UnixStream) {
     // Kept small so a slow viewer shows as queue here rather than hiding
-    // in the kernel.
+    // in the kernel; voxl's flow control reads the backlog from acks.
     let fd = stream.as_raw_fd();
     let size: libc::c_int = 64 << 10;
     unsafe {
@@ -105,8 +141,8 @@ pub async fn connection(hub: Arc<Hub>, stream: tokio::net::UnixStream) {
         )
     };
     let service = service_fn(move |request| {
-        let hub = hub.clone();
-        async move { Ok::<_, Infallible>(route(hub, fd, request).await) }
+        let state = state.clone();
+        async move { Ok::<_, Infallible>(route(state, request).await) }
     });
     let _ = http1::Builder::new()
         .serve_connection(TokioIo::new(stream), service)
@@ -150,15 +186,29 @@ async fn body<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(|e| e.to_string())
 }
 
-fn gate_json(gate: &Gate) -> serde_json::Value {
-    match gate {
-        Gate::Shut => serde_json::json!({ "viewer": null }),
-        Gate::Agent => serde_json::json!({ "viewer": "agent" }),
-        Gate::Viewer(v) => serde_json::json!({ "viewer": v }),
+/// Moves the gate to `next` and applies the side effects when it actually changed:
+/// release the keys the old holder held, tell each viewer whether its input lands now,
+/// and (for the keyframe-on-lease hook) force a keyframe so a lease change starts the
+/// new holder on a clean picture.
+fn set_gate(state: &State, next: Gate) {
+    let Some(_previous) = state.gate.set(next) else {
+        return;
+    };
+    if let Some(tx) = state.hub.input.lock().as_ref() {
+        let _ = tx.send(InputEvent::ReleaseAll);
     }
+    let gate = state.gate.get();
+    let keyframe = state.hub.keyframe_on_lease();
+    for c in state.hub.clients() {
+        c.send(Out::Text(gate.message(c.viewer.as_deref())));
+        if keyframe {
+            c.resync();
+        }
+    }
+    state.hub.wake();
 }
 
-async fn route(hub: Arc<Hub>, fd: RawFd, mut request: Request<Incoming>) -> Response<Body> {
+async fn route(state: State, mut request: Request<Incoming>) -> Response<Body> {
     let path = request.uri().path().to_string();
     match (request.method().clone(), path.as_str()) {
         (Method::GET, "/healthz") => reply(StatusCode::OK, "text/plain", "ok\n"),
@@ -173,7 +223,7 @@ async fn route(hub: Arc<Hub>, fd: RawFd, mut request: Request<Incoming>) -> Resp
                 Some("1") => true,
                 Some(_) => return error(StatusCode::BAD_REQUEST, "cursor is 0 or 1"),
             };
-            still(&hub, width, cursor).await
+            still(&state.hub, width, cursor).await
         }
         (Method::GET, "/stream") => {
             let viewer = query(&request, "viewer");
@@ -186,9 +236,12 @@ async fn route(hub: Arc<Hub>, fd: RawFd, mut request: Request<Incoming>) -> Resp
                     "a viewer id is not empty and not \"agent\"",
                 );
             }
-            upgrade(&mut request, move |socket| stream(hub, viewer, fd, socket))
+            let caps = Caps::parse(query(&request, "caps").as_deref());
+            upgrade(&mut request, move |socket| {
+                stream(state, viewer, caps, socket)
+            })
         }
-        (Method::GET, "/gate") => json(StatusCode::OK, gate_json(&hub.gate.lock().unwrap())),
+        (Method::GET, "/gate") => json(StatusCode::OK, state.gate.get().holder()),
         (Method::POST, "/gate") => {
             let b: GateBody = match body(request, 4096).await {
                 Ok(b) => b,
@@ -200,8 +253,8 @@ async fn route(hub: Arc<Hub>, fd: RawFd, mut request: Request<Incoming>) -> Resp
                 Some(v) if v.is_empty() => return error(StatusCode::BAD_REQUEST, "empty viewer"),
                 Some(v) => Gate::Viewer(v),
             };
-            let out = gate_json(&gate);
-            hub.set_gate(gate);
+            let out = gate.holder();
+            set_gate(&state, gate);
             json(StatusCode::OK, out)
         }
         (Method::POST, "/input") => {
@@ -218,18 +271,20 @@ async fn route(hub: Arc<Hub>, fd: RawFd, mut request: Request<Incoming>) -> Resp
             }
             // Checked after the body is read, so the gate cannot shut while
             // half the events are in.
-            let gate = hub.gate.lock().unwrap();
-            if *gate != Gate::Agent {
+            if !state.gate.may_agent() {
                 return error(
                     StatusCode::CONFLICT,
                     "the input gate is not open for the agent",
                 );
             }
             let n = input.len();
-            for i in input {
-                let _ = hub.input.send(i);
+            if let Some(tx) = state.hub.input.lock().as_ref() {
+                for i in input {
+                    let _ = tx.send(i);
+                }
             }
-            drop(gate);
+            state.hub.note_input();
+            state.hub.wake();
             json(StatusCode::OK, serde_json::json!({ "applied": n }))
         }
         (_, "/healthz" | "/still" | "/stream" | "/gate" | "/input") => {
@@ -241,7 +296,7 @@ async fn route(hub: Arc<Hub>, fd: RawFd, mut request: Request<Incoming>) -> Resp
 
 async fn still(hub: &Hub, width: Option<usize>, cursor: bool) -> Response<Body> {
     let (tx, rx) = oneshot::channel();
-    hub.snapshots.lock().unwrap().push(tx);
+    hub.snapshots.lock().push(tx);
     hub.wake();
     let Ok(Ok(shot)) = tokio::time::timeout(Duration::from_secs(5), rx).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "no frame from capture");
@@ -307,28 +362,29 @@ where
     response
 }
 
-async fn stream(hub: Arc<Hub>, viewer: Option<String>, fd: RawFd, socket: Socket) {
+async fn stream(state: State, viewer: Option<String>, caps: Caps, socket: Socket) {
     let (mut sink, mut source) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
-    let client = hub.add_client(viewer.clone(), tx, fd);
-    let c2 = client.clone();
+    state
+        .hub
+        .add_caps(caps.sharpen_on_input_quiet, caps.keyframe_on_lease);
+    let client = state.hub.add_client(viewer.clone(), tx);
+    // The gate state the hub does not carry, sent after the hub's hello/cursor/pointer.
+    client.send(Out::Text(state.gate.get().message(viewer.as_deref())));
     let writer = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
-            let n = m.len();
             let msg = match m {
                 Out::Bin(b) => Message::Binary(b),
                 Out::Text(t) => Message::Text(t.into()),
             };
-            let sent = sink.send(msg).await;
-            c2.wrote(n);
-            if sent.is_err() {
+            if sink.send(msg).await.is_err() {
                 break;
             }
         }
     });
     while let Some(Ok(msg)) = source.next().await {
         match msg {
-            Message::Text(t) => on_text(&hub, &client, t.as_str()),
+            Message::Text(t) => on_text(&state, &client, t.as_str()),
             Message::Close(_) => break,
             _ => {}
         }
@@ -336,13 +392,18 @@ async fn stream(hub: Arc<Hub>, viewer: Option<String>, fd: RawFd, socket: Socket
     writer.abort();
     // Keys and buttons held through this stream are let go; the gate stays
     // with the viewer, who may reconnect.
-    if hub.may_input(viewer.as_deref()) {
-        let _ = hub.input.send(InputEvent::ReleaseAll);
+    if state.gate.may_viewer(viewer.as_deref()) {
+        if let Some(tx) = state.hub.input.lock().as_ref() {
+            let _ = tx.send(InputEvent::ReleaseAll);
+        }
     }
-    hub.remove_client(client.id);
+    state
+        .hub
+        .remove_caps(caps.sharpen_on_input_quiet, caps.keyframe_on_lease);
+    state.hub.remove_client(client.id);
 }
 
-fn on_text(hub: &Hub, client: &Client, text: &str) {
+fn on_text(state: &State, client: &Client, text: &str) {
     // Messages this version does not know are skipped.
     let Ok(msg) = serde_json::from_str::<Msg>(text) else {
         return;
@@ -350,18 +411,23 @@ fn on_text(hub: &Hub, client: &Client, text: &str) {
     match msg {
         Msg::Ack { frame } => {
             client.on_ack(frame);
-            hub.wake();
+            state.hub.wake();
         }
         Msg::Keyframe => {
-            client.resync();
-            hub.wake();
+            // Decoder-aware reconnect hook: the viewer asks for a fresh keyframe.
+            client.needs_keyframe.store(true, Ordering::Relaxed);
+            client.started.store(false, Ordering::Relaxed);
+            state.hub.wake();
         }
         input => {
-            let gate = hub.gate.lock().unwrap();
-            let open =
-                matches!((&*gate, client.viewer.as_deref()), (Gate::Viewer(g), Some(v)) if g == v);
-            if let (true, Some(ev)) = (open, input.input()) {
-                let _ = hub.input.send(ev);
+            if state.gate.may_viewer(client.viewer.as_deref()) {
+                if let Some(ev) = input.input() {
+                    if let Some(tx) = state.hub.input.lock().as_ref() {
+                        let _ = tx.send(ev);
+                    }
+                    state.hub.note_input();
+                    state.hub.wake();
+                }
             }
         }
     }
@@ -397,5 +463,13 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(err.contains("text is longer than 4096 chars"), "{err}");
+    }
+
+    #[test]
+    fn caps_parse_only_known() {
+        let c = Caps::parse(Some("sharpenOnInputQuiet,keyframeOnLease,bogus"));
+        assert!(c.sharpen_on_input_quiet && c.keyframe_on_lease);
+        let none = Caps::parse(None);
+        assert!(!none.sharpen_on_input_quiet && !none.keyframe_on_lease);
     }
 }
