@@ -134,6 +134,27 @@ impl Encoder {
         }
     }
 
+    /// SHURU: the stream's WebCodecs codec string, such as `avc1.640028`: the
+    /// SPS's profile, constraint flags and level. The Mac and web viewers
+    /// configure their decoders with it and refuse a hello without one.
+    pub fn codec(&self) -> Option<String> {
+        const NAL_SPS: i32 = 7;
+        unsafe {
+            let mut nals: *mut ffi::x264_nal_t = ptr::null_mut();
+            let mut n = 0;
+            if ffi::x264_encoder_headers(self.h, &mut nals, &mut n) < 0 || nals.is_null() {
+                return None;
+            }
+            let sps = std::slice::from_raw_parts(nals, n as usize)
+                .iter()
+                .find(|nal| nal.i_type == NAL_SPS)?;
+            avc_codec(std::slice::from_raw_parts(
+                sps.p_payload,
+                sps.i_payload as usize,
+            ))
+        }
+    }
+
     /// Reconfigure rate control on the fly (buffer of ~1.25 frames at `max_kbps`).
     pub fn set_rate(&mut self, crf: f32, max_kbps: u32) {
         self.set_rate_buf(
@@ -327,5 +348,44 @@ mod bench {
                 out.len()
             );
         }
+    }
+}
+
+/// SHURU: `avc1.PPCCLL` from an Annex B SPS: the three bytes after the start
+/// code and the NAL header.
+fn avc_codec(sps: &[u8]) -> Option<String> {
+    let start = sps.windows(3).position(|w| w == [0, 0, 1])? + 3;
+    let b = sps.get(start + 1..start + 4)?;
+    Some(format!("avc1.{:02x}{:02x}{:02x}", b[0], b[1], b[2]))
+}
+
+#[cfg(test)]
+mod codec_tests {
+    #[test]
+    fn the_codec_string_is_read_from_the_sps() {
+        let sps = [0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28, 0xac, 0xd9];
+        assert_eq!(super::avc_codec(&sps).as_deref(), Some("avc1.640028"));
+        assert_eq!(super::avc_codec(&[0, 0, 1, 0x67, 0x64]), None);
+    }
+
+    #[test]
+    fn a_real_encoder_names_its_codec_as_the_viewers_expect() {
+        let enc = super::Encoder::new(&super::EncoderConfig {
+            width: 1280,
+            height: 720,
+            fps: 30,
+            preset: "ultrafast".into(),
+            threads: 1,
+            crf: 23.0,
+            max_kbps: 0,
+        })
+        .unwrap();
+        let codec = enc.codec().unwrap();
+        // The Mac and web viewers accept only ^avc1\.[0-9a-f]{6}$.
+        let hex = codec.strip_prefix("avc1.").unwrap_or_default();
+        assert!(
+            hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "{codec}"
+        );
     }
 }

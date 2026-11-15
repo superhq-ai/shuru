@@ -2500,7 +2500,7 @@ dependencies = [
 
 [[package]]
 name = "shuru-desktop"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "accesskit",
  "accesskit_atspi_common",
@@ -2614,7 +2614,7 @@ dependencies = [
 
 [[package]]
 name = "shuru-screen"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "base64",

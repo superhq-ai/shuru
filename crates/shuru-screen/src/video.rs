@@ -154,6 +154,8 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
         });
     }
     *hub.stripes.lock() = layout;
+    // SHURU: every stripe shares one encoder setup; the first names the codec.
+    *hub.codec.lock() = stripes[0].enc.codec().ok_or("x264 gave no SPS")?;
     let hub2 = hub.clone();
     let (crf, po_crf) = (cfg.crf, cfg.paintover_crf);
     let encode = std::thread::Builder::new()
@@ -1528,7 +1530,10 @@ mod tests {
             }
         }
         assert!(over_flow_bound(&behind, interval_ms));
-        assert!(!flow_ok(&hub, interval_ms), "a buried viewer should fail flow_ok");
+        assert!(
+            !flow_ok(&hub, interval_ms),
+            "a buried viewer should fail flow_ok"
+        );
 
         // A viewer comfortably within the bound.
         let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();

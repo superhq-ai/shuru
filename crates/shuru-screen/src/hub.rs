@@ -251,6 +251,8 @@ pub struct Hub {
     pub height: AtomicU32,
     /// Encoded stripes as (y, height).
     pub stripes: Mutex<Vec<(u32, u32)>>,
+    /// SHURU: the WebCodecs codec string (`avc1.PPCCLL`) the viewers decode with.
+    pub codec: Mutex<String>,
     /// Adaptive bitrate cap applied by the encoder (kbit/s).
     pub target_kbps: AtomicU32,
     /// The last cursor message (shuru JSON), replayed to new clients.
@@ -285,6 +287,7 @@ impl Hub {
             height: AtomicU32::new(0),
             target_kbps: AtomicU32::new(0),
             stripes: Mutex::new(Vec::new()),
+            codec: Mutex::new(String::new()),
             cursor: Mutex::new(None),
             cursor_image: Mutex::new(None),
             pointer: Mutex::new(None),
@@ -417,7 +420,7 @@ impl Hub {
     pub fn hello(&self) -> String {
         serde_json::json!({
             "type": "hello",
-            "codec": "h264",
+            "codec": self.codec.lock().clone(),
             "format": "annexb",
             "width": self.width.load(Ordering::Relaxed),
             "height": self.height.load(Ordering::Relaxed),
