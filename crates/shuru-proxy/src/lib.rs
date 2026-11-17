@@ -93,17 +93,19 @@ impl ProxyHandle {
     }
 }
 
-/// Generate a unique placeholder token for a secret.
+/// Generate the placeholder token for a secret: the `shuru_tok_` marker and
+/// 80 random bits as 20 hex digits, the same 30 bytes as before.
+///
+/// The guest is handed this in place of the secret, and the proxy swaps in
+/// the real value wherever the token appears. So it has to be random, not
+/// just unique: only what was handed the token should be able to produce it.
 fn generate_placeholder() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("shuru_tok_{:016x}{:04x}", ts, seq)
+    let mut bytes = [0u8; 10];
+    // BoringSSL's generator does not return an error: it aborts the process
+    // if the system has no entropy to give.
+    boring::rand::rand_bytes(&mut bytes).expect("system random source");
+    let digits: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("shuru_tok_{digits}")
 }
 
 /// Create a Unix datagram socketpair for VZFileHandleNetworkDeviceAttachment.
@@ -261,4 +263,32 @@ pub fn start_session(
         egress,
         secrets,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_placeholder;
+    use std::collections::HashSet;
+
+    #[test]
+    fn placeholders_keep_their_shape() {
+        let token = generate_placeholder();
+        let digits = token.strip_prefix("shuru_tok_").expect("the marker");
+        assert_eq!(token.len(), 30);
+        assert!(digits
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
+    }
+
+    #[test]
+    fn placeholders_minted_together_share_no_prefix() {
+        // Tokens built from a clock reading and a counter agree on their
+        // leading digits when minted in the same instant. Random ones do
+        // not: 64 of them agreeing on four digits has odds of 2^-1008.
+        let tokens: Vec<String> = (0..64).map(|_| generate_placeholder()).collect();
+        let leading: HashSet<&str> = tokens.iter().map(|t| &t[10..14]).collect();
+        assert!(leading.len() > 1, "placeholders share a prefix: {tokens:?}");
+        let distinct: HashSet<&String> = tokens.iter().collect();
+        assert_eq!(distinct.len(), tokens.len());
+    }
 }
