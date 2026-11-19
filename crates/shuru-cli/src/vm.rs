@@ -369,12 +369,22 @@ pub(crate) fn run_command(
         eprintln!("shuru: VM started, waiting for guest...");
     }
     trace_boot("vm running");
-    sandbox.start_services(
-        proxy_handle
-            .as_ref()
-            .map(|handle| &handle.placeholders)
-            .unwrap_or(&HashMap::new()),
-    )?;
+
+    // Inject the CA cert ahead of the services when MITM is needed, so they
+    // start trusting it
+    let mut env = HashMap::new();
+    if let Some(ref handle) = proxy_handle {
+        if !handle.placeholders.is_empty() {
+            sandbox.install_ca(&handle.ca_cert_pem)?;
+            if prepared.verbose {
+                eprintln!("shuru: proxy CA certificate injected");
+            }
+            for (name, placeholder) in &handle.placeholders {
+                env.insert(name.clone(), placeholder.clone());
+            }
+        }
+    }
+    sandbox.start_services(&env)?;
     if std::env::var("SHURU_BOOT_TRACE").is_ok() {
         let _ = sandbox.wait_ready();
         trace_boot("guest vsock ready");
@@ -385,28 +395,6 @@ pub(crate) fn run_command(
     } else {
         None
     };
-
-    // Inject CA cert and secret placeholders when MITM is needed
-    let mut env = HashMap::new();
-    if let Some(ref handle) = proxy_handle {
-        if !handle.placeholders.is_empty() {
-            sandbox.write_file(
-                "/usr/local/share/ca-certificates/shuru-proxy.crt",
-                &handle.ca_cert_pem,
-            )?;
-            sandbox.exec(
-                &["update-ca-certificates", "--fresh"],
-                &mut std::io::sink(),
-                &mut std::io::sink(),
-            )?;
-            if prepared.verbose {
-                eprintln!("shuru: proxy CA certificate injected");
-            }
-            for (name, placeholder) in &handle.placeholders {
-                env.insert(name.clone(), placeholder.clone());
-            }
-        }
-    }
 
     let exit_code = if std::io::stdin().is_terminal() {
         sandbox.shell(command, &env, &prepared.run_as)?

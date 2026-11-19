@@ -466,6 +466,42 @@ impl Sandbox {
         shuru_proto::send_service_env(&mut stream, env).context("starting the guest services")
     }
 
+    /// Has the guest trust the proxy CA, which the proxy signs with for the
+    /// hosts it sends secrets to. Send it before `start_services`, so the
+    /// services start trusting it.
+    pub fn install_ca(&self, ca_cert_pem: &[u8]) -> Result<()> {
+        let mut stream = self.connect_vsock()?;
+        stream.set_read_timeout(Some(INSTALL_CA_TIMEOUT))?;
+        let req = ExecRequest {
+            argv: ["sh", "-c", INSTALL_CA].map(str::to_string).to_vec(),
+            env: HashMap::from([(
+                "SHURU_PROXY_CA".to_string(),
+                String::from_utf8_lossy(ca_cert_pem).into_owned(),
+            )]),
+            tty: None,
+            rows: None,
+            cols: None,
+            cwd: None,
+            id: None,
+            before_services: true,
+            run_as: RunAs::default(),
+        };
+        frame::send_json(&mut stream, frame::EXEC_REQ, &req)?;
+        loop {
+            match frame::read_frame(&mut stream).context("installing the proxy CA")? {
+                Some((frame::EXIT, payload)) => match frame::parse_exit_code(&payload) {
+                    Some(0) => return Ok(()),
+                    code => bail!("installing the proxy CA in the guest failed: {code:?}"),
+                },
+                Some((frame::ERROR, payload)) => {
+                    bail!("guest error: {}", String::from_utf8_lossy(&payload))
+                }
+                Some(_) => {}
+                None => bail!("guest closed connection while installing the proxy CA"),
+            }
+        }
+    }
+
     /// Block until the guest control server accepts vsock connections.
     pub fn wait_ready(&self) -> Result<()> {
         let stream = self.connect_vsock()?;
@@ -1251,6 +1287,10 @@ impl GuestVm {
 /// timeout an image can reasonably declare, plus the sync.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(90);
 const SERVICE_ENV_TIMEOUT: Duration = Duration::from_secs(10);
+const INSTALL_CA: &str =
+    "printf '%s' \"$SHURU_PROXY_CA\" > /usr/local/share/ca-certificates/shuru-proxy.crt \
+    && update-ca-certificates --fresh > /dev/null 2>&1";
+const INSTALL_CA_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn shutdown_handshake(stream: TcpStream) -> Result<ShutdownResponse> {
     let mut writer = stream.try_clone()?;
