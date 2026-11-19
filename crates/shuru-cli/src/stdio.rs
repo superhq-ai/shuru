@@ -393,30 +393,18 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
         nbd_uri.as_deref(),
     )?);
     sandbox.start()?;
-    sandbox.start_services(
-        proxy_handle
-            .as_ref()
-            .map(|handle| &handle.placeholders)
-            .unwrap_or(&HashMap::new()),
-    )?;
 
-    // Inject CA cert and secret placeholders when MITM is needed
+    // Inject the CA cert ahead of the services when MITM is needed, so they
+    // start trusting it
     let secret_env: HashMap<String, String> = if let Some(ref handle) = proxy_handle {
         if !handle.placeholders.is_empty() {
-            sandbox.write_file(
-                "/usr/local/share/ca-certificates/shuru-proxy.crt",
-                &handle.ca_cert_pem,
-            )?;
-            sandbox.exec(
-                &["update-ca-certificates", "--fresh"],
-                &mut io::sink(),
-                &mut io::sink(),
-            )?;
+            sandbox.install_ca(&handle.ca_cert_pem)?;
         }
         handle.placeholders.clone()
     } else {
         HashMap::new()
     };
+    sandbox.start_services(&secret_env)?;
 
     let _fwd = if !prepared.forwards.is_empty() {
         Some(sandbox.start_port_forwarding(&prepared.forwards)?)
